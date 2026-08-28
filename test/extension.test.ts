@@ -3,6 +3,7 @@ import {
   buildManagedImplementationId,
   getReviewArgumentCompletions,
   injectReviewResult,
+  reviewExecutionSelection,
   validateFindingDispositionInputs,
 } from "../extensions/code-review.js";
 import type { ReviewResult } from "../src/types.js";
@@ -19,11 +20,22 @@ const result: ReviewResult = {
 };
 
 describe("review extension helpers", () => {
-  it("offers discoverable command arguments and preserves completed input", () => {
-    expect(getReviewArgumentCompletions("")?.map((item) => item.value)).toContain("--effort low");
+  it("offers the managed loop prominently while preserving advanced phase completions", () => {
+    const rootCompletions = getReviewArgumentCompletions("")?.map((item) => item.value);
+    expect(rootCompletions?.[0]).toBe("loop");
+    expect(rootCompletions).toContain("--effort low");
+    expect(rootCompletions).toContain("--phase initial");
     expect(getReviewArgumentCompletions("--e")?.map((item) => item.value)).toContain("--effort low");
     expect(getReviewArgumentCompletions("status --s")?.map((item) => item.value)).toContain("status --session ");
     expect(getReviewArgumentCompletions("unknown")).toBeNull();
+  });
+
+  it("selects managed auto progression for loop without changing one-shot reviews", () => {
+    expect(reviewExecutionSelection({ action: "run", phase: "auto" })).toEqual({ managed: false, requestedPhase: "auto" });
+    expect(reviewExecutionSelection({ action: "loop", phase: "auto" })).toEqual({ managed: true, requestedPhase: "auto" });
+    expect(reviewExecutionSelection({ action: "loop", phase: "delta" })).toEqual({ managed: true, requestedPhase: "delta" });
+    expect(reviewExecutionSelection({ action: "run", phase: "initial" })).toEqual({ managed: true, requestedPhase: "initial" });
+    expect(reviewExecutionSelection({ action: "run", phase: "auto", sessionId: "session-1" })).toEqual({ managed: true, requestedPhase: "auto" });
   });
 
   it("injects the complete rendered report as a model-visible custom message", () => {

@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Use the pi-code-review extension for one-shot reviews or its explicit bounded initial/delta/final managed lifecycle.
+description: Use the pi-code-review extension for one-shot reviews or its bounded managed review loop.
 compatibility: Requires the installed pi-code-review package and gh for pull-request targets.
 ---
 
@@ -12,18 +12,29 @@ This skill does not replace or disable `pi-plan-mode` orchestration, PREWALK, `L
 
 ## One-shot review
 
-For a normal report-only review, call `code_review` once with `action=run` and the requested target. The default effort is `low`; use a higher effort only when the user explicitly requests it. Publishing requires explicit user authorization through `comment=true`.
+For a normal report-only review, use:
+
+```text
+/code-review <target>
+```
+
+The equivalent agent-tool call is `code_review` with `action=run` and the requested target. The default effort is `low`; use a higher effort only when the user explicitly requests it. Publishing requires explicit user authorization through `comment=true`.
 
 ## Managed implementation review
 
-Managed review is opt-in. Explicitly provide at least one of:
+Managed review is opt-in. Start or continue it with:
 
-- `phase=initial|delta|final`
-- `planPath`
-- `implementationId`
-- `sessionId`
+```text
+/code-review loop <target>
+```
 
-The extension does not discover `pi-plan-mode` state or infer an approved plan from session context.
+The equivalent agent-tool call uses `action=loop`. Each invocation runs exactly one pass; it does not edit code or repeatedly invoke itself. The extension automatically selects the next permitted phase:
+
+- first invocation: `initial`;
+- after adjudication and a committed remediation: `delta`;
+- after another adjudication and committed remediation, when needed: `final`.
+
+Use the returned `sessionId` on later loop calls when available. `planPath` and `implementationId` can bind the loop to an explicit implementation identity. The extension does not discover `pi-plan-mode` state or infer an approved plan from session context. Explicit `phase=initial|delta|final` remains available only as an advanced override and cannot bypass lifecycle ordering.
 
 The lifecycle is fixed:
 
@@ -47,6 +58,6 @@ Record every candidate with `action=record`, the exact session/snapshot values, 
 
 A confirmed blocker requires concise parent evidence. Critical/high findings with high confidence may block. Medium findings block only when deterministic and explicitly contract-based. Low, plausible, medium/low-confidence, stylistic, speculative, intentional, pre-existing, and check-caught concerns do not block.
 
-Record dispositions before editing. Fix confirmed blockers in one coherent remediation commit, run relevant checks, and call `code_review` again with `phase=auto` and the returned `sessionId`. If the final pass still has a blocker, stop for architecture or product attention.
+Record dispositions before editing. Fix confirmed blockers in one coherent remediation commit, run relevant checks, and call `code_review` again with `action=loop` and the returned `sessionId`. If the final pass still has a blocker, stop for architecture or product attention.
 
 `APPROVE` is a code-review decision only. It does not claim that required project checks ran or replace the parent or existing plan-mode verifier workflows. Use `action=status` to inspect the lifecycle without running reviewers. Use `action=reset` only with explicit user authorization and `confirmReset=true`.

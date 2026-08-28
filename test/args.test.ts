@@ -18,7 +18,18 @@ describe("parseReviewArgs", () => {
     expect(parseReviewArgs("--effort=ultra --comment 123")).toMatchObject({ action: "run", target: "123", comment: true, effort: "ultra" });
   });
 
-  it("parses status, reset, and managed-review identity flags", () => {
+  it("keeps ordinary reviews one-shot and parses managed loop arguments", () => {
+    expect(parseReviewArgs("main")).toMatchObject({ action: "run", target: "main", phase: "auto" });
+    expect(parseReviewArgs("loop main")).toMatchObject({ action: "loop", target: "main", phase: "auto" });
+    expect(parseReviewArgs("loop --phase delta --implementation impl --plan plan.md")).toMatchObject({
+      action: "loop",
+      phase: "delta",
+      implementationId: "impl",
+      planPath: "plan.md",
+    });
+  });
+
+  it("parses status, reset, and advanced managed-review identity flags", () => {
     expect(parseReviewArgs("status --plan '/tmp/plan.md'")).toMatchObject({ action: "status", planPath: "/tmp/plan.md" });
     expect(parseReviewArgs("reset --session abc --confirm")).toMatchObject({ action: "reset", sessionId: "abc", confirmReset: true });
     expect(parseReviewArgs("--phase delta --implementation impl --plan plan.md")).toMatchObject({ phase: "delta", implementationId: "impl", planPath: "plan.md" });

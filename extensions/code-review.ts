@@ -22,7 +22,7 @@ import { captureReviewSnapshot, resolveReviewTarget } from "../src/targets.js";
 import type { ReviewDecision, ReviewPhase, ReviewResult, ReviewTarget } from "../src/types.js";
 
 interface ReviewToolParams {
-  readonly action?: "run" | "record" | "status" | "reset" | undefined;
+  readonly action?: "run" | "loop" | "record" | "status" | "reset" | undefined;
   readonly target?: string | undefined;
   readonly comment?: boolean | undefined;
   readonly effort?: string | undefined;
@@ -49,6 +49,7 @@ interface ReviewExecutionContext {
 }
 
 const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
+  { value: "loop", label: "loop — start or continue the managed review loop" },
   { value: "low", label: "low — cheapest one-shot review (default)" },
   { value: "status", label: "status — inspect a managed review session" },
   { value: "reset", label: "reset — reset a managed review session" },
@@ -58,10 +59,10 @@ const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
   { value: "--effort xhigh", label: "--effort xhigh — very expensive review" },
   { value: "--effort max", label: "--effort max — maximum-depth review" },
   { value: "--effort ultra", label: "--effort ultra — maximum review plus second verification" },
-  { value: "--phase initial", label: "--phase initial — start managed lifecycle" },
-  { value: "--phase auto", label: "--phase auto — run next managed phase" },
-  { value: "--phase delta", label: "--phase delta — review remediation changes" },
-  { value: "--phase final", label: "--phase final — final managed confirmation" },
+  { value: "--phase initial", label: "--phase initial — advanced managed override" },
+  { value: "--phase auto", label: "--phase auto — advanced automatic override" },
+  { value: "--phase delta", label: "--phase delta — advanced remediation override" },
+  { value: "--phase final", label: "--phase final — advanced confirmation override" },
   { value: "--plan ", label: "--plan <path> — bind a managed plan" },
   { value: "--session ", label: "--session <id> — select managed session" },
   { value: "--implementation ", label: "--implementation <id> — select implementation" },
@@ -226,6 +227,18 @@ async function requireCurrentAdjudicationTarget(
   }
 }
 
+export function reviewExecutionSelection(
+  params: Pick<ReviewToolParams, "action" | "phase" | "planPath" | "implementationId" | "sessionId">,
+): { readonly managed: boolean; readonly requestedPhase: "auto" | ReviewPhase } {
+  const requestedPhase = params.phase ?? "auto";
+  return {
+    requestedPhase,
+    managed: params.action === "loop"
+      || Boolean(params.planPath?.trim() || params.implementationId?.trim() || params.sessionId?.trim()
+        || requestedPhase === "initial" || requestedPhase === "delta" || requestedPhase === "final"),
+  };
+}
+
 async function executeReview(
   ctx: ReviewExecutionContext,
   params: ReviewToolParams,
@@ -233,7 +246,7 @@ async function executeReview(
 ): Promise<ReviewResult> {
   const commands = new NodeCommandRunner();
   const action = params.action ?? "run";
-  if (!["run", "record", "status", "reset"].includes(action)) throw new Error(`Unknown code-review action: ${action}`);
+  if (!["run", "loop", "record", "status", "reset"].includes(action)) throw new Error(`Unknown code-review action: ${action}`);
   const effort = parseReviewEffort(params.effort);
   const planPath = params.planPath?.trim();
   const dependencies = {
@@ -291,9 +304,8 @@ async function executeReview(
     return plainResult(`### Code review reset\n\n${message}`, effort);
   }
 
-  const phase = params.phase ?? "auto";
+  const { requestedPhase: phase, managed } = reviewExecutionSelection(params);
   if (!["auto", "initial", "delta", "final"].includes(phase)) throw new Error(`Unknown code-review phase: ${phase}`);
-  const managed = Boolean(planPath || params.implementationId?.trim() || params.sessionId?.trim() || phase === "initial" || phase === "delta" || phase === "final");
   const implementationId = managed
   ? inferredImplementationId ?? (params.sessionId?.trim() ? undefined : await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal))
   : undefined;
@@ -364,7 +376,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("code-review", {
-    description: "Run or inspect the bounded stateful code-review lifecycle (default effort: low)",
+    description: "Run a one-shot review or start/continue a managed review loop (default effort: low)",
     getArgumentCompletions: getReviewArgumentCompletions,
     handler: async (args, ctx) => {
       try {
@@ -391,9 +403,9 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "code_review",
     label: "Code Review",
-    description: "Run, adjudicate, inspect, or explicitly reset the bounded initial/delta/final code-review lifecycle. Results are report-only unless comment is explicitly true for a one-shot pull-request review.",
+    description: "Run a one-shot review or start/continue the bounded managed review loop. Results are report-only unless comment is explicitly true for a one-shot pull-request review.",
     parameters: Type.Object({
-      action: Type.Optional(Type.Union([Type.Literal("run"), Type.Literal("record"), Type.Literal("status"), Type.Literal("reset")])),
+      action: Type.Optional(Type.Union([Type.Literal("run"), Type.Literal("loop"), Type.Literal("record"), Type.Literal("status"), Type.Literal("reset")])),
       target: Type.Optional(Type.String({ description: "Pull request number/URL, branch, path, worktree, or omit for current diff" })),
       comment: Type.Optional(Type.Boolean({ description: "Publish only for an explicit one-shot pull-request review" })),
       effort: Type.Optional(Type.String({ description: "Review depth: low, medium, high, xhigh, max, or ultra" })),

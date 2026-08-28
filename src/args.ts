@@ -1,7 +1,7 @@
 import { isReviewEffort, parseReviewEffort, type ReviewEffort } from "./effort.js";
 import type { ReviewPhase } from "./types.js";
 
-export type ReviewCommandAction = "run" | "status" | "reset";
+export type ReviewCommandAction = "run" | "loop" | "status" | "reset";
 
 export interface ParsedReviewArgs {
   readonly action: ReviewCommandAction;
@@ -83,7 +83,7 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
   let confirmReset = false;
   let target: string | undefined;
 
-  if (tokens[0] === "status" || tokens[0] === "reset") {
+  if (tokens[0] === "loop" || tokens[0] === "status" || tokens[0] === "reset") {
     action = tokens.shift() as ReviewCommandAction;
   }
 

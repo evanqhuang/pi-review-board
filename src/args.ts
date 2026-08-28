@@ -73,7 +73,7 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
   const tokens = tokenize(input);
   let action: ReviewCommandAction = "run";
   let comment = false;
-  let effort: ReviewEffort = "medium";
+  let effort: ReviewEffort = "low";
   let effortProvided = false;
   let model: string | undefined;
   let phase: ReviewPhase | "auto" = "auto";
@@ -88,7 +88,6 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
   } else if (tokens[0] === "audit") {
     tokens.shift();
     phase = "audit";
-    effort = "high";
   }
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -153,7 +152,6 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
     target = token;
   }
 
-  if (phase === "audit" && !effortProvided) effort = "high";
   if (action === "reset" && !confirmReset) {
     // The command handler will return an explanatory refusal rather than
     // allowing an accidental reset from a terse command.

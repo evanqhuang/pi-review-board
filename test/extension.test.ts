@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   buildManagedImplementationId,
+  getReviewArgumentCompletions,
   injectReviewResult,
   validateFindingDispositionInputs,
 } from "../extensions/code-review.js";
@@ -18,6 +19,13 @@ const result: ReviewResult = {
 };
 
 describe("review extension helpers", () => {
+  it("offers discoverable command arguments and preserves completed input", () => {
+    expect(getReviewArgumentCompletions("")?.map((item) => item.value)).toContain("--effort low");
+    expect(getReviewArgumentCompletions("--e")?.map((item) => item.value)).toContain("--effort low");
+    expect(getReviewArgumentCompletions("status --s")?.map((item) => item.value)).toContain("status --session ");
+    expect(getReviewArgumentCompletions("unknown")).toBeNull();
+  });
+
   it("injects the complete rendered report as a model-visible custom message", () => {
     const sendMessage = vi.fn();
     injectReviewResult({ sendMessage }, result);

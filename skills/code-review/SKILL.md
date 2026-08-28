@@ -12,7 +12,7 @@ This skill does not replace or disable `pi-plan-mode` orchestration, PREWALK, `L
 
 ## One-shot review
 
-For a normal report-only review, call `code_review` once with `action=run` and the requested target. Publishing requires explicit user authorization through `comment=true`.
+For a normal report-only review, call `code_review` once with `action=run` and the requested target. The default effort is `low`; use a higher effort only when the user explicitly requests it. Publishing requires explicit user authorization through `comment=true`.
 
 ## Managed implementation review
 

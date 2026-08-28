@@ -1,5 +1,5 @@
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Markdown, matchesKey } from "@earendil-works/pi-tui";
+import { Markdown, matchesKey, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
@@ -46,6 +46,39 @@ interface ReviewExecutionContext {
   readonly cwd: string;
   readonly signal?: AbortSignal | undefined;
   readonly ui: ReviewUI;
+}
+
+const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
+  { value: "low", label: "low — cheapest one-shot review (default)" },
+  { value: "status", label: "status — inspect a managed review session" },
+  { value: "audit", label: "audit — audit with low effort by default" },
+  { value: "reset", label: "reset — reset a managed review session" },
+  { value: "--effort low", label: "--effort low — cheapest review (default)" },
+  { value: "--effort medium", label: "--effort medium — broader review" },
+  { value: "--effort high", label: "--effort high — expensive deep review" },
+  { value: "--effort xhigh", label: "--effort xhigh — very expensive review" },
+  { value: "--effort max", label: "--effort max — maximum-depth review" },
+  { value: "--effort ultra", label: "--effort ultra — maximum review plus second verification" },
+  { value: "--phase initial", label: "--phase initial — start managed lifecycle" },
+  { value: "--phase auto", label: "--phase auto — run next managed phase" },
+  { value: "--phase delta", label: "--phase delta — review remediation changes" },
+  { value: "--phase final", label: "--phase final — final managed confirmation" },
+  { value: "--plan ", label: "--plan <path> — bind a managed plan" },
+  { value: "--session ", label: "--session <id> — select managed session" },
+  { value: "--implementation ", label: "--implementation <id> — select implementation" },
+  { value: "--model ", label: "--model <provider/model> — override reviewer model" },
+  { value: "--comment", label: "--comment — publish a one-shot PR review" },
+  { value: "--confirm", label: "--confirm — confirm an explicit reset" },
+];
+
+export function getReviewArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+  const tokenStart = prefix.lastIndexOf(" ") + 1;
+  const completedPrefix = prefix.slice(0, tokenStart);
+  const currentToken = prefix.slice(tokenStart).toLowerCase();
+  const matches = REVIEW_ARGUMENT_COMPLETIONS
+    .filter((item) => item.value.toLowerCase().startsWith(currentToken))
+    .map((item) => ({ ...item, value: `${completedPrefix}${item.value}` }));
+  return matches.length > 0 ? matches : null;
 }
 
 const FINDING_DISPOSITIONS = new Set<FindingDispositionInput["disposition"]>([
@@ -283,7 +316,7 @@ async function executeReview(
       cwd,
       target,
       comment: params.comment === true,
-      effort: phase === "audit" && params.effort === undefined ? "high" : effort,
+      effort,
       ...(phase === "audit" ? { phase: "audit" as const } : {}),
     }, dependencies, cancellation.signal);
   } finally {
@@ -333,7 +366,8 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("code-review", {
-    description: "Run or inspect the bounded stateful code-review lifecycle",
+    description: "Run or inspect the bounded stateful code-review lifecycle (default effort: low)",
+    getArgumentCompletions: getReviewArgumentCompletions,
     handler: async (args, ctx) => {
       try {
         const parsed = parseReviewArgs(args);
@@ -410,7 +444,7 @@ export default function (pi: ExtensionAPI): void {
       } catch (error) {
         return {
           content: [{ type: "text", text: `Code review failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { effort: params.effort ?? "medium", status: "incomplete", decision: "incomplete", findings: [], failures: [String(error)], commented: false },
+          details: { effort: params.effort ?? "low", status: "incomplete", decision: "incomplete", findings: [], failures: [String(error)], commented: false },
           isError: true,
         };
       }

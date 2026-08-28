@@ -6,7 +6,7 @@ describe("parseReviewArgs", () => {
     expect(parseReviewArgs("")).toEqual({
       action: "run",
       comment: false,
-      effort: "medium",
+      effort: "low",
       effortProvided: false,
       phase: "auto",
       confirmReset: false,
@@ -20,7 +20,8 @@ describe("parseReviewArgs", () => {
 
   it("parses status, audit, reset, and managed-review identity flags", () => {
     expect(parseReviewArgs("status --plan '/tmp/plan.md'")).toMatchObject({ action: "status", planPath: "/tmp/plan.md" });
-    expect(parseReviewArgs("audit 123")).toMatchObject({ action: "run", phase: "audit", effort: "high", target: "123" });
+    expect(parseReviewArgs("audit 123")).toMatchObject({ action: "run", phase: "audit", effort: "low", target: "123" });
+    expect(parseReviewArgs("audit --effort high 123")).toMatchObject({ action: "run", phase: "audit", effort: "high", target: "123" });
     expect(parseReviewArgs("reset --session abc --confirm")).toMatchObject({ action: "reset", sessionId: "abc", confirmReset: true });
     expect(parseReviewArgs("--phase delta --implementation impl --plan plan.md")).toMatchObject({ phase: "delta", implementationId: "impl", planPath: "plan.md" });
   });

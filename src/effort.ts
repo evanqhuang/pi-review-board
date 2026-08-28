@@ -156,7 +156,7 @@ export function isReviewEffort(value: string): value is ReviewEffort {
 }
 
 export function parseReviewEffort(value: string | undefined): ReviewEffort {
-  if (value === undefined) return "medium";
+  if (value === undefined) return "low";
   const normalized = value.toLowerCase();
   if (isReviewEffort(normalized)) return normalized;
   throw new Error(`Unknown effort level: ${value}. Expected low, medium, high, xhigh, max, or ultra.`);

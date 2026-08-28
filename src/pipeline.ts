@@ -10,13 +10,11 @@ import {
   promoteDirectFindings,
 } from "./output.js";
 import {
-  buildEligibilityPrompt,
   buildFinderPrompt,
   buildSummaryPrompt,
   buildBatchVerifierPrompt,
   FINDER_LENSES,
   GAP_SWEEP_LENS,
-  validateEligibility,
   validateFinder,
   validateSummary,
   validateBatchVerifier,
@@ -26,7 +24,6 @@ import {
 } from "./prompts.js";
 import {
   captureReviewSnapshot,
-  hasExistingReview,
   hasSnapshotDrift,
   isLikelyAutomatedPullRequest,
 } from "./targets.js";
@@ -34,6 +31,7 @@ import type {
   AgentInvocation,
   AgentResult,
   ReviewCandidate,
+  ReviewContract,
   ReviewDependencies,
   ReviewOptions,
   ReviewResult,
@@ -64,9 +62,9 @@ function runAgent<T>(
   return dependencies.agents.run(configuredInvocation, validate, signal, (message) => progress(dependencies, stage, message));
 }
 
-function resultWithoutSnapshot(status: ReviewResult["status"], message: string, effort: ReviewOptions["effort"]): ReviewResult {
+function resultWithoutSnapshot(status: ReviewResult["status"], message: string, options: ReviewOptions): ReviewResult {
   return {
-    effort,
+    effort: options.effort,
     status,
     summary: message,
     findings: [],
@@ -74,13 +72,14 @@ function resultWithoutSnapshot(status: ReviewResult["status"], message: string, 
     report: `### Code review\n\n${status === "ineligible" ? "Not reviewed" : "Review could not start"}: ${message}`,
     commented: false,
     usage: [],
+    ...(options.phase ? { phase: options.phase } : {}),
   };
 }
 
 function candidateWithFinder(candidate: FinderOutput["candidates"][number], finder: string, index: number): ReviewCandidate {
   return {
     ...candidate,
-    id: `${finder}:${candidate.id}:${index}`,
+    id: `${finder}:${candidate.rootCauseKey}:${index}`,
     finder,
   };
 }
@@ -91,7 +90,7 @@ function stageFailure(stage: StageFailure["stage"], error: unknown): StageFailur
 
 function completedResult(
   snapshot: ReviewSnapshot,
-  effort: ReviewOptions["effort"],
+  options: ReviewOptions,
   status: ReviewResult["status"],
   summary: string,
   findings: readonly VerifiedFinding[],
@@ -100,7 +99,7 @@ function completedResult(
   commented: boolean | "unknown",
 ): ReviewResult {
   return {
-    effort,
+    effort: options.effort,
     status,
     summary,
     findings,
@@ -108,26 +107,75 @@ function completedResult(
     report: formatReviewReport(snapshot, status, summary, findings, failures),
     commented,
     usage,
+    reviewedSnapshotHash: snapshot.snapshotHash,
+    ...(options.phase ? { phase: options.phase } : {}),
   };
 }
 
-function reviewAlreadyPerformed(snapshot: ReviewSnapshot): boolean {
-  return snapshot.pullRequest ? hasExistingReview(snapshot.pullRequest) : false;
+function bounded(items: readonly string[], limit = 20): string[] {
+  return items.slice(0, limit).map((item) => item.trim().slice(0, 500)).filter(Boolean);
+}
+
+function contractContext(contract: ReviewContract | undefined): string {
+  if (!contract) return "";
+  const sections = [
+    ["Supported guarantees", bounded(contract.guarantees)],
+    ["Explicit non-goals", bounded(contract.nonGoals)],
+    ["Risk areas", bounded(contract.riskAreas)],
+    ["Required checks", bounded(contract.requiredChecks)],
+  ] as const;
+  const rendered = sections.flatMap(([title, items]) => items.length > 0
+    ? [`${title}:`, ...items.map((item) => `- ${item}`)]
+    : []);
+  if (rendered.length === 0) return "";
+  return [
+    "Review contract supplied by the approved plan or caller:",
+    ...rendered,
+    "Do not promote an explicit non-goal into a blocker unless it violates a fundamental authorization, security, data-integrity, or backward-compatibility invariant.",
+  ].join("\n");
+}
+
+function phaseContext(options: ReviewOptions): string {
+  switch (options.phase) {
+    case "delta":
+      return "This is a remediation-delta review. Review the supplied delta and directly affected invariants. Do not restart a broad search over unchanged initial code.";
+    case "final":
+      return "This is the final bounded confirmation review. Check the final remediation delta and open high-risk invariants only; do not perform a fresh broad gap sweep.";
+    case "audit":
+      return "This is an explicit audit. Findings are observations and do not automatically reopen a previously approved managed review session.";
+    case "initial":
+      return "This is the one comprehensive initial review for the managed change.";
+    default:
+      return "";
+  }
+}
+
+function openFindingContext(options: ReviewOptions): string {
+  const findings = options.openFindings?.slice(0, 3) ?? [];
+  if (findings.length === 0) return "";
+  return [
+    "Open root causes from the prior managed pass. Re-check these invariants while reviewing the remediation delta; the parent still owns final resolution:",
+    ...findings.map((finding) => `- ${finding.id} [${finding.severity}/${finding.confidence}%] ${finding.impact} — trigger: ${finding.trigger}${finding.contractBasis ? ` — contract: ${finding.contractBasis}` : ""}`),
+  ].join("\n");
+}
+
+function appendReviewContext(summary: string, options: ReviewOptions): string {
+  return [summary, phaseContext(options), contractContext(options.contract), openFindingContext(options)].filter(Boolean).join("\n\n");
 }
 
 export async function runCodeReview(options: ReviewOptions, dependencies: ReviewDependencies, signal?: AbortSignal): Promise<ReviewResult> {
   const effortConfig = getReviewEffortConfig(options.effort);
   let snapshot: ReviewSnapshot;
   try {
-    progress(dependencies, "eligibility", "Capturing immutable review snapshot");
-    snapshot = await captureReviewSnapshot(options.target, options.cwd, dependencies.commands, signal);
+    progress(dependencies, "eligibility", options.snapshot ? "Using immutable supplied review snapshot" : "Capturing immutable review snapshot");
+    snapshot = options.snapshot ?? await captureReviewSnapshot(options.target, options.cwd, dependencies.commands, signal);
   } catch (error) {
-    return resultWithoutSnapshot("incomplete", error instanceof Error ? error.message : String(error), options.effort);
+    return resultWithoutSnapshot("incomplete", error instanceof Error ? error.message : String(error), options);
   }
   const reviewCwd = snapshot.cwd;
 
   if (snapshot.changedPaths.length === 0 || snapshot.diff.trim().length === 0) {
-    return completedResult(snapshot, options.effort, "ineligible", "No changed files were found in the requested target.", [], [], [], false);
+    return completedResult(snapshot, options, "ineligible", "No changed files were found in the requested target.", [], [], [], false);
   }
 
   const failures: StageFailure[] = [];
@@ -135,36 +183,10 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
 
   if (snapshot.pullRequest) {
     const pullRequest = snapshot.pullRequest;
-    if (pullRequest.state.toUpperCase() !== "OPEN") return completedResult(snapshot, options.effort, "ineligible", "The pull request is not open.", [], [], [], false);
-    if (pullRequest.isDraft) return completedResult(snapshot, options.effort, "ineligible", "The pull request is a draft.", [], [], [], false);
-    if (isLikelyAutomatedPullRequest(pullRequest)) return completedResult(snapshot, options.effort, "ineligible", "The pull request appears to be automated.", [], [], [], false);
-    if (reviewAlreadyPerformed(snapshot)) return completedResult(snapshot, options.effort, "ineligible", "A code review comment already exists on this pull request.", [], [], [], false);
+    if (pullRequest.state.toUpperCase() !== "OPEN") return completedResult(snapshot, options, "ineligible", "The pull request is not open.", [], [], [], false);
+    if (isLikelyAutomatedPullRequest(pullRequest)) return completedResult(snapshot, options, "ineligible", "The pull request appears to be automated.", [], [], [], false);
     if (options.comment && !pullRequest.reviewerIdentityAvailable) {
-      failures.push({ stage: "eligibility", message: "Could not verify the current reviewer identity; publishing is disabled to avoid duplicate comments." });
-    }
-  }
-
-  if (snapshot.pullRequest) {
-    progress(dependencies, "eligibility", "Checking whether the change needs review");
-    try {
-      const eligibility = await runAgent(
-        dependencies,
-        "eligibility",
-        {
-          role: "eligibility",
-          prompt: buildEligibilityPrompt(snapshot.pullRequest),
-          cwd: reviewCwd,
-          tools: ["read", "grep", "find", "ls"],
-          model: effortConfig.finderRoute.model,
-          thinking: effortConfig.finderRoute.thinking,
-        },
-        validateEligibility,
-        signal,
-      );
-      usage.push(eligibility.usage);
-      if (!eligibility.data.proceed) return completedResult(snapshot, options.effort, "ineligible", eligibility.data.reason, [], failures, usage, false);
-    } catch (error) {
-      failures.push(stageFailure("eligibility", error));
+      failures.push({ stage: "eligibility", message: "Could not verify the current reviewer identity; publishing is disabled." });
     }
   }
 
@@ -197,8 +219,11 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
       failures.push(stageFailure("summary", error));
     }
   }
+  summary = appendReviewContext(summary, options);
 
-  const finderLenses = effortConfig.finderLensNames.map((name) => FINDER_LENSES.find((lens) => lens.name === name)).filter((lens): lens is FinderLens => lens !== undefined);
+  const finderLenses = effortConfig.finderLensNames
+    .map((name) => FINDER_LENSES.find((lens) => lens.name === name))
+    .filter((lens): lens is FinderLens => lens !== undefined);
   if (finderLenses.length !== effortConfig.finderLensNames.length) {
     failures.push({ stage: "finders", message: "The configured effort level references an unavailable review pass." });
   }
@@ -233,7 +258,9 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
   const changedLocations = collectChangedLocations(snapshot.diff);
   const candidates = deduplicateCandidates(
     filterCandidatesToChangedLines(
-      finderResults.flatMap(({ lens, result }) => result?.data.candidates.slice(0, effortConfig.maxCandidatesPerFinder).map((candidate, index) => candidateWithFinder(candidate, lens.name, index)) ?? []),
+      finderResults.flatMap(({ lens, result }) => result?.data.candidates
+        .slice(0, effortConfig.maxCandidatesPerFinder)
+        .map((candidate, index) => candidateWithFinder(candidate, lens.name, index)) ?? []),
       changedLocations,
     ),
   );
@@ -281,7 +308,10 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
 
   progress(dependencies, "revalidation", "Checking that the reviewed target did not change");
   try {
-    if (await hasSnapshotDrift(snapshot, dependencies.commands, signal)) {
+    if (options.snapshot) {
+      // Managed snapshots are constructed from exact committed SHAs. The
+      // lifecycle wrapper performs its own current-HEAD revalidation.
+    } else if (await hasSnapshotDrift(snapshot, dependencies.commands, signal)) {
       failures.push({ stage: "revalidation", message: "The reviewed target changed during review; no comment was published." });
     }
   } catch (error) {
@@ -328,5 +358,5 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
   }
 
   const finalStatus: ReviewResult["status"] = failures.length > 0 ? "incomplete" : "complete";
-  return completedResult(snapshot, options.effort, finalStatus, summary, findings, failures, usage, commented);
+  return completedResult(snapshot, options, finalStatus, summary, findings, failures, usage, commented);
 }

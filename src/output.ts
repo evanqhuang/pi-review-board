@@ -145,19 +145,19 @@ export function filterCandidatesToChangedLines(
 }
 
 function candidateKey(candidate: ReviewCandidate): string {
-  return `${candidate.file}:${candidate.line}:${normalize(candidate.summary)}:${normalize(candidate.failureScenario).slice(0, 160)}`;
+  return `${candidate.category}:${normalize(candidate.rootCauseKey)}`;
 }
 
 export function deduplicateCandidates(candidates: readonly ReviewCandidate[]): ReviewCandidate[] {
-  const seen = new Set<string>();
-  const result: ReviewCandidate[] = [];
+  const byRootCause = new Map<string, ReviewCandidate>();
   for (const candidate of candidates) {
     const key = candidateKey(candidate);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(candidate);
+    const existing = byRootCause.get(key);
+    if (!existing || severityRank[candidate.severity] < severityRank[existing.severity]) {
+      byRootCause.set(key, candidate);
+    }
   }
-  return result;
+  return [...byRootCause.values()];
 }
 
 export interface FindingFilterOptions {

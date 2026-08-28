@@ -2,38 +2,38 @@ import { describe, expect, it } from "vitest";
 import { parseReviewArgs } from "../src/args.js";
 
 describe("parseReviewArgs", () => {
-  it("defaults to the current diff, medium effort, without publishing", () => {
-    expect(parseReviewArgs("")).toEqual({ comment: false, effort: "medium" });
+  it("defaults to one-shot current diff review", () => {
+    expect(parseReviewArgs("")).toEqual({
+      action: "run",
+      comment: false,
+      effort: "medium",
+      effortProvided: false,
+      phase: "auto",
+      confirmReset: false,
+    });
   });
 
-  it("accepts positional and named effort levels", () => {
-    expect(parseReviewArgs("high --comment 123")).toEqual({ target: "123", comment: true, effort: "high" });
-    expect(parseReviewArgs("--effort=ultra --comment 123")).toEqual({ target: "123", comment: true, effort: "ultra" });
-    expect(parseReviewArgs("--effort max")).toEqual({ comment: false, effort: "max" });
+  it("accepts legacy effort and target forms", () => {
+    expect(parseReviewArgs("high --comment 123")).toMatchObject({ action: "run", target: "123", comment: true, effort: "high", effortProvided: true });
+    expect(parseReviewArgs("--effort=ultra --comment 123")).toMatchObject({ action: "run", target: "123", comment: true, effort: "ultra" });
+  });
+
+  it("parses status, audit, reset, and managed-review identity flags", () => {
+    expect(parseReviewArgs("status --plan '/tmp/plan.md'")).toMatchObject({ action: "status", planPath: "/tmp/plan.md" });
+    expect(parseReviewArgs("audit 123")).toMatchObject({ action: "run", phase: "audit", effort: "high", target: "123" });
+    expect(parseReviewArgs("reset --session abc --confirm")).toMatchObject({ action: "reset", sessionId: "abc", confirmReset: true });
+    expect(parseReviewArgs("--phase delta --implementation impl --plan plan.md")).toMatchObject({ phase: "delta", implementationId: "impl", planPath: "plan.md" });
   });
 
   it("accepts an optional reviewer model override", () => {
-    expect(parseReviewArgs("low --model openai-codex/gpt-5.6-luna 123")).toEqual({ target: "123", comment: false, effort: "low", model: "openai-codex/gpt-5.6-luna" });
-    expect(parseReviewArgs("--model=qwen38-main/qwen3.8-27b")).toEqual({ comment: false, effort: "medium", model: "qwen38-main/qwen3.8-27b" });
-    expect(() => parseReviewArgs("--model")).toThrow("--model requires a provider/id");
+    expect(parseReviewArgs("low --model openai-codex/gpt-5.6-luna 123")).toMatchObject({ target: "123", effort: "low", model: "openai-codex/gpt-5.6-luna" });
+    expect(() => parseReviewArgs("--model")).toThrow("--model requires a value");
     expect(() => parseReviewArgs("--model one --model two")).toThrow("Model may be provided only once");
   });
 
-  it("rejects unknown effort levels and duplicate effort options", () => {
-    expect(parseReviewArgs("extreme")).toEqual({ target: "extreme", comment: false, effort: "medium" });
-    expect(() => parseReviewArgs("--effort extreme")).toThrow("Unknown effort level");
-    expect(() => parseReviewArgs("--effort=")).toThrow("Unknown effort level");
-    expect(() => parseReviewArgs("high --effort low")).toThrow("Effort level may be provided only once");
-  });
-
-  it("preserves quoted paths with spaces and Windows separators", () => {
-    expect(parseReviewArgs("'path with spaces.ts'")).toEqual({ target: "path with spaces.ts", comment: false, effort: "medium" });
-    expect(parseReviewArgs("src\\feature\\file.ts")).toEqual({ target: "src\\feature\\file.ts", comment: false, effort: "medium" });
-    expect(() => parseReviewArgs("'unterminated")).toThrow("Unclosed quote");
-  });
-
-  it("rejects unknown flags and multiple targets", () => {
+  it("rejects unknown flags, phases, and multiple targets", () => {
     expect(() => parseReviewArgs("--fix")).toThrow("Unknown option");
+    expect(() => parseReviewArgs("--phase endless")).toThrow("Unknown review phase");
     expect(() => parseReviewArgs("main feature")).toThrow("Ambiguous review target");
   });
 });

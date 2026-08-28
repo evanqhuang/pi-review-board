@@ -1,10 +1,20 @@
 import { isReviewEffort, parseReviewEffort, type ReviewEffort } from "./effort.js";
+import type { ReviewPhase } from "./types.js";
+
+export type ReviewCommandAction = "run" | "status" | "reset";
 
 export interface ParsedReviewArgs {
+  readonly action: ReviewCommandAction;
   readonly target?: string;
   readonly comment: boolean;
   readonly effort: ReviewEffort;
+  readonly effortProvided: boolean;
   readonly model?: string;
+  readonly phase: ReviewPhase | "auto";
+  readonly planPath?: string;
+  readonly implementationId?: string;
+  readonly sessionId?: string;
+  readonly confirmReset: boolean;
 }
 
 function tokenize(input: string): string[] {
@@ -42,14 +52,44 @@ function tokenize(input: string): string[] {
   return tokens;
 }
 
+function optionValue(tokens: readonly string[], index: number, name: string): { value: string; consumed: number } {
+  const token = tokens[index] ?? "";
+  const prefix = `${name}=`;
+  if (token.startsWith(prefix)) {
+    const value = token.slice(prefix.length);
+    if (!value) throw new Error(`${name} requires a value`);
+    return { value, consumed: 0 };
+  }
+  const value = tokens[index + 1];
+  if (!value) throw new Error(`${name} requires a value`);
+  return { value, consumed: 1 };
+}
+
+function isPhase(value: string): value is ReviewPhase | "auto" {
+  return value === "auto" || value === "initial" || value === "delta" || value === "final" || value === "audit";
+}
+
 export function parseReviewArgs(input: string): ParsedReviewArgs {
   const tokens = tokenize(input);
+  let action: ReviewCommandAction = "run";
   let comment = false;
   let effort: ReviewEffort = "medium";
   let effortProvided = false;
   let model: string | undefined;
-  let modelProvided = false;
+  let phase: ReviewPhase | "auto" = "auto";
+  let planPath: string | undefined;
+  let implementationId: string | undefined;
+  let sessionId: string | undefined;
+  let confirmReset = false;
   let target: string | undefined;
+
+  if (tokens[0] === "status" || tokens[0] === "reset") {
+    action = tokens.shift() as ReviewCommandAction;
+  } else if (tokens[0] === "audit") {
+    tokens.shift();
+    phase = "audit";
+    effort = "high";
+  }
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
@@ -59,40 +99,52 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
       comment = true;
       continue;
     }
-    if (token === "--model") {
-      if (modelProvided) throw new Error("Model may be provided only once");
-      const value = tokens[index + 1];
-      if (!value) throw new Error("--model requires a provider/id");
-      model = value;
-      modelProvided = true;
-      index += 1;
+    if (token === "--confirm") {
+      confirmReset = true;
       continue;
     }
-    if (token.startsWith("--model=")) {
-      if (modelProvided) throw new Error("Model may be provided only once");
-      const value = token.slice("--model=".length);
-      if (!value) throw new Error("--model requires a provider/id");
-      model = value;
-      modelProvided = true;
+    if (token === "--model" || token.startsWith("--model=")) {
+      if (model !== undefined) throw new Error("Model may be provided only once");
+      const parsed = optionValue(tokens, index, "--model");
+      model = parsed.value;
+      index += parsed.consumed;
       continue;
     }
-    if (token === "--effort") {
+    if (token === "--effort" || token.startsWith("--effort=")) {
       if (effortProvided) throw new Error("Effort level may be provided only once");
-      const value = tokens[index + 1];
-      if (!value) throw new Error("--effort requires a level");
-      effort = parseReviewEffort(value);
+      const parsed = optionValue(tokens, index, "--effort");
+      effort = parseReviewEffort(parsed.value);
       effortProvided = true;
-      index += 1;
+      index += parsed.consumed;
       continue;
     }
-    if (token.startsWith("--effort=")) {
-      if (effortProvided) throw new Error("Effort level may be provided only once");
-      effort = parseReviewEffort(token.slice("--effort=".length));
-      effortProvided = true;
+    if (token === "--phase" || token.startsWith("--phase=")) {
+      const parsed = optionValue(tokens, index, "--phase");
+      if (!isPhase(parsed.value)) throw new Error(`Unknown review phase: ${parsed.value}`);
+      phase = parsed.value;
+      index += parsed.consumed;
+      continue;
+    }
+    if (token === "--plan" || token.startsWith("--plan=")) {
+      const parsed = optionValue(tokens, index, "--plan");
+      planPath = parsed.value;
+      index += parsed.consumed;
+      continue;
+    }
+    if (token === "--implementation" || token.startsWith("--implementation=")) {
+      const parsed = optionValue(tokens, index, "--implementation");
+      implementationId = parsed.value;
+      index += parsed.consumed;
+      continue;
+    }
+    if (token === "--session" || token.startsWith("--session=")) {
+      const parsed = optionValue(tokens, index, "--session");
+      sessionId = parsed.value;
+      index += parsed.consumed;
       continue;
     }
     if (token.startsWith("-")) throw new Error(`Unknown option: ${token}`);
-    if (!effortProvided && target === undefined && isReviewEffort(token)) {
+    if (action === "run" && !effortProvided && target === undefined && isReviewEffort(token)) {
       effort = parseReviewEffort(token);
       effortProvided = true;
       continue;
@@ -101,6 +153,23 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
     target = token;
   }
 
-  if (target === undefined) return model === undefined ? { comment, effort } : { comment, effort, model };
-  return model === undefined ? { target, comment, effort } : { target, comment, effort, model };
+  if (phase === "audit" && !effortProvided) effort = "high";
+  if (action === "reset" && !confirmReset) {
+    // The command handler will return an explanatory refusal rather than
+    // allowing an accidental reset from a terse command.
+  }
+
+  return {
+    action,
+    comment,
+    effort,
+    effortProvided,
+    phase,
+    confirmReset,
+    ...(target === undefined ? {} : { target }),
+    ...(model === undefined ? {} : { model }),
+    ...(planPath === undefined ? {} : { planPath }),
+    ...(implementationId === undefined ? {} : { implementationId }),
+    ...(sessionId === undefined ? {} : { sessionId }),
+  };
 }

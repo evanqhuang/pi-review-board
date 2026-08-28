@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildBatchVerifierPrompt, validateBatchVerifier } from "../src/prompts.js";
+import { buildBatchVerifierPrompt, buildFinderPrompt, FINDER_LENSES, validateBatchVerifier, validateFinder } from "../src/prompts.js";
 import type { ReviewCandidate, ReviewSnapshot } from "../src/types.js";
 
 const candidates: readonly ReviewCandidate[] = [
   {
-    id: "diff-correctness:first:0",
+    id: "diff-correctness:cache:cold-refresh-skipped:0",
+    rootCauseKey: "cache:cold-refresh-skipped",
     file: "src/cache.ts",
     line: 12,
     summary: "Skips cache refresh",
@@ -15,7 +16,8 @@ const candidates: readonly ReviewCandidate[] = [
     finder: "diff-correctness",
   },
   {
-    id: "cross-file:second:0",
+    id: "cross-file:client:error-contract-dropped:0",
+    rootCauseKey: "client:error-contract-dropped",
     file: "src/client.ts",
     line: 24,
     summary: "Drops the error contract",
@@ -48,7 +50,24 @@ function verdict(candidateId: string) {
   };
 }
 
-describe("batch verifier contract", () => {
+describe("finder and batch verifier contract", () => {
+  it("requires a semantic root-cause key from every finder candidate", () => {
+    expect(() => validateFinder({ candidates: [{
+      id: "candidate-1",
+      file: "src/cache.ts",
+      line: 12,
+      summary: "Skips cache refresh",
+      failureScenario: "A cold cache returns stale data",
+      evidence: "The changed branch returns before refresh",
+      category: "correctness",
+      severity: "high",
+    }] })).toThrow("rootCauseKey");
+
+    const prompt = buildFinderPrompt(FINDER_LENSES[0]!, snapshot, [], "summary");
+    expect(prompt).toContain("rootCauseKey");
+    expect(prompt).toContain("not an ordinal");
+  });
+
   it("validates one verdict for every candidate and preserves IDs", () => {
     const result = validateBatchVerifier(
       { verifications: [verdict(secondCandidate.id), verdict(firstCandidate.id)] },

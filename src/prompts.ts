@@ -37,6 +37,7 @@ export interface SummaryOutput {
 
 export interface FinderCandidate {
   readonly id: string;
+  readonly rootCauseKey: string;
   readonly file: string;
   readonly line: number;
   readonly summary: string;
@@ -106,6 +107,7 @@ export function validateFinder(value: unknown): FinderOutput {
     if (!severities.has(severity)) throw new Error(`Unknown candidate severity: ${severity}`);
     return {
       id: string(item.id, `candidates[${index}].id`),
+      rootCauseKey: string(item.rootCauseKey, `candidates[${index}].rootCauseKey`),
       file: string(item.file, `candidates[${index}].file`),
       line: integer(item.line, `candidates[${index}].line`),
       summary: string(item.summary, `candidates[${index}].summary`),
@@ -219,7 +221,8 @@ export function buildFinderPrompt(
     "Inspect only the supplied change and relevant repository context.",
     contextInstruction(options.contextDepth, options.fullContext, "finder"),
     "Report only concrete defects on changed lines. Do not report style, missing tests, compiler-detectable issues, pre-existing problems, intentional behavior, or speculative concerns.",
-    "Return JSON only with this shape: {\"candidates\":[{\"id\":\"stable-id\",\"file\":\"path\",\"line\":1,\"summary\":\"defect\",\"failureScenario\":\"input/state -> wrong output/crash\",\"evidence\":\"why\",\"category\":\"correctness|guidance|history|integration|contract\",\"severity\":\"critical|high|medium|low\"}]}.",
+    "For each defect, rootCauseKey must be a concise semantic invariant key that is unique to the root cause, not an ordinal, filename, line number, or wording-dependent summary. Reuse the same rootCauseKey when the same underlying defect moves or is reworded.",
+    "Return JSON only with this shape: {\"candidates\":[{\"id\":\"correlation-id\",\"rootCauseKey\":\"semantic-root-cause-key\",\"file\":\"path\",\"line\":1,\"summary\":\"defect\",\"failureScenario\":\"input/state -> wrong output/crash\",\"evidence\":\"why\",\"category\":\"correctness|guidance|history|integration|contract\",\"severity\":\"critical|high|medium|low\"}]}.",
     "If no concrete defect exists, return {\"candidates\":[]}.",
     inputBlock(snapshot, guidance, summary),
   ].join("\n");

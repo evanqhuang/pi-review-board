@@ -26,11 +26,32 @@ export type ReviewTarget =
   | { readonly kind: "path"; readonly path: string }
   | { readonly kind: "worktree"; readonly path: string };
 
+export type ReviewPhase = "initial" | "delta" | "final" | "audit";
+export type ReviewDecision =
+  | "awaiting-adjudication"
+  | "approve"
+  | "comment"
+  | "request-changes"
+  | "incomplete"
+  | "blocked";
+
+export interface ReviewContract {
+  readonly guarantees: readonly string[];
+  readonly nonGoals: readonly string[];
+  readonly riskAreas: readonly string[];
+  readonly requiredChecks: readonly string[];
+  readonly source?: string;
+}
+
 export interface ReviewOptions {
   readonly cwd: string;
   readonly target: ReviewTarget;
   readonly comment: boolean;
   readonly effort: ReviewEffort;
+  readonly phase?: ReviewPhase;
+  readonly contract?: ReviewContract;
+  readonly snapshot?: ReviewSnapshot;
+  readonly openFindings?: readonly FindingLedgerEntry[];
 }
 
 export interface ReviewSnapshot {
@@ -49,6 +70,7 @@ export type FindingSeverity = "critical" | "high" | "medium" | "low";
 
 export interface ReviewCandidate {
   readonly id: string;
+  readonly rootCauseKey: string;
   readonly file: string;
   readonly line: number;
   readonly summary: string;
@@ -78,6 +100,51 @@ export interface StageFailure {
   readonly message: string;
 }
 
+export type FindingLedgerStatus =
+  | "candidate"
+  | "open"
+  | "resolved"
+  | "non-blocking"
+  | "accepted-risk"
+  | "product-decision"
+  | "follow-up"
+  | "not-reproducible";
+
+export interface FindingLedgerEntry {
+  readonly id: string;
+  readonly rootCauseKey: string;
+  readonly severity: FindingSeverity;
+  readonly confidence: number;
+  readonly status: FindingLedgerStatus;
+  readonly firstObservedHead: string;
+  readonly lastVerifiedHead: string;
+  readonly introducedByDelta: boolean;
+  readonly file: string;
+  readonly line: number;
+  readonly trigger: string;
+  readonly impact: string;
+  readonly contractBasis?: string;
+  readonly evidence: string;
+  readonly parentEvidence?: string;
+}
+
+export interface ReviewLedgerSummary {
+  readonly sessionId: string;
+  readonly implementationId?: string;
+  readonly target: ReviewTarget;
+  readonly targetIdentity: string;
+  readonly phase: ReviewPhase | "approved" | "blocked";
+  readonly decision: ReviewDecision;
+  readonly baseSha: string;
+  readonly lastReviewedHead?: string;
+  readonly lastReviewedSnapshotHash?: string;
+  readonly completedPasses: number;
+  readonly remediationBatches: number;
+  readonly incompleteAttemptsThisPhase: number;
+  readonly awaitingAdjudication: boolean;
+  readonly findings: readonly FindingLedgerEntry[];
+}
+
 export interface ReviewResult {
   readonly effort: ReviewEffort;
   readonly status: "complete" | "ineligible" | "incomplete";
@@ -87,6 +154,11 @@ export interface ReviewResult {
   readonly report: string;
   readonly commented: boolean | "unknown";
   readonly usage: readonly AgentUsage[];
+  readonly phase?: ReviewPhase;
+  readonly decision?: ReviewDecision;
+  readonly sessionId?: string;
+  readonly reviewedSnapshotHash?: string;
+  readonly ledger?: ReviewLedgerSummary;
 }
 
 export interface AgentUsage {

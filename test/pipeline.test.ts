@@ -72,7 +72,8 @@ class FakeAgents implements ReviewAgentRunner {
     else if (invocation.role.startsWith("finder:")) {
       value = {
         candidates: [{
-          id: "same-defect",
+          id: "candidate-1",
+          rootCauseKey: "cache:cold-refresh-skipped",
           file: "src/a.ts",
           line: 4,
           summary: "Skips refresh on a cold cache",
@@ -137,7 +138,7 @@ describe("runCodeReview", () => {
     const verifierCalls = agents.roles.map((role, index) => ({ role, model: agents.models[index], thinking: agents.thinkings[index] })).filter(({ role }) => role === "verifier");
     expect(finderCalls.every(({ model, thinking }) => model === "openai-codex/gpt-5.6-luna" && thinking === "xhigh")).toBe(true);
     expect(verifierCalls).toEqual([{ role: "verifier", model: "openai-codex/gpt-5.6-sol", thinking: "medium" }]);
-    expect(agents.prompts.find((prompt) => prompt.includes("as one batch"))).toContain("diff-correctness:same-defect:0");
+    expect(agents.prompts.find((prompt) => prompt.includes("as one batch"))).toContain("diff-correctness:cache:cold-refresh-skipped:0");
   });
 
   it("changes execution depth for every effort level", async () => {

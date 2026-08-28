@@ -13,6 +13,7 @@ const snapshot: ReviewSnapshot = {
 function candidate(overrides: Partial<ReviewCandidate> = {}): ReviewCandidate {
   return {
     id: "finder:one:0",
+    rootCauseKey: "cache:stale-value",
     file: "src/a.ts",
     line: 12,
     summary: "Uses stale value",
@@ -26,11 +27,18 @@ function candidate(overrides: Partial<ReviewCandidate> = {}): ReviewCandidate {
 }
 
 describe("review output", () => {
-  it("deduplicates the same defect while retaining distinct defects on one line", () => {
+  it("deduplicates a root cause across wording and location while retaining distinct roots", () => {
     const first = candidate();
-    const same = candidate({ id: "finder:two:0", finder: "history" });
-    const distinct = candidate({ id: "finder:three:0", summary: "Drops error state" });
-    expect(deduplicateCandidates([first, same, distinct])).toHaveLength(2);
+    const sameRoot = candidate({
+      id: "finder:two:0",
+      finder: "history",
+      file: "src/other.ts",
+      line: 44,
+      summary: "Cold startup bypasses cache population",
+      failureScenario: "The first read observes stale state",
+    });
+    const distinct = candidate({ id: "finder:three:0", rootCauseKey: "errors:dropped-state", summary: "Drops error state" });
+    expect(deduplicateCandidates([first, sameRoot, distinct])).toHaveLength(2);
   });
 
   it("accepts only changed locations and rejects verifier corrections outside them", () => {

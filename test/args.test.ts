@@ -18,10 +18,8 @@ describe("parseReviewArgs", () => {
     expect(parseReviewArgs("--effort=ultra --comment 123")).toMatchObject({ action: "run", target: "123", comment: true, effort: "ultra" });
   });
 
-  it("parses status, audit, reset, and managed-review identity flags", () => {
+  it("parses status, reset, and managed-review identity flags", () => {
     expect(parseReviewArgs("status --plan '/tmp/plan.md'")).toMatchObject({ action: "status", planPath: "/tmp/plan.md" });
-    expect(parseReviewArgs("audit 123")).toMatchObject({ action: "run", phase: "audit", effort: "low", target: "123" });
-    expect(parseReviewArgs("audit --effort high 123")).toMatchObject({ action: "run", phase: "audit", effort: "high", target: "123" });
     expect(parseReviewArgs("reset --session abc --confirm")).toMatchObject({ action: "reset", sessionId: "abc", confirmReset: true });
     expect(parseReviewArgs("--phase delta --implementation impl --plan plan.md")).toMatchObject({ phase: "delta", implementationId: "impl", planPath: "plan.md" });
   });
@@ -35,6 +33,7 @@ describe("parseReviewArgs", () => {
   it("rejects unknown flags, phases, and multiple targets", () => {
     expect(() => parseReviewArgs("--fix")).toThrow("Unknown option");
     expect(() => parseReviewArgs("--phase endless")).toThrow("Unknown review phase");
+    expect(() => parseReviewArgs("--phase audit")).toThrow("Unknown review phase");
     expect(() => parseReviewArgs("main feature")).toThrow("Ambiguous review target");
   });
 });

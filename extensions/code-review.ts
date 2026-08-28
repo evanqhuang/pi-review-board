@@ -51,7 +51,6 @@ interface ReviewExecutionContext {
 const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
   { value: "low", label: "low — cheapest one-shot review (default)" },
   { value: "status", label: "status — inspect a managed review session" },
-  { value: "audit", label: "audit — audit with low effort by default" },
   { value: "reset", label: "reset — reset a managed review session" },
   { value: "--effort low", label: "--effort low — cheapest review (default)" },
   { value: "--effort medium", label: "--effort medium — broader review" },
@@ -293,8 +292,8 @@ async function executeReview(
   }
 
   const phase = params.phase ?? "auto";
-  if (!["auto", "initial", "delta", "final", "audit"].includes(phase)) throw new Error(`Unknown code-review phase: ${phase}`);
-  const managed = phase !== "audit" && Boolean(planPath || params.implementationId?.trim() || params.sessionId?.trim() || phase === "initial" || phase === "delta" || phase === "final");
+  if (!["auto", "initial", "delta", "final"].includes(phase)) throw new Error(`Unknown code-review phase: ${phase}`);
+  const managed = Boolean(planPath || params.implementationId?.trim() || params.sessionId?.trim() || phase === "initial" || phase === "delta" || phase === "final");
   const implementationId = managed
   ? inferredImplementationId ?? (params.sessionId?.trim() ? undefined : await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal))
   : undefined;
@@ -317,7 +316,6 @@ async function executeReview(
       target,
       comment: params.comment === true,
       effort,
-      ...(phase === "audit" ? { phase: "audit" as const } : {}),
     }, dependencies, cancellation.signal);
   } finally {
     cancellation.dispose();
@@ -400,7 +398,7 @@ export default function (pi: ExtensionAPI): void {
       comment: Type.Optional(Type.Boolean({ description: "Publish only for an explicit one-shot pull-request review" })),
       effort: Type.Optional(Type.String({ description: "Review depth: low, medium, high, xhigh, max, or ultra" })),
       model: Type.Optional(Type.String({ description: "Reviewer model provider/id override" })),
-      phase: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("initial"), Type.Literal("delta"), Type.Literal("final"), Type.Literal("audit")])),
+      phase: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("initial"), Type.Literal("delta"), Type.Literal("final")])),
       planPath: Type.Optional(Type.String({ description: "Managed plan path whose review contract and implementation identity should be used" })),
       implementationId: Type.Optional(Type.String({ description: "Stable approved implementation identity" })),
       sessionId: Type.Optional(Type.String({ description: "Review session ID returned by a prior managed run" })),

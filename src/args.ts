@@ -66,7 +66,7 @@ function optionValue(tokens: readonly string[], index: number, name: string): { 
 }
 
 function isPhase(value: string): value is ReviewPhase | "auto" {
-  return value === "auto" || value === "initial" || value === "delta" || value === "final" || value === "audit";
+  return value === "auto" || value === "initial" || value === "delta" || value === "final";
 }
 
 export function parseReviewArgs(input: string): ParsedReviewArgs {
@@ -85,9 +85,6 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
 
   if (tokens[0] === "status" || tokens[0] === "reset") {
     action = tokens.shift() as ReviewCommandAction;
-  } else if (tokens[0] === "audit") {
-    tokens.shift();
-    phase = "audit";
   }
 
   for (let index = 0; index < tokens.length; index += 1) {

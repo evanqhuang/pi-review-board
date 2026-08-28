@@ -141,8 +141,6 @@ function phaseContext(options: ReviewOptions): string {
       return "This is a remediation-delta review. Review the supplied delta and directly affected invariants. Do not restart a broad search over unchanged initial code.";
     case "final":
       return "This is the final bounded confirmation review. Check the final remediation delta and open high-risk invariants only; do not perform a fresh broad gap sweep.";
-    case "audit":
-      return "This is an explicit audit. Findings are observations and do not automatically reopen a previously approved managed review session.";
     case "initial":
       return "This is the one comprehensive initial review for the managed change.";
     default:

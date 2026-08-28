@@ -339,7 +339,7 @@ function reviewHash(target: ReviewTarget, diff: string, paths: readonly string[]
   return hash(JSON.stringify({ target, diff, paths, base, head }));
 }
 
-async function localSnapshot(target: ReviewTarget, cwd: string, commands: CommandRunner, phase: Exclude<ReviewPhase, "audit">, previousHead?: string, signal?: AbortSignal): Promise<ReviewSnapshot> {
+async function localSnapshot(target: ReviewTarget, cwd: string, commands: CommandRunner, phase: ReviewPhase, previousHead?: string, signal?: AbortSignal): Promise<ReviewSnapshot> {
   await requireClean(cwd, commands, signal);
   const head = (await command(commands, cwd, "git", ["rev-parse", "HEAD"], signal)).trim();
   const base = phase === "initial" ? await baseSha(cwd, commands, signal) : previousHead;
@@ -355,7 +355,7 @@ async function localSnapshot(target: ReviewTarget, cwd: string, commands: Comman
   return { target, cwd, changedPaths: paths, diff, snapshotHash: reviewHash(target, diff, paths, base, head), baseSha: base, headSha: head };
 }
 
-async function managedSnapshot(input: ManagedReviewRunInput & { readonly target: ReviewTarget }, phase: Exclude<ReviewPhase, "audit">, previousHead: string | undefined, dependencies: ReviewDependencies, signal?: AbortSignal): Promise<ReviewSnapshot> {
+async function managedSnapshot(input: ManagedReviewRunInput & { readonly target: ReviewTarget }, phase: ReviewPhase, previousHead: string | undefined, dependencies: ReviewDependencies, signal?: AbortSignal): Promise<ReviewSnapshot> {
   if (input.target.kind !== "pull-request") return localSnapshot(input.target, input.cwd, dependencies.commands, phase, previousHead, signal);
   if (phase === "initial") return captureReviewSnapshot(input.target, input.cwd, dependencies.commands, signal);
   const current = await captureReviewSnapshot(input.target, input.cwd, dependencies.commands, signal);
@@ -439,7 +439,7 @@ function newLedger(root: string, target: ReviewTarget, base: string, implementat
   };
 }
 
-function selectPhase(ledger: Ledger, requested: ManagedReviewRunInput["requestedPhase"]): Exclude<ReviewPhase, "audit"> {
+function selectPhase(ledger: Ledger, requested: ManagedReviewRunInput["requestedPhase"]): ReviewPhase {
   if (ledger.phase === "blocked" || ledger.decision === "blocked") throw new Error("This review session is blocked; do not run another pass");
   if (ledger.awaitingAdjudication) throw new Error("Record parent dispositions for the last review before running another pass");
   if (ledger.completedPasses >= MAX_PASSES) throw new Error("No fourth review pass is permitted");
@@ -454,7 +454,7 @@ function rootKey(finding: VerifiedFinding): string {
   return `root:${hash(`${finding.category}|${normalize(finding.rootCauseKey)}`).slice(0, 20)}`;
 }
 
-function mergeFindings(ledger: Ledger, findings: readonly VerifiedFinding[], head: string, phase: Exclude<ReviewPhase, "audit">): VerifiedFinding[] {
+function mergeFindings(ledger: Ledger, findings: readonly VerifiedFinding[], head: string, phase: ReviewPhase): VerifiedFinding[] {
   const nextNumber = () => `REV-${String(ledger.findings.length + 1).padStart(3, "0")}`;
   const output: VerifiedFinding[] = [];
   for (const finding of findings.slice(0, 5)) {
@@ -519,7 +519,7 @@ function resultFromLedger(ledger: Ledger, note: string): ReviewResult {
   };
 }
 
-async function markIncomplete(path: string, ledger: Ledger, phase: Exclude<ReviewPhase, "audit">, message: string): Promise<ReviewResult> {
+async function markIncomplete(path: string, ledger: Ledger, phase: ReviewPhase, message: string): Promise<ReviewResult> {
   ledger.incompleteAttemptsThisPhase += 1;
   ledger.decision = ledger.incompleteAttemptsThisPhase >= MAX_INCOMPLETE ? "blocked" : "incomplete";
   if (ledger.decision === "blocked") ledger.phase = "blocked";

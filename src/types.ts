@@ -26,7 +26,7 @@ export type ReviewTarget =
   | { readonly kind: "path"; readonly path: string }
   | { readonly kind: "worktree"; readonly path: string };
 
-export type ReviewPhase = "initial" | "delta" | "final" | "audit";
+export type ReviewPhase = "initial" | "delta" | "final";
 export type ReviewDecision =
   | "awaiting-adjudication"
   | "approve"

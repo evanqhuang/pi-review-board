@@ -313,7 +313,7 @@ async function executeReview(
   try {
     if (managed) {
       await requireManagedTargetCheckout(targetContext, target, commands);
-      return runManagedReview({
+      return await runManagedReview({
         cwd,
         target,
         requestedPhase: phase,
@@ -323,7 +323,7 @@ async function executeReview(
         ...(planPath ? { planPath } : {}),
       }, dependencies, cancellation.signal);
     }
-    return runCodeReview({
+    return await runCodeReview({
       cwd,
       target,
       comment: params.comment === true,

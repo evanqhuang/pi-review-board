@@ -240,7 +240,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
           model: effortConfig.finderRoute.model,
           thinking: effortConfig.finderRoute.thinking,
         },
-        validateFinder,
+        (value) => validateFinder(Array.isArray(value) ? { candidates: value } : value),
         signal,
       );
       return { lens, result };

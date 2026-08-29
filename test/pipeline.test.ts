@@ -57,7 +57,7 @@ class FakeAgents implements ReviewAgentRunner {
   public readonly toolsets: string[][] = [];
   public readonly models: (string | undefined)[] = [];
   public readonly thinkings: string[] = [];
-  public constructor(private readonly failRole?: string) {}
+  public constructor(private readonly failRole?: string, private readonly returnFinderArray = false) {}
   public run<T>(invocation: { role: string; prompt: string; cwd: string; tools: readonly string[]; model?: string; thinking: string }, validate: (value: unknown) => T, _signal?: AbortSignal, onProgress?: (message: string) => void): Promise<AgentResult<T>> {
     this.roles.push(invocation.role);
     this.cwds.push(invocation.cwd);
@@ -70,19 +70,18 @@ class FakeAgents implements ReviewAgentRunner {
     let value: unknown;
     if (invocation.role === "summary") value = { summary: "Updates cache refresh behavior" };
     else if (invocation.role.startsWith("finder:")) {
-      value = {
-        candidates: [{
-          id: "candidate-1",
-          rootCauseKey: "cache:cold-refresh-skipped",
-          file: "src/a.ts",
-          line: 4,
-          summary: "Skips refresh on a cold cache",
-          failureScenario: "A cold cache returns stale data",
-          evidence: "The changed branch returns before refresh",
-          category: "correctness",
-          severity: "high",
-        }],
-      };
+      const candidates = [{
+        id: "candidate-1",
+        rootCauseKey: "cache:cold-refresh-skipped",
+        file: "src/a.ts",
+        line: 4,
+        summary: "Skips refresh on a cold cache",
+        failureScenario: "A cold cache returns stale data",
+        evidence: "The changed branch returns before refresh",
+        category: "correctness",
+        severity: "high",
+      }];
+      value = this.returnFinderArray ? candidates : { candidates };
     } else if (invocation.role === "verifier" || invocation.role === "independent-verifier") {
       value = { verifications: batchCandidateIds(invocation.prompt).map((candidateId) => ({ candidateId, confidence: 95, verification: "The changed branch reproduces the stale result", confirmed: true, disposition: "CONFIRMED" })) };
     } else value = { proceed: true, reason: "substantive change" };
@@ -115,6 +114,16 @@ describe("runCodeReview", () => {
     expect(progress).toContain("finder:diff-correctness mocked progress");
     expect(agents.models.every((model) => model === "parent-provider/parent-model")).toBe(true);
     expect(agents.thinkings.every((thinking) => thinking === "xhigh" || thinking === "medium")).toBe(true);
+  });
+
+  it("accepts a bare array from finder reviewers", async () => {
+    const result = await runCodeReview(
+      { cwd: "/repo", target, comment: false, effort: "low" },
+      { commands: new FakeCommands(), agents: new FakeAgents(undefined, true) },
+    );
+
+    expect(result.status).toBe("complete");
+    expect(result.findings).toHaveLength(1);
   });
 
   it("runs review agents from the requested worktree root", async () => {

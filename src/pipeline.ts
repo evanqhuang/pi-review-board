@@ -1,5 +1,6 @@
 import { discoverApplicableGuidance, type GuidanceFile } from "./guidance.js";
 import { getReviewEffortConfig } from "./effort.js";
+import { REVIEWER_RESULT_TOOLS } from "./reviewer-protocol.js";
 import {
   collectChangedLocations,
   deduplicateCandidates,
@@ -18,6 +19,7 @@ import {
   validateFinder,
   validateSummary,
   validateBatchVerifier,
+  type BatchVerifierOutput,
   type FinderLens,
   type FinderOutput,
   type SummaryOutput,
@@ -27,6 +29,7 @@ import {
   hasSnapshotDrift,
   isLikelyAutomatedPullRequest,
 } from "./targets.js";
+import { ReviewerRunError } from "./runner.js";
 import type {
   AgentInvocation,
   AgentResult,
@@ -43,10 +46,19 @@ import type {
 
 const REVIEW_TOOLS = ["read", "grep", "find", "ls"] as const;
 
-type FinderPassResult = { readonly lens: FinderLens; readonly result?: AgentResult<FinderOutput> };
+type FinderPassResult = {
+  readonly lens: FinderLens;
+  readonly result?: AgentResult<FinderOutput>;
+  readonly failure?: StageFailure;
+  readonly usage?: AgentResult<unknown>["usage"];
+};
 
 function progress(dependencies: ReviewDependencies, stage: ReviewStage, message: string): void {
-  dependencies.onProgress?.(stage, message);
+  dependencies.onProgress?.({ type: "stage", stage, message });
+}
+
+function usageFromError(error: unknown): AgentResult<unknown>["usage"] | undefined {
+  return error instanceof ReviewerRunError ? error.usage : undefined;
 }
 
 function runAgent<T>(
@@ -59,7 +71,7 @@ function runAgent<T>(
   const configuredInvocation = dependencies.reviewerModel
     ? { ...invocation, model: dependencies.reviewerModel }
     : invocation;
-  return dependencies.agents.run(configuredInvocation, validate, signal, (message) => progress(dependencies, stage, message));
+  return dependencies.agents.run(configuredInvocation, validate, signal, (event) => dependencies.onProgress?.(event));
 }
 
 function resultWithoutSnapshot(status: ReviewResult["status"], message: string, options: ReviewOptions): ReviewResult {
@@ -205,6 +217,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
           prompt: buildSummaryPrompt(snapshot, guidance),
           cwd: reviewCwd,
           tools: REVIEW_TOOLS,
+          resultTool: REVIEWER_RESULT_TOOLS.summary,
           model: effortConfig.finderRoute.model,
           thinking: effortConfig.finderRoute.thinking,
         },
@@ -214,6 +227,8 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
       usage.push(summaryResult.usage);
       summary = summaryResult.data.summary;
     } catch (error) {
+      const failedUsage = usageFromError(error);
+      if (failedUsage) usage.push(failedUsage);
       failures.push(stageFailure("summary", error));
     }
   }
@@ -237,6 +252,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
           prompt: buildFinderPrompt(lens, snapshot, guidance, summary, { contextDepth: effortConfig.contextDepth }),
           cwd: reviewCwd,
           tools: REVIEW_TOOLS,
+          resultTool: REVIEWER_RESULT_TOOLS.finder,
           model: effortConfig.finderRoute.model,
           thinking: effortConfig.finderRoute.thinking,
         },
@@ -245,13 +261,16 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
       );
       return { lens, result };
     } catch (error) {
-      failures.push(stageFailure("finders", `${lens.name}: ${error instanceof Error ? error.message : String(error)}`));
-      return { lens };
+      const failure = stageFailure("finders", `${lens.name}: ${error instanceof Error ? error.message : String(error)}`);
+      const failedUsage = usageFromError(error);
+      return failedUsage ? { lens, failure, usage: failedUsage } : { lens, failure };
     }
   };
 
   const finderResults = await Promise.all(finderLenses.map((lens) => runFinderPass(lens)));
   if (effortConfig.gapSweep) finderResults.push(await runFinderPass(GAP_SWEEP_LENS));
+
+  failures.push(...finderResults.flatMap(({ failure }) => failure ? [failure] : []));
 
   const changedLocations = collectChangedLocations(snapshot.diff);
   const candidates = deduplicateCandidates(
@@ -262,13 +281,14 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
       changedLocations,
     ),
   );
-  usage.push(...finderResults.flatMap(({ result }) => (result ? [result.usage] : [])));
+  usage.push(...finderResults.flatMap(({ result, usage: failedUsage }) => result ? [result.usage] : failedUsage ? [failedUsage] : []));
 
   const verifyCandidateBatch = async (items: readonly ReviewCandidate[], passLabel: string): Promise<VerifiedFinding[]> => {
     if (items.length === 0) return [];
+    progress(dependencies, "verification", `Starting ${passLabel} verification for ${items.length} finding${items.length === 1 ? "" : "s"}`);
     const candidateIds = new Set(items.map((candidate) => candidate.id));
     try {
-      const result = await runAgent(
+      const result = await runAgent<BatchVerifierOutput>(
         dependencies,
         "verification",
         {
@@ -276,6 +296,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
           prompt: buildBatchVerifierPrompt(items, snapshot, guidance, summary, { contextDepth: effortConfig.contextDepth, passLabel }),
           cwd: reviewCwd,
           tools: REVIEW_TOOLS,
+          resultTool: REVIEWER_RESULT_TOOLS.verifier,
           model: effortConfig.verifierRoute.model,
           thinking: effortConfig.verifierRoute.thinking,
         },
@@ -283,12 +304,16 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
         signal,
       );
       usage.push(result.usage);
-      return filterVerifiedFindings(items, result.data.verifications, {
+      const verified = filterVerifiedFindings(items, result.data.verifications, {
         changedLocations,
         minimumConfidence: effortConfig.minimumConfidence,
         retainPlausible: effortConfig.retainPlausible,
       }).slice(0, effortConfig.maxFindings);
+      progress(dependencies, "verification", `Completed ${passLabel} verification with ${verified.length} retained finding${verified.length === 1 ? "" : "s"}`);
+      return verified;
     } catch (error) {
+      const failedUsage = usageFromError(error);
+      if (failedUsage) usage.push(failedUsage);
       failures.push(stageFailure("verification", `${passLabel}: ${error instanceof Error ? error.message : String(error)}`));
       return [];
     }

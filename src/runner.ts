@@ -1,44 +1,71 @@
-import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import { killProcessTree, PROCESS_KILL_GRACE_PERIOD_MS } from "./process.js";
-import type { AgentInvocation, AgentResult, AgentUsage, ReviewAgentRunner } from "./types.js";
+import {
+  REVIEWER_RESULT_TOOLS,
+  type ReviewerResultToolName,
+  type ReviewerSafeToolName,
+} from "./reviewer-protocol.js";
+import type {
+  AgentInvocation,
+  AgentResult,
+  AgentUsage,
+  ReviewerFailureKind,
+  ReviewerProgressEvent,
+  ReviewAgentRunner,
+} from "./types.js";
 
 const MAX_REVIEWER_EVENT_BYTES = 16 * 1024 * 1024;
+const MAX_REVIEWER_STDOUT_BYTES = 64 * 1024 * 1024;
+const MAX_REVIEWER_STDERR_BYTES = 8 * 1024 * 1024;
+const MAX_REVIEW_ATTEMPTS = 2;
+const RETRY_SUFFIX = [
+  "Protocol correction: submit exactly one final result with the required terminating tool.",
+  "Do not return assistant JSON; use the required result tool even when the result is empty.",
+].join(" ");
 
-function textFromMessage(message: unknown): string {
-  if (!message || typeof message !== "object") return "";
-  const content = (message as { readonly content?: unknown }).content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((part): part is { readonly type: "text"; readonly text: string } => {
-      return Boolean(part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string");
-    })
-    .map((part) => part.text)
-    .join("\n");
-}
+const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
+const RESULT_TOOLS = new Set<string>(Object.values(REVIEWER_RESULT_TOOLS));
+const SAFE_TOOLS = new Set<string>([...READ_ONLY_TOOLS, ...RESULT_TOOLS]);
 
-function parsePayload(text: string): unknown {
-  const trimmed = text.trim();
-  if (!trimmed) throw new Error("Reviewer returned no structured output");
-  const withoutFence = trimmed.replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "").trim();
-  try {
-    return JSON.parse(withoutFence) as unknown;
-  } catch {
-    const firstObject = withoutFence.indexOf("{");
-    const lastObject = withoutFence.lastIndexOf("}");
-    if (firstObject >= 0 && lastObject > firstObject) {
-      try {
-        return JSON.parse(withoutFence.slice(firstObject, lastObject + 1)) as unknown;
-      } catch {
-        // Fall through to a useful validation error.
-      }
-    }
-    throw new Error("Reviewer returned malformed JSON");
-  }
-}
+export const reviewerOutputLimits = {
+  eventBytes: MAX_REVIEWER_EVENT_BYTES,
+  stdoutBytes: MAX_REVIEWER_STDOUT_BYTES,
+  stderrBytes: MAX_REVIEWER_STDERR_BYTES,
+  attempts: MAX_REVIEW_ATTEMPTS,
+} as const;
 
 function emptyUsage(role: string): AgentUsage {
   return { role, turns: 0, inputTokens: 0, outputTokens: 0, contextTokens: 0 };
+}
+
+function usageNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function addUsage(first: AgentUsage, second: AgentUsage): AgentUsage {
+  return {
+    role: first.role,
+    turns: first.turns + second.turns,
+    inputTokens: first.inputTokens + second.inputTokens,
+    outputTokens: first.outputTokens + second.outputTokens,
+    contextTokens: Math.max(first.contextTokens, second.contextTokens),
+  };
+}
+
+function updateUsage(current: AgentUsage, rawUsage: unknown): AgentUsage {
+  const values = rawUsage && typeof rawUsage === "object"
+    ? rawUsage as { readonly input?: unknown; readonly output?: unknown; readonly totalTokens?: unknown }
+    : {};
+  return {
+    role: current.role,
+    turns: current.turns + 1,
+    inputTokens: current.inputTokens + usageNumber(values.input),
+    outputTokens: current.outputTokens + usageNumber(values.output),
+    contextTokens: Math.max(current.contextTokens, usageNumber(values.totalTokens)),
+  };
 }
 
 function formatTokenCount(value: number): string {
@@ -51,47 +78,190 @@ function formatAgentProgress(usage: AgentUsage): string {
   return `${usage.role}: turn ${usage.turns} · tokens in ${formatTokenCount(usage.inputTokens)} · out ${formatTokenCount(usage.outputTokens)} · context ${formatTokenCount(usage.contextTokens)}`;
 }
 
-export function buildReviewAgentArgs(invocation: AgentInvocation): string[] {
+function extensionCandidates(): string[] {
+  return [
+    fileURLToPath(new URL("../extensions/reviewer-output.ts", import.meta.url)),
+    fileURLToPath(new URL("../extensions/reviewer-output.js", import.meta.url)),
+    fileURLToPath(new URL("../dist/extensions/reviewer-output.js", import.meta.url)),
+  ];
+}
+
+export function resolveReviewerOutputExtension(): string {
+  const path = extensionCandidates().find((candidate) => existsSync(candidate));
+  if (!path) throw new Error("Reviewer output extension is not available");
+  return path;
+}
+
+function permittedTools(invocation: AgentInvocation): string[] {
+  const tools = invocation.tools.filter((tool) => SAFE_TOOLS.has(tool));
+  return [...new Set([...tools, invocation.resultTool])];
+}
+
+export function buildReviewAgentArgs(invocation: AgentInvocation, prompt = invocation.prompt): string[] {
   const args = [
     "--mode",
     "json",
     "-p",
     "--no-session",
     "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "-e",
+    resolveReviewerOutputExtension(),
   ];
   if (invocation.model) args.push("--model", invocation.model);
   args.push("--thinking", invocation.thinking);
-  if (invocation.tools.length > 0) args.push("--tools", invocation.tools.join(","));
-  args.push(invocation.prompt);
+  const tools = permittedTools(invocation);
+  if (tools.length > 0) args.push("--tools", tools.join(","));
+  args.push(prompt);
   return args;
+}
+
+function safeToolName(value: unknown): ReviewerSafeToolName | "other" {
+  return typeof value === "string" && SAFE_TOOLS.has(value) ? value as ReviewerSafeToolName : "other";
+}
+
+function messageForFailure(kind: ReviewerFailureKind, role: string): string {
+  switch (kind) {
+    case "missing-result":
+      return `${role} reviewer did not submit the required result`;
+    case "malformed-result":
+      return `${role} reviewer submitted a malformed result`;
+    case "duplicate-result":
+      return `${role} reviewer submitted duplicate results`;
+    case "wrong-result":
+      return `${role} reviewer submitted an unexpected result`;
+    case "validation":
+      return `${role} reviewer result failed local validation`;
+    case "canceled":
+      return `${role} reviewer was canceled`;
+    case "output-limit":
+      return `${role} reviewer output exceeded the review limit`;
+    case "spawn":
+      return `${role} reviewer process could not start`;
+    case "transport":
+      return `${role} reviewer process failed`;
+    case "process":
+      return `${role} reviewer process exited unsuccessfully`;
+  }
+}
+
+export class ReviewerRunError extends Error {
+  public readonly role: string;
+  public readonly kind: ReviewerFailureKind;
+  public readonly usage: AgentUsage;
+
+  public constructor(role: string, kind: ReviewerFailureKind, usage: AgentUsage) {
+    super(messageForFailure(kind, role));
+    this.name = "ReviewerRunError";
+    this.role = role;
+    this.kind = kind;
+    this.usage = usage;
+  }
+}
+
+interface AttemptResult<T> {
+  readonly data: T;
+  readonly usage: AgentUsage;
+}
+
+function isAssistantMessage(event: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (event.type !== "message_end" || !event.message || typeof event.message !== "object") return undefined;
+  const message = event.message as Record<string, unknown>;
+  return message.role === "assistant" ? message : undefined;
+}
+
+function resultDetails(result: unknown): { readonly hasDetails: boolean; readonly details?: unknown } {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return { hasDetails: false };
+  const record = result as Record<string, unknown>;
+  return Object.prototype.hasOwnProperty.call(record, "details")
+    ? { hasDetails: true, details: record.details }
+    : { hasDetails: false };
 }
 
 export class PiReviewAgentRunner implements ReviewAgentRunner {
   public constructor(private readonly executable = process.env.PI_CODE_REVIEW_AGENT_BIN ?? "pi") {}
 
-  public run<T>(
+  public async run<T>(
     invocation: AgentInvocation,
     validate: (value: unknown) => T,
     signal?: AbortSignal,
-    onProgress?: (message: string) => void,
+    onProgress?: (event: ReviewerProgressEvent) => void,
   ): Promise<AgentResult<T>> {
-    return new Promise((resolve, reject) => {
-      const args = buildReviewAgentArgs(invocation);
-      onProgress?.(`${invocation.role}: started`);
+    let aggregateUsage = emptyUsage(invocation.role);
+    for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt += 1) {
+      if (signal?.aborted) {
+        const canceled = new ReviewerRunError(invocation.role, "canceled", aggregateUsage);
+        onProgress?.({ type: "reviewer-failed", role: invocation.role, attempt, kind: canceled.kind, usage: aggregateUsage });
+        throw canceled;
+      }
 
-      const child = spawn(this.executable, args, {
-        cwd: invocation.cwd,
-        shell: false,
-        detached: process.platform !== "win32",
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const prompt = attempt === 1 ? invocation.prompt : `${invocation.prompt}\n\n${RETRY_SUFFIX}`;
+      onProgress?.({ type: "reviewer-start", role: invocation.role, resultTool: invocation.resultTool, attempt });
+      try {
+        const result = await this.runAttempt(invocation, prompt, validate, signal, attempt, onProgress);
+        aggregateUsage = addUsage(aggregateUsage, result.usage);
+        onProgress?.({ type: "reviewer-complete", role: invocation.role, attempt, usage: aggregateUsage });
+        return { data: result.data, usage: aggregateUsage };
+      } catch (error) {
+        const attemptError = error instanceof ReviewerRunError
+          ? error
+          : new ReviewerRunError(invocation.role, "transport", emptyUsage(invocation.role));
+        aggregateUsage = addUsage(aggregateUsage, attemptError.usage);
+        const canRetry = attempt < MAX_REVIEW_ATTEMPTS
+          && (attemptError.kind === "missing-result" || attemptError.kind === "malformed-result")
+          && !signal?.aborted;
+        if (canRetry) {
+          onProgress?.({ type: "reviewer-retry", role: invocation.role, attempt: attempt + 1, usage: aggregateUsage });
+          continue;
+        }
+        const terminal = new ReviewerRunError(invocation.role, attemptError.kind, aggregateUsage);
+        onProgress?.({ type: "reviewer-failed", role: invocation.role, attempt, kind: terminal.kind, usage: aggregateUsage });
+        throw terminal;
+      }
+    }
+    throw new ReviewerRunError(invocation.role, "transport", aggregateUsage);
+  }
+
+  private runAttempt<T>(
+    invocation: AgentInvocation,
+    prompt: string,
+    validate: (value: unknown) => T,
+    signal: AbortSignal | undefined,
+    attempt: number,
+    onProgress: ((event: ReviewerProgressEvent) => void) | undefined,
+  ): Promise<AttemptResult<T>> {
+    if (signal?.aborted) return Promise.reject(new ReviewerRunError(invocation.role, "canceled", emptyUsage(invocation.role)));
+
+    return new Promise((resolve, reject) => {
+      let child: ChildProcess;
+      try {
+        child = spawn(this.executable, buildReviewAgentArgs(invocation, prompt), {
+          cwd: invocation.cwd,
+          shell: false,
+          detached: process.platform !== "win32",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch {
+        reject(new ReviewerRunError(invocation.role, "spawn", emptyUsage(invocation.role)));
+        return;
+      }
+
       let buffer = "";
       const stdoutDecoder = new StringDecoder("utf8");
-      let lastAssistantText = "";
-      let eventLimitExceeded = false;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let outputLimitExceeded = false;
       let aborted = false;
       let terminationRequested = false;
       let usage = emptyUsage(invocation.role);
+      let expectedResultCount = 0;
+      let expectedDetails: unknown;
+      let expectedDetailsPresent = false;
+      let expectedCallErrored = false;
+      let duplicateResult = false;
+      let wrongResult = false;
       let settled = false;
       let escalationTimer: NodeJS.Timeout | undefined;
       let abortListener: (() => void) | undefined;
@@ -118,6 +288,9 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           killProcessTree(child, "SIGKILL");
         }, PROCESS_KILL_GRACE_PERIOD_MS);
       };
+      const emitTool = (tool: unknown, status: "started" | "updated" | "completed"): void => {
+        onProgress?.({ type: "reviewer-tool", role: invocation.role, attempt, tool: safeToolName(tool), status });
+      };
       const processLine = (line: string): void => {
         if (!line.trim()) return;
         let event: unknown;
@@ -127,83 +300,122 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           return;
         }
         if (!event || typeof event !== "object") return;
-        const record = event as { readonly type?: unknown; readonly message?: unknown };
-        if (record.type !== "message_end" || !record.message || typeof record.message !== "object") return;
-        const message = record.message as { readonly role?: unknown; readonly content?: unknown; readonly usage?: unknown };
-        if (message.role !== "assistant") return;
-        const text = textFromMessage(message);
-        if (text) lastAssistantText = text;
-        const rawUsage = message.usage;
-        if (rawUsage && typeof rawUsage === "object") {
-          const values = rawUsage as { input?: unknown; output?: unknown; totalTokens?: unknown };
-          usage = {
-            role: invocation.role,
-            turns: usage.turns + 1,
-            inputTokens: usage.inputTokens + (typeof values.input === "number" ? values.input : 0),
-            outputTokens: usage.outputTokens + (typeof values.output === "number" ? values.output : 0),
-            contextTokens: typeof values.totalTokens === "number" ? values.totalTokens : usage.contextTokens,
-          };
-        } else {
-          usage = { ...usage, turns: usage.turns + 1 };
+        const record = event as Record<string, unknown>;
+        if (record.type === "tool_execution_start") {
+          emitTool(record.toolName, "started");
+          return;
         }
-        onProgress?.(formatAgentProgress(usage));
+        if (record.type === "tool_execution_update") {
+          emitTool(record.toolName, "updated");
+          return;
+        }
+        if (record.type === "tool_execution_end") {
+          emitTool(record.toolName, "completed");
+          const toolName = record.toolName;
+          if (toolName === invocation.resultTool) {
+            expectedResultCount += 1;
+            if (expectedResultCount > 1) duplicateResult = true;
+            if (record.isError === true) {
+              expectedCallErrored = true;
+              return;
+            }
+            const details = resultDetails(record.result);
+            if (!details.hasDetails) return;
+            expectedDetailsPresent = true;
+            expectedDetails = details.details;
+          } else if (typeof toolName === "string" && RESULT_TOOLS.has(toolName)) {
+            wrongResult = true;
+          }
+          return;
+        }
+        const message = isAssistantMessage(record);
+        if (!message) return;
+        usage = updateUsage(usage, message.usage);
+        onProgress?.({ type: "reviewer-turn", role: invocation.role, attempt, usage });
       };
-      const consumeOutput = (text: string): void => {
-        if (eventLimitExceeded) return;
+      const consumeStdout = (text: string): void => {
+        if (outputLimitExceeded) return;
         buffer += text;
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
         for (const line of lines) {
           if (Buffer.byteLength(line, "utf8") > MAX_REVIEWER_EVENT_BYTES) {
-            eventLimitExceeded = true;
+            outputLimitExceeded = true;
             terminateProcess();
             return;
           }
           processLine(line);
         }
         if (Buffer.byteLength(buffer, "utf8") > MAX_REVIEWER_EVENT_BYTES) {
-          eventLimitExceeded = true;
+          outputLimitExceeded = true;
+          terminateProcess();
+        }
+      };
+      const consumeStdoutChunk = (chunk: Buffer | string): void => {
+        const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        stdoutBytes += bytes.byteLength;
+        if (stdoutBytes > MAX_REVIEWER_STDOUT_BYTES) {
+          outputLimitExceeded = true;
+          terminateProcess();
+          return;
+        }
+        consumeStdout(stdoutDecoder.write(bytes));
+      };
+      const consumeStderrChunk = (chunk: Buffer | string): void => {
+        stderrBytes += typeof chunk === "string" ? Buffer.byteLength(chunk, "utf8") : chunk.byteLength;
+        if (stderrBytes > MAX_REVIEWER_STDERR_BYTES) {
+          outputLimitExceeded = true;
           terminateProcess();
         }
       };
 
-      child.stdout.on("data", (chunk: Buffer | string) => {
-        consumeOutput(stdoutDecoder.write(typeof chunk === "string" ? Buffer.from(chunk) : chunk));
-      });
-      child.stderr.on("data", () => {
-        // Drain process diagnostics without forwarding them to the parent review.
-      });
-      child.on("error", (error) => {
+      child.stdout?.on("data", (chunk: Buffer | string) => consumeStdoutChunk(chunk));
+      child.stderr?.on("data", (chunk: Buffer | string) => consumeStderrChunk(chunk));
+      child.on("error", () => {
         removeAbortListener();
-        if (aborted || terminationRequested) killProcessTree(child, "SIGKILL");
         clearEscalationTimer();
-        finish(() => reject(error));
+        finish(() => reject(new ReviewerRunError(invocation.role, aborted ? "canceled" : "spawn", usage)));
       });
       child.on("close", (code) => {
         const stdoutTail = stdoutDecoder.end();
-        consumeOutput(stdoutTail);
-        buffer += stdoutTail;
+        if (!outputLimitExceeded) consumeStdout(stdoutTail);
         removeAbortListener();
         if (aborted || terminationRequested) killProcessTree(child, "SIGKILL");
         clearEscalationTimer();
-        if (!eventLimitExceeded && buffer.trim()) processLine(buffer);
+        if (!outputLimitExceeded && buffer.trim()) processLine(buffer);
         finish(() => {
           if (aborted) {
-            reject(new Error(`${invocation.role} reviewer was canceled`));
+            reject(new ReviewerRunError(invocation.role, "canceled", usage));
             return;
           }
-          if (eventLimitExceeded) {
-            reject(new Error(`${invocation.role} reviewer event exceeded the review limit`));
+          if (outputLimitExceeded) {
+            reject(new ReviewerRunError(invocation.role, "output-limit", usage));
             return;
           }
           if (code !== 0) {
-            reject(new Error(`${invocation.role} reviewer failed with exit code ${code ?? 1}`));
+            reject(new ReviewerRunError(invocation.role, "process", usage));
+            return;
+          }
+          if (duplicateResult) {
+            reject(new ReviewerRunError(invocation.role, "duplicate-result", usage));
+            return;
+          }
+          if (wrongResult) {
+            reject(new ReviewerRunError(invocation.role, "wrong-result", usage));
+            return;
+          }
+          if (expectedResultCount !== 1 || expectedCallErrored || !expectedDetailsPresent) {
+            reject(new ReviewerRunError(invocation.role, "missing-result", usage));
+            return;
+          }
+          if (!expectedDetails || typeof expectedDetails !== "object" || Array.isArray(expectedDetails)) {
+            reject(new ReviewerRunError(invocation.role, "malformed-result", usage));
             return;
           }
           try {
-            resolve({ data: validate(parsePayload(lastAssistantText)), usage });
-          } catch (error) {
-            reject(new Error(`${invocation.role} reviewer output invalid: ${error instanceof Error ? error.message : String(error)}`));
+            resolve({ data: validate(expectedDetails), usage });
+          } catch {
+            reject(new ReviewerRunError(invocation.role, "validation", usage));
           }
         });
       });
@@ -222,4 +434,6 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
 
 export const reviewAgentConfiguration = {
   supportsInvocationThinking: true,
+  supportsStructuredResultTools: true,
+  maxProtocolRecoveryAttempts: MAX_REVIEW_ATTEMPTS,
 } as const;

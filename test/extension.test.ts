@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import {
+import registerCodeReviewExtension, {
   buildManagedImplementationId,
   getReviewArgumentCompletions,
   injectReviewResult,
@@ -61,5 +61,45 @@ describe("review extension helpers", () => {
       id: "REV-001",
       disposition: "dismissed" as never,
     }])).toThrow("Unknown finding disposition");
+  });
+
+  it("registers the tool and clears progress state when execution fails before target resolution", async () => {
+    type RegisteredReviewTool = {
+      readonly name: string;
+      readonly execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: unknown, ctx: unknown) => Promise<{ readonly isError?: boolean }>;
+    };
+    const registeredTools: RegisteredReviewTool[] = [];
+    const statuses = new Map<string, string | undefined>();
+    const widgets = new Map<string, string[] | undefined>();
+    const working: (string | undefined)[] = [];
+    const ui = {
+      notify: vi.fn(),
+      setStatus: (key: string, value: string | undefined) => statuses.set(key, value),
+      setWidget: (key: string, value: string[] | undefined) => widgets.set(key, value),
+      setWorkingMessage: (value: string | undefined) => working.push(value),
+      onTerminalInput: vi.fn(),
+    };
+    const pi = {
+      on: vi.fn(),
+      registerTool: (tool: RegisteredReviewTool) => registeredTools.push(tool),
+      registerCommand: vi.fn(),
+      registerMessageRenderer: vi.fn(),
+      registerEntryRenderer: vi.fn(),
+    };
+    registerCodeReviewExtension(pi as never);
+    const tool = registeredTools.find((entry) => entry.name === "code_review");
+    expect(tool).toBeDefined();
+    const result = await tool!.execute(
+      "tool-call",
+      { action: "not-a-real-action" } as never,
+      undefined,
+      undefined,
+      { cwd: "/repo", ui } as never,
+    );
+
+    expect(result.isError).toBe(true);
+    expect([...statuses.values()].every((value) => value === undefined)).toBe(true);
+    expect([...widgets.values()].every((value) => value === undefined)).toBe(true);
+    expect(working.at(-1)).toBeUndefined();
   });
 });

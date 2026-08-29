@@ -1,6 +1,7 @@
 import type { ReviewContextDepth } from "./effort.js";
 import type { PullRequestMetadata, ReviewCandidate, ReviewSnapshot } from "./types.js";
 import { formatGuidance, type GuidanceFile } from "./guidance.js";
+import { REVIEWER_RESULT_TOOLS } from "./reviewer-protocol.js";
 
 export interface FinderLens {
   readonly name: string;
@@ -99,6 +100,7 @@ export function validateSummary(value: unknown): SummaryOutput {
 export function validateFinder(value: unknown): FinderOutput {
   const raw = object(value);
   if (!Array.isArray(raw.candidates)) throw new Error("Finder response must contain candidates array");
+  if (raw.candidates.length > 100) throw new Error("Finder response contains too many candidates");
   const candidates = raw.candidates.map((candidate, index) => {
     const item = object(candidate);
     const category = string(item.category, `candidates[${index}].category`) as ReviewCandidate["category"];
@@ -148,6 +150,7 @@ export function validateVerifier(value: unknown): VerifierOutput {
 export function validateBatchVerifier(value: unknown, candidateIds?: ReadonlySet<string>): BatchVerifierOutput {
   const raw = object(value);
   if (!Array.isArray(raw.verifications)) throw new Error("Batch verifier response must contain verifications array");
+  if (raw.verifications.length > 100) throw new Error("Batch verifier response contains too many verifications");
   const seen = new Set<string>();
   const verifications = raw.verifications.map((item, index) => {
     const verification = validateVerifier(item);
@@ -188,7 +191,8 @@ export function buildEligibilityPrompt(pullRequest: PullRequestMetadata): string
 export function buildSummaryPrompt(snapshot: ReviewSnapshot, guidance: readonly GuidanceFile[]): string {
   return [
     "Summarize the reviewed change for independent reviewers.",
-    "Return JSON only: {\"summary\":\"...\"}.",
+    `Call ${REVIEWER_RESULT_TOOLS.summary} exactly once as your final action with a non-empty summary string.`,
+    "Do not return assistant JSON or emit another response after the result tool.",
     inputBlock(snapshot, guidance),
   ].join("\n");
 }
@@ -222,8 +226,9 @@ export function buildFinderPrompt(
     contextInstruction(options.contextDepth, options.fullContext, "finder"),
     "Report only concrete defects on changed lines. Do not report style, missing tests, compiler-detectable issues, pre-existing problems, intentional behavior, or speculative concerns.",
     "For each defect, rootCauseKey must be a concise semantic invariant key that is unique to the root cause, not an ordinal, filename, line number, or wording-dependent summary. Reuse the same rootCauseKey when the same underlying defect moves or is reworded.",
-    "Return JSON only with this shape: {\"candidates\":[{\"id\":\"correlation-id\",\"rootCauseKey\":\"semantic-root-cause-key\",\"file\":\"path\",\"line\":1,\"summary\":\"defect\",\"failureScenario\":\"input/state -> wrong output/crash\",\"evidence\":\"why\",\"category\":\"correctness|guidance|history|integration|contract\",\"severity\":\"critical|high|medium|low\"}]}.",
-    "If no concrete defect exists, return {\"candidates\":[]}.",
+    `Call ${REVIEWER_RESULT_TOOLS.finder} exactly once as your final action with candidates containing id, rootCauseKey, file, positive line, summary, failureScenario, evidence, category, and severity.`,
+    "If no concrete defect exists, call the result tool with candidates: [].",
+    "Do not return assistant JSON or emit another response after the result tool.",
     inputBlock(snapshot, guidance, summary),
   ].join("\n");
 }
@@ -239,8 +244,8 @@ export function buildBatchVerifierPrompt(
     `Verify the proposed code-review findings as one batch (${options.passLabel ?? "primary"} pass).`,
     contextInstruction(options.contextDepth, options.fullContext, "verifier"),
     "Check every candidate against the exact changed line, surrounding code, repository guidance, and its stated failure scenario.",
-    "Return JSON only with exactly one verdict for every supplied candidate: {\"verifications\":[{\"candidateId\":\"...\",\"confidence\":0,\"verification\":\"...\",\"confirmed\":true|false,\"disposition\":\"CONFIRMED|PLAUSIBLE|REFUTED\",\"file\":\"optional corrected path\",\"line\":1}]}.",
-    "Do not invent candidates or omit any candidate ID. Confidence rubric: 0 false/pre-existing; 25 unverified or stylistic; 50 real but minor/uncommon; 75 very likely and important; 100 certain and frequent.",
+    `Call ${REVIEWER_RESULT_TOOLS.verifier} exactly once as your final action with exactly one verdict for every supplied candidate.`,
+    "Do not invent candidates or omit any candidate ID. Do not return assistant JSON or emit another response after the result tool. Confidence rubric: 0 false/pre-existing; 25 unverified or stylistic; 50 real but minor/uncommon; 75 very likely and important; 100 certain and frequent.",
     JSON.stringify({ candidates, review: inputBlock(snapshot, guidance, summary) }),
   ].join("\n");
 }
@@ -256,8 +261,8 @@ export function buildVerifierPrompt(
     `Verify one proposed code-review finding against the change (${options.passLabel ?? "primary"} pass).`,
     contextInstruction(options.contextDepth, options.fullContext, "verifier"),
     "Check the exact changed line, surrounding code, repository guidance, and the stated failure scenario.",
-    "Return JSON only: {\"candidateId\":\"...\",\"confidence\":0,\"verification\":\"...\",\"confirmed\":true|false,\"disposition\":\"CONFIRMED|PLAUSIBLE|REFUTED\",\"file\":\"optional corrected path\",\"line\":1}.",
-    "Confidence rubric: 0 false/pre-existing; 25 unverified or stylistic; 50 real but minor/uncommon; 75 very likely and important; 100 certain and frequent.",
+    `Call ${REVIEWER_RESULT_TOOLS.verifier} exactly once as your final action with one verdict for this candidate.`,
+    "Do not return assistant JSON or emit another response after the result tool. Confidence rubric: 0 false/pre-existing; 25 unverified or stylistic; 50 real but minor/uncommon; 75 very likely and important; 100 certain and frequent.",
     JSON.stringify({ candidate, review: inputBlock(snapshot, guidance, summary) }),
   ].join("\n");
 }

@@ -64,6 +64,7 @@ function candidateIds(prompt: string): string[] {
 
 class FakeAgents implements ReviewAgentRunner {
   public candidates = true;
+  public invalidCategory = false;
   public candidateSummary = "Exports the wrong value";
   public calls = 0;
   public readonly prompts: string[] = [];
@@ -86,7 +87,7 @@ class FakeAgents implements ReviewAgentRunner {
         summary: this.candidateSummary,
         failureScenario: "Importing the module returns the wrong value",
         evidence: "The changed line sets the incorrect constant",
-        category: "correctness",
+        category: this.invalidCategory ? "" : "correctness",
         severity: "high",
       }],
     } : { candidates: [] };
@@ -248,6 +249,25 @@ describe("managed review lifecycle", () => {
       reviewedSnapshotHash: initial.reviewedSnapshotHash!,
       dispositions: [{ id: "REV-001", disposition: "non-blocking" }],
     }, dependencies)).rejects.toThrow("approved plan changed");
+  });
+
+  it("keeps an invalid initial finder result incomplete without approval-like wording", async () => {
+    const { repo, plan } = await fixture();
+    const agents = new FakeAgents();
+    agents.invalidCategory = true;
+    const result = await runManagedReview({
+      cwd: repo,
+      target: { kind: "current-diff" },
+      requestedPhase: "auto",
+      effort: "medium",
+      planPath: plan,
+    }, { commands: new NodeCommandRunner(), agents });
+
+    expect(result.status).toBe("incomplete");
+    expect(result.ledger?.completedPasses).toBe(0);
+    expect(result.report).toContain("neither an approval nor a blocker conclusion");
+    expect(result.report).toContain("Retry this phase within the bounded lifecycle");
+    expect(result.report).not.toContain("No open validated blocker remains");
   });
 
   it("marks an approved status stale when uncommitted edits exist", async () => {

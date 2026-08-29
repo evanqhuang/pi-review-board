@@ -1,6 +1,6 @@
-import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, type AgentToolUpdateCallback, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown, matchesKey, type AutocompleteItem } from "@earendil-works/pi-tui";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { Type } from "typebox";
@@ -9,6 +9,7 @@ import { cancelActiveReviews, startReviewCancellation } from "../src/cancellatio
 import { parseReviewEffort, type ReviewEffort } from "../src/effort.js";
 import { NodeCommandRunner } from "../src/commands.js";
 import { PiReviewAgentRunner } from "../src/runner.js";
+import { ReviewProgressPresenter } from "../src/progress.js";
 import { runCodeReview } from "../src/pipeline.js";
 import {
   formatStatusReport,
@@ -19,7 +20,7 @@ import {
   type FindingDispositionInput,
 } from "../src/lifecycle.js";
 import { captureReviewSnapshot, resolveReviewTarget } from "../src/targets.js";
-import type { ReviewDecision, ReviewPhase, ReviewResult, ReviewTarget } from "../src/types.js";
+import type { ReviewDecision, ReviewPhase, ReviewProgressEvent, ReviewResult, ReviewTarget } from "../src/types.js";
 
 interface ReviewToolParams {
   readonly action?: "run" | "loop" | "record" | "status" | "reset" | undefined;
@@ -40,12 +41,14 @@ interface ReviewUI {
   notify(message: string, level: "info" | "warning" | "error"): void;
   setStatus?: ((key: string, text: string | undefined) => void) | undefined;
   setWorkingMessage?: ((message: string | undefined) => void) | undefined;
+  setWidget?: ((key: string, content: string[] | undefined) => void) | undefined;
 }
 
 interface ReviewExecutionContext {
   readonly cwd: string;
   readonly signal?: AbortSignal | undefined;
   readonly ui: ReviewUI;
+  readonly onUpdate?: AgentToolUpdateCallback<unknown> | undefined;
 }
 
 const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
@@ -91,15 +94,16 @@ const FINDING_DISPOSITIONS = new Set<FindingDispositionInput["disposition"]>([
   "resolved",
 ]);
 
-function renderProgress(ctx: { ui: ReviewUI }, stage: string, message: string): void {
-  const progress = `[${stage}] ${message}`;
-  ctx.ui.setStatus?.("code-review", progress);
-  ctx.ui.setWorkingMessage?.(progress);
-}
+let activeProgressKey: string | undefined;
 
-function clearProgress(ctx: { ui: ReviewUI }): void {
-  ctx.ui.setStatus?.("code-review", undefined);
-  ctx.ui.setWorkingMessage?.(undefined);
+function progressPresenter(ctx: ReviewExecutionContext, key: string): ReviewProgressPresenter {
+  return new ReviewProgressPresenter({
+    ui: ctx.ui,
+    key,
+    isOwner: () => activeProgressKey === key,
+    acquire: () => { activeProgressKey = key; },
+    release: () => { if (activeProgressKey === key) activeProgressKey = undefined; },
+  });
 }
 
 function reviewTargetIdentity(target: ReviewTarget): string {
@@ -243,74 +247,86 @@ async function executeReview(
   ctx: ReviewExecutionContext,
   params: ReviewToolParams,
   activeReviews: Set<AbortController>,
+  runKey = `code-review:${randomUUID()}`,
 ): Promise<ReviewResult> {
-  const commands = new NodeCommandRunner();
-  const action = params.action ?? "run";
-  if (!["run", "loop", "record", "status", "reset"].includes(action)) throw new Error(`Unknown code-review action: ${action}`);
-  const effort = parseReviewEffort(params.effort);
-  const planPath = params.planPath?.trim();
-  const dependencies = {
-    commands,
-    agents: new PiReviewAgentRunner(),
-    ...(params.model?.trim() ? { reviewerModel: params.model.trim() } : {}),
-    onProgress: (stage: Parameters<typeof renderProgress>[1], message: string) => renderProgress(ctx, stage, message),
-  };
-  let target: ReviewTarget;
-  if (params.target?.trim()) {
-    target = await resolveReviewTarget(params.target.trim(), ctx.cwd, commands, ctx.signal);
-  } else if (params.sessionId?.trim()) {
-    const status = await getReviewStatus(ctx.cwd, dependencies, { sessionId: params.sessionId.trim() }, ctx.signal);
-    if (!status) throw new Error(`Review session not found: ${params.sessionId.trim()}`);
-    target = status.target;
-  } else {
-    target = await resolveReviewTarget(undefined, ctx.cwd, commands, ctx.signal);
-  }
-  const cwd = operationCwd(ctx, target);
-  const targetContext = contextAt(ctx, cwd);
-
-  if (action === "record") {
-    if (!params.reviewedSnapshotHash?.trim()) throw new Error("record requires reviewedSnapshotHash");
-    if (!params.dispositions || params.dispositions.length === 0) throw new Error("record requires at least one finding disposition");
-    validateFindingDispositionInputs(params.dispositions);
-    await requireCurrentAdjudicationTarget(targetContext, target, params, dependencies);
-    return recordReviewDispositions({
-      cwd,
-      sessionId: params.sessionId!.trim(),
-      reviewedSnapshotHash: params.reviewedSnapshotHash.trim(),
-      dispositions: params.dispositions,
-    }, dependencies);
-  }
-
-  const inferredImplementationId = planPath || params.implementationId?.trim()
-    ? await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal)
-    : undefined;
-
-  if (action === "status") {
-    const status = await getReviewStatus(cwd, dependencies, {
-      ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
-      ...(inferredImplementationId ? { implementationId: inferredImplementationId } : {}),
-      ...(planPath ? { planPath } : {}),
-      target,
-    }, ctx.signal);
-    return plainResult(formatStatusReport(status), effort, status?.decision);
-  }
-  if (action === "reset") {
-    const message = await resetReviewSession(cwd, dependencies, {
-      ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
-      ...(inferredImplementationId ? { implementationId: inferredImplementationId } : {}),
-      ...(planPath ? { planPath } : {}),
-      confirm: params.confirmReset === true,
-    });
-    return plainResult(`### Code review reset\n\n${message}`, effort);
-  }
-
-  const { requestedPhase: phase, managed } = reviewExecutionSelection(params);
-  if (!["auto", "initial", "delta", "final"].includes(phase)) throw new Error(`Unknown code-review phase: ${phase}`);
-  const implementationId = managed
-  ? inferredImplementationId ?? (params.sessionId?.trim() ? undefined : await managedImplementationId(cwd, planPath, params.implementationId, commands, ctx.signal))
-  : undefined;
+  const presenter = progressPresenter(ctx, runKey);
   const cancellation = startReviewCancellation(activeReviews, ctx.signal);
+  presenter.start();
+  const signal = cancellation.signal;
+  const emitProgress = (event: ReviewProgressEvent): void => {
+    presenter.update(event);
+    ctx.onUpdate?.({
+      content: [{ type: "text", text: presenter.lines().join("\n") }],
+      details: { status: "in-progress" },
+    });
+  };
+
   try {
+    const commands = new NodeCommandRunner();
+    const action = params.action ?? "run";
+    if (!["run", "loop", "record", "status", "reset"].includes(action)) throw new Error(`Unknown code-review action: ${action}`);
+    const effort = parseReviewEffort(params.effort);
+    const planPath = params.planPath?.trim();
+    const dependencies = {
+      commands,
+      agents: new PiReviewAgentRunner(),
+      ...(params.model?.trim() ? { reviewerModel: params.model.trim() } : {}),
+      onProgress: emitProgress,
+    };
+    let target: ReviewTarget;
+    if (params.target?.trim()) {
+      target = await resolveReviewTarget(params.target.trim(), ctx.cwd, commands, signal);
+    } else if (params.sessionId?.trim()) {
+      const status = await getReviewStatus(ctx.cwd, dependencies, { sessionId: params.sessionId.trim() }, signal);
+      if (!status) throw new Error(`Review session not found: ${params.sessionId.trim()}`);
+      target = status.target;
+    } else {
+      target = await resolveReviewTarget(undefined, ctx.cwd, commands, signal);
+    }
+    const cwd = operationCwd(ctx, target);
+    const targetContext = contextAt({ ...ctx, signal }, cwd);
+
+    if (action === "record") {
+      if (!params.reviewedSnapshotHash?.trim()) throw new Error("record requires reviewedSnapshotHash");
+      if (!params.dispositions || params.dispositions.length === 0) throw new Error("record requires at least one finding disposition");
+      validateFindingDispositionInputs(params.dispositions);
+      await requireCurrentAdjudicationTarget(targetContext, target, params, dependencies);
+      return recordReviewDispositions({
+        cwd,
+        sessionId: params.sessionId!.trim(),
+        reviewedSnapshotHash: params.reviewedSnapshotHash.trim(),
+        dispositions: params.dispositions,
+      }, dependencies);
+    }
+
+    const inferredImplementationId = planPath || params.implementationId?.trim()
+      ? await managedImplementationId(cwd, planPath, params.implementationId, commands, signal)
+      : undefined;
+
+    if (action === "status") {
+      const status = await getReviewStatus(cwd, dependencies, {
+        ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
+        ...(inferredImplementationId ? { implementationId: inferredImplementationId } : {}),
+        ...(planPath ? { planPath } : {}),
+        target,
+      }, signal);
+      return plainResult(formatStatusReport(status), effort, status?.decision);
+    }
+    if (action === "reset") {
+      const message = await resetReviewSession(cwd, dependencies, {
+        ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
+        ...(inferredImplementationId ? { implementationId: inferredImplementationId } : {}),
+        ...(planPath ? { planPath } : {}),
+        confirm: params.confirmReset === true,
+      });
+      return plainResult(`### Code review reset\n\n${message}`, effort);
+    }
+
+    const { requestedPhase: phase, managed } = reviewExecutionSelection(params);
+    if (!["auto", "initial", "delta", "final"].includes(phase)) throw new Error(`Unknown code-review phase: ${phase}`);
+    const implementationId = managed
+      ? inferredImplementationId ?? (params.sessionId?.trim() ? undefined : await managedImplementationId(cwd, planPath, params.implementationId, commands, signal))
+      : undefined;
     if (managed) {
       await requireManagedTargetCheckout(targetContext, target, commands);
       return await runManagedReview({
@@ -321,17 +337,17 @@ async function executeReview(
         ...(implementationId ? { implementationId } : {}),
         ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
         ...(planPath ? { planPath } : {}),
-      }, dependencies, cancellation.signal);
+      }, dependencies, signal);
     }
     return await runCodeReview({
       cwd,
       target,
       comment: params.comment === true,
       effort,
-    }, dependencies, cancellation.signal);
+    }, dependencies, signal);
   } finally {
     cancellation.dispose();
-    clearProgress(ctx);
+    presenter.clear();
   }
 }
 
@@ -392,7 +408,7 @@ export default function (pi: ExtensionAPI): void {
           ...(parsed.planPath ? { planPath: parsed.planPath } : {}),
           ...(parsed.implementationId ? { implementationId: parsed.implementationId } : {}),
           ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
-        }, activeReviews);
+        }, activeReviews, `code-review:command:${randomUUID()}`);
         injectReviewResult(pi, result);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -432,9 +448,14 @@ export default function (pi: ExtensionAPI): void {
       }))),
       confirmReset: Type.Optional(Type.Boolean({ description: "Must be true for an explicit reset" })),
     }),
-    execute: async (_toolCallId, params: ReviewToolParams, signal, _onUpdate, ctx) => {
+    execute: async (toolCallId, params: ReviewToolParams, signal, onUpdate, ctx) => {
       try {
-        const result = await executeReview({ cwd: ctx.cwd, ui: ctx.ui, ...(signal ? { signal } : {}) }, params, activeReviews);
+        const result = await executeReview({
+          cwd: ctx.cwd,
+          ui: ctx.ui,
+          ...(signal ? { signal } : {}),
+          ...(onUpdate ? { onUpdate } : {}),
+        }, params, activeReviews, `code-review:tool:${toolCallId}`);
         return {
           content: [{ type: "text", text: result.report }],
           details: {
@@ -459,9 +480,10 @@ export default function (pi: ExtensionAPI): void {
         };
       }
     },
-    renderResult: (result, _options, _theme) => {
+    renderResult: (result, options, _theme) => {
       const text = result.content[0];
-      return new Markdown(text?.type === "text" ? text.text : "Review result unavailable.", 0, 0, getMarkdownTheme());
+      const content = text?.type === "text" ? text.text : "Review result unavailable.";
+      return new Markdown(options.isPartial ? `### Code review progress\n\n${content}` : content, 0, 0, getMarkdownTheme());
     },
   });
 }

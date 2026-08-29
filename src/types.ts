@@ -1,4 +1,5 @@
 import type { ReviewEffort, ReviewThinking } from "./effort.js";
+import type { ReviewerResultToolName, ReviewerSafeToolName } from "./reviewer-protocol.js";
 
 export type ReviewTargetKind = "pull-request" | "current-diff" | "branch" | "path" | "worktree";
 
@@ -169,11 +170,68 @@ export interface AgentUsage {
   readonly contextTokens: number;
 }
 
+export type ReviewerFailureKind =
+  | "missing-result"
+  | "malformed-result"
+  | "duplicate-result"
+  | "wrong-result"
+  | "validation"
+  | "canceled"
+  | "output-limit"
+  | "spawn"
+  | "transport"
+  | "process";
+
+export type ReviewerProgressEvent =
+  | {
+      readonly type: "reviewer-start";
+      readonly role: string;
+      readonly resultTool: ReviewerResultToolName;
+      readonly attempt: number;
+    }
+  | {
+      readonly type: "reviewer-turn";
+      readonly role: string;
+      readonly attempt: number;
+      readonly usage: AgentUsage;
+    }
+  | {
+      readonly type: "reviewer-tool";
+      readonly role: string;
+      readonly attempt: number;
+      readonly tool: ReviewerSafeToolName | "other";
+      readonly status: "started" | "updated" | "completed";
+    }
+  | {
+      readonly type: "reviewer-retry";
+      readonly role: string;
+      readonly attempt: number;
+      readonly usage: AgentUsage;
+    }
+  | {
+      readonly type: "reviewer-complete";
+      readonly role: string;
+      readonly attempt: number;
+      readonly usage: AgentUsage;
+    }
+  | {
+      readonly type: "reviewer-failed";
+      readonly role: string;
+      readonly attempt: number;
+      readonly kind: ReviewerFailureKind;
+      readonly usage: AgentUsage;
+    };
+
+export type ReviewProgressEvent =
+  | { readonly type: "stage"; readonly stage: ReviewStage; readonly message: string }
+  | ReviewerProgressEvent;
+
 export interface AgentInvocation {
   readonly role: string;
   readonly prompt: string;
   readonly cwd: string;
   readonly tools: readonly string[];
+  readonly resultTool: ReviewerResultToolName;
   readonly model?: string;
   readonly thinking: ReviewThinking;
 }
@@ -188,7 +246,7 @@ export interface ReviewAgentRunner {
     invocation: AgentInvocation,
     validate: (value: unknown) => T,
     signal?: AbortSignal,
-    onProgress?: (message: string) => void,
+    onProgress?: (event: ReviewerProgressEvent) => void,
   ): Promise<AgentResult<T>>;
 }
 
@@ -208,5 +266,5 @@ export interface ReviewDependencies {
   readonly commands: CommandRunner;
   readonly agents: ReviewAgentRunner;
   readonly reviewerModel?: string;
-  readonly onProgress?: (stage: ReviewStage, message: string) => void;
+  readonly onProgress?: (event: ReviewProgressEvent) => void;
 }

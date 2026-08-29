@@ -506,13 +506,15 @@ function managedReport(decision: ReviewDecision, ledger: Ledger, phase: string, 
       ? "Apply one coherent remediation commit, then run phase=auto."
       : decision === "blocked"
         ? "The bounded review lifecycle is exhausted. Stop for architecture/product attention or explicitly reset."
-        : "No open validated blocker remains for the reviewed committed head.");
+        : decision === "incomplete"
+          ? "The review is incomplete and reached neither an approval nor a blocker conclusion. Retry this phase within the bounded lifecycle."
+          : "No open validated blocker remains for the reviewed committed head.");
   return lines.join("\n");
 }
 
 function resultFromLedger(ledger: Ledger, note: string): ReviewResult {
   return {
-    effort: "low", status: ledger.decision === "incomplete" ? "incomplete" : "complete", summary: note,
+    effort: "low", status: ledger.decision === "incomplete" || ledger.decision === "blocked" ? "incomplete" : "complete", summary: note,
     findings: [], failures: [], commented: false, usage: [], report: managedReport(ledger.decision, ledger, ledger.phase, [], note),
     decision: ledger.decision, sessionId: ledger.sessionId, ...(ledger.lastReviewedSnapshotHash ? { reviewedSnapshotHash: ledger.lastReviewedSnapshotHash } : {}),
     ledger: summary(ledger), ...(ledger.phase === "initial" || ledger.phase === "delta" || ledger.phase === "final" ? { phase: ledger.phase } : {}),

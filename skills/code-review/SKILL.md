@@ -60,4 +60,6 @@ A confirmed blocker requires concise parent evidence. Critical/high findings wit
 
 Record dispositions before editing. Fix confirmed blockers in one coherent remediation commit, run relevant checks, and call `code_review` again with `action=loop` and the returned `sessionId`. If the final pass still has a blocker, stop for architecture or product attention.
 
+Reviewer subprocesses submit through private typed terminating result tools rather than assistant-text JSON. If a reviewer misses or malforms the required result tool, the engine makes one internal fresh-process protocol-recovery attempt; a persistent miss remains `incomplete` and is never treated as approval. Live progress is informational only: it shows stage, reviewer, safe tool activity, retry state, and token counts without exposing reviewer transcripts or tool payloads.
+
 `APPROVE` is a code-review decision only. It does not claim that required project checks ran or replace the parent or existing plan-mode verifier workflows. Use `action=status` to inspect the lifecycle without running reviewers. Use `action=reset` only with explicit user authorization and `confirmReset=true`.

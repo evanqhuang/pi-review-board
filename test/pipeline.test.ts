@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { runCodeReview } from "../src/pipeline.js";
-import type { AgentResult, CommandResult, CommandRunner, ReviewAgentRunner } from "../src/types.js";
+import type { AgentInvocation, AgentResult, AgentUsage, CommandResult, CommandRunner, ReviewAgentRunner, ReviewerProgressEvent } from "../src/types.js";
 
 const patch = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,3 +1,4 @@\n context\n context\n context\n+changed\n";
 
@@ -55,18 +55,30 @@ class FakeAgents implements ReviewAgentRunner {
   public readonly cwds: string[] = [];
   public readonly prompts: string[] = [];
   public readonly toolsets: string[][] = [];
+  public readonly resultTools: string[] = [];
   public readonly models: (string | undefined)[] = [];
   public readonly thinkings: string[] = [];
-  public constructor(private readonly failRole?: string, private readonly returnFinderArray = false) {}
-  public run<T>(invocation: { role: string; prompt: string; cwd: string; tools: readonly string[]; model?: string; thinking: string }, validate: (value: unknown) => T, _signal?: AbortSignal, onProgress?: (message: string) => void): Promise<AgentResult<T>> {
+  private readonly attempts = new Map<string, number>();
+  public constructor(
+    private readonly failRole?: string,
+    private readonly returnFinderArray = false,
+    private readonly additionalFailures: readonly string[] = [],
+    private readonly retryRole?: string,
+  ) {}
+  public run<T>(invocation: AgentInvocation, validate: (value: unknown) => T, _signal?: AbortSignal, onProgress?: (event: ReviewerProgressEvent) => void): Promise<AgentResult<T>> {
     this.roles.push(invocation.role);
     this.cwds.push(invocation.cwd);
     this.models.push(invocation.model);
     this.thinkings.push(invocation.thinking);
-    onProgress?.(`${invocation.role} mocked progress`);
     this.prompts.push(invocation.prompt);
     this.toolsets.push([...invocation.tools]);
-    if (invocation.role === this.failRole) return Promise.reject(new Error("simulated reviewer failure"));
+    this.resultTools.push(invocation.resultTool);
+    onProgress?.({ type: "reviewer-start", role: invocation.role, resultTool: invocation.resultTool, attempt: 1 });
+    const attempt = (this.attempts.get(invocation.role) ?? 0) + 1;
+    this.attempts.set(invocation.role, attempt);
+    if (invocation.role === this.failRole || this.additionalFailures.includes(invocation.role)) return Promise.reject(new Error("simulated reviewer failure"));
+    const simulatedRetry = invocation.role === this.retryRole && attempt === 1;
+    if (simulatedRetry) onProgress?.({ type: "reviewer-retry", role: invocation.role, attempt: 2, usage: { role: invocation.role, turns: 2, inputTokens: 14, outputTokens: 6, contextTokens: 9 } });
     let value: unknown;
     if (invocation.role === "summary") value = { summary: "Updates cache refresh behavior" };
     else if (invocation.role.startsWith("finder:")) {
@@ -85,7 +97,10 @@ class FakeAgents implements ReviewAgentRunner {
     } else if (invocation.role === "verifier" || invocation.role === "independent-verifier") {
       value = { verifications: batchCandidateIds(invocation.prompt).map((candidateId) => ({ candidateId, confidence: 95, verification: "The changed branch reproduces the stale result", confirmed: true, disposition: "CONFIRMED" })) };
     } else value = { proceed: true, reason: "substantive change" };
-    return Promise.resolve({ data: validate(value), usage: { role: invocation.role, turns: 1, inputTokens: 10, outputTokens: 5, contextTokens: 20 } });
+    const usage: AgentUsage = simulatedRetry
+      ? { role: invocation.role, turns: 2, inputTokens: 20, outputTokens: 8, contextTokens: 20 }
+      : { role: invocation.role, turns: 1, inputTokens: 10, outputTokens: 5, contextTokens: 20 };
+    return Promise.resolve({ data: validate(value), usage });
   }
 }
 
@@ -102,8 +117,8 @@ describe("runCodeReview", () => {
   it("runs the medium finder set, deduplicates, verifies, and does not comment by default", async () => {
     const commands = new FakeCommands();
     const agents = new FakeAgents();
-    const progress: string[] = [];
-    const result = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "medium" }, { commands, agents, reviewerModel: "parent-provider/parent-model", onProgress: (_stage, message) => progress.push(message) });
+    const progress: ReviewerProgressEvent[] = [];
+    const result = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "medium" }, { commands, agents, reviewerModel: "parent-provider/parent-model", onProgress: (event) => { if (event.type !== "stage") progress.push(event); } });
 
     expect(result.status).toBe("complete");
     expect(result.findings).toHaveLength(1);
@@ -111,7 +126,9 @@ describe("runCodeReview", () => {
     expect(agents.roles.filter((role) => role === "verifier").length).toBe(1);
     expect(commands.calls.some((call) => call[0] === "gh" && call[1] === "pr" && call[2] === "comment")).toBe(false);
     expect(agents.toolsets.every((tools) => !tools.includes("bash"))).toBe(true);
-    expect(progress).toContain("finder:diff-correctness mocked progress");
+    expect(progress.some((event) => event.type === "reviewer-start" && event.role === "finder:diff-correctness")).toBe(true);
+    expect(agents.resultTools.filter((tool) => tool === "review_finder_result").length).toBe(8);
+    expect(agents.resultTools.filter((tool) => tool === "review_verifier_result").length).toBe(1);
     expect(agents.models.every((model) => model === "parent-provider/parent-model")).toBe(true);
     expect(agents.thinkings.every((thinking) => thinking === "xhigh" || thinking === "medium")).toBe(true);
   });
@@ -225,6 +242,51 @@ describe("runCodeReview", () => {
     expect(result.status).toBe("incomplete");
     expect(result.commented).toBe(false);
     expect(commands.commentCount).toBe(0);
+  });
+
+  it("merges concurrent finder failures in configured lens order", async () => {
+    const agents = new FakeAgents("finder:cross-file", false, ["finder:diff-correctness"]);
+    const result = await runCodeReview(
+      { cwd: "/repo", target, comment: false, effort: "medium" },
+      { commands: new FakeCommands(), agents },
+    );
+
+    expect(result.status).toBe("incomplete");
+    expect(result.failures.filter((failure) => failure.stage === "finders").map((failure) => failure.message)).toEqual([
+      "diff-correctness: simulated reviewer failure",
+      "cross-file: simulated reviewer failure",
+    ]);
+  });
+
+  it("keeps a successful protocol retry complete and visible in progress usage", async () => {
+    const progress: ReviewerProgressEvent[] = [];
+    const agents = new FakeAgents(undefined, false, [], "finder:diff-correctness");
+    const result = await runCodeReview(
+      { cwd: "/repo", target, comment: false, effort: "low" },
+      { commands: new FakeCommands(), agents, onProgress: (event) => { if (event.type !== "stage") progress.push(event); } },
+    );
+
+    expect(result.status).toBe("complete");
+    expect(result.findings).toHaveLength(1);
+    expect(progress.some((event) => event.type === "reviewer-retry" && event.role === "finder:diff-correctness")).toBe(true);
+    expect(result.usage.find((usage) => usage.role === "finder:diff-correctness")).toEqual({
+      role: "finder:diff-correctness",
+      turns: 2,
+      inputTokens: 20,
+      outputTokens: 8,
+      contextTokens: 20,
+    });
+  });
+
+  it("emits verifier stage start and completion progress", async () => {
+    const stages: string[] = [];
+    await runCodeReview(
+      { cwd: "/repo", target, comment: false, effort: "low" },
+      { commands: new FakeCommands(), agents: new FakeAgents(), onProgress: (event) => { if (event.type === "stage") stages.push(event.message); } },
+    );
+
+    expect(stages.some((message) => message.startsWith("Starting verifier verification"))).toBe(true);
+    expect(stages.some((message) => message.startsWith("Completed verifier verification"))).toBe(true);
   });
 
   it("reports incomplete when a required finder fails", async () => {

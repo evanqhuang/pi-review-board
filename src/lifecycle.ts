@@ -288,9 +288,9 @@ export function parseReviewContract(body: string, source?: string): ReviewContra
   return contract;
 }
 
-async function planData(planPath: string | undefined, supplied?: ReviewContract): Promise<{ planPath?: string; planHash?: string; contract: ReviewContract }> {
+async function planData(planPath: string | undefined, supplied?: ReviewContract, cwd = process.cwd()): Promise<{ planPath?: string; planHash?: string; contract: ReviewContract }> {
   if (!planPath) return { contract: cleanContract(supplied ?? { guarantees: [], nonGoals: [], riskAreas: [], requiredChecks: [] }) };
-  const canonical = await realpath(isAbsolute(planPath) ? planPath : resolve(planPath));
+  const canonical = await realpath(isAbsolute(planPath) ? planPath : resolve(cwd, planPath));
   const body = await readFile(canonical, "utf8");
   const extracted = parseReviewContract(body, canonical);
   return { planPath: canonical, planHash: hash(body), contract: cleanContract(supplied ?? extracted) };
@@ -550,7 +550,7 @@ async function revalidateManagedSnapshot(
       if (remote.headSha !== snapshot.headSha) return "The pull-request head changed during review";
     }
     if (ledger.planPath) {
-      const currentPlan = await planData(ledger.planPath);
+      const currentPlan = await planData(ledger.planPath, undefined, snapshot.cwd);
       if (currentPlan.planHash !== ledger.planHash) return "The approved plan changed during review";
     }
     return undefined;
@@ -586,7 +586,7 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
   const root = await repositoryRoot(input.cwd, dependencies.commands, signal);
   const directory = await stateDirectory(input.cwd, dependencies.commands);
   const requestedPlan = input.planPath !== undefined || input.contract !== undefined
-    ? await planData(input.planPath, input.contract)
+    ? await planData(input.planPath, input.contract, input.cwd)
     : undefined;
   const requestedImplementationId = input.implementationId
     ?? (input.planPath ? await deriveImplementationId(input.cwd, input.planPath, dependencies.commands) : undefined);
@@ -602,7 +602,7 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
   }
   const plan: Awaited<ReturnType<typeof planData>> = requestedPlan
     ?? (existing?.ledger.planPath
-      ? await planData(existing.ledger.planPath)
+      ? await planData(existing.ledger.planPath, undefined, input.cwd)
       : existing
         ? { contract: existing.ledger.contract }
         : await planData(undefined, input.contract));
@@ -785,7 +785,7 @@ export async function getReviewStatus(cwd: string, dependencies: Pick<ReviewDepe
     targetMismatch = remote.baseSha !== found.ledger.baseSha || remote.headSha !== localHead;
   }
   const planPath = options.planPath ?? found.ledger.planPath;
-  const currentPlan = planPath ? await planData(planPath) : undefined;
+  const currentPlan = planPath ? await planData(planPath, undefined, cwd) : undefined;
   const planChanged = Boolean(planPath && currentPlan?.planHash !== found.ledger.planHash);
   const stale = planChanged || dirty || targetMismatch || !currentHead
     || Boolean(found.ledger.lastReviewedHead && currentHead !== found.ledger.lastReviewedHead);

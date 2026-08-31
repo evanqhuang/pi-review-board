@@ -9,24 +9,33 @@ class FakeCommands implements CommandRunner {
   public commentCount = 0;
   public rejectComment = false;
   public failIdentity = false;
+  public draft = false;
+  public existingReview = false;
+  public existingReviewOnPublish = false;
   public changeBeforePublish = false;
+  private prViewCount = 0;
   private prDiffCount = 0;
   public run(command: string, args: readonly string[]): Promise<CommandResult> {
     this.calls.push([command, ...args]);
-    if (command === "gh" && args[0] === "pr" && args[1] === "view") return Promise.resolve({ stdout: JSON.stringify({
+    if (command === "gh" && args[0] === "pr" && args[1] === "view") {
+      this.prViewCount += 1;
+      return Promise.resolve({ stdout: JSON.stringify({
       number: 7,
       title: "Fix cache",
       body: "body",
       state: "OPEN",
-      isDraft: false,
+      isDraft: this.draft,
       author: { login: "human" },
       url: "https://github.com/acme/repo/pull/7",
       baseRefOid: "base",
       headRefOid: "head",
       repository: { nameWithOwner: "acme/repo" },
       files: [{ path: "src/a.ts" }],
-      comments: [],
+      comments: this.existingReview || (this.existingReviewOnPublish && this.prViewCount >= 2)
+        ? [{ body: "### Code review\n\nAlready reviewed.", author: { login: "reviewer" } }]
+        : [],
     }), stderr: "", exitCode: 0 });
+    }
     if (command === "gh" && args[0] === "api" && args[1] === "user") {
       if (this.failIdentity) return Promise.resolve({ stdout: "", stderr: "identity unavailable", exitCode: 1 });
       return Promise.resolve({ stdout: "reviewer\n", stderr: "", exitCode: 0 });
@@ -214,6 +223,38 @@ describe("runCodeReview", () => {
     expect(result.commented).toBe(true);
     expect(commands.commentCount).toBe(1);
     expect(commands.calls.some((call) => call[0] === "gh" && call[1] === "pr" && call[2] === "comment" && call.includes("--repo") && call.includes("acme/repo"))).toBe(true);
+  });
+
+  it("rejects draft pull requests before invoking reviewers", async () => {
+    const commands = new FakeCommands();
+    commands.draft = true;
+    const agents = new FakeAgents();
+    const result = await runCodeReview({ cwd: "/repo", target: { kind: "pull-request", value: "7" }, comment: true, effort: "medium" }, { commands, agents });
+    expect(result.status).toBe("ineligible");
+    expect(result.summary).toContain("draft");
+    expect(agents.roles).toEqual([]);
+    expect(commands.commentCount).toBe(0);
+  });
+
+  it("detects the current reviewer's existing review before publishing a duplicate", async () => {
+    const commands = new FakeCommands();
+    commands.existingReview = true;
+    const agents = new FakeAgents();
+    const result = await runCodeReview({ cwd: "/repo", target: { kind: "pull-request", value: "7" }, comment: true, effort: "medium" }, { commands, agents });
+    expect(result.status).toBe("ineligible");
+    expect(result.summary).toContain("already has a code review");
+    expect(agents.roles).toEqual([]);
+    expect(commands.commentCount).toBe(0);
+  });
+
+  it("does not duplicate a comment that appears during review", async () => {
+    const commands = new FakeCommands();
+    commands.existingReviewOnPublish = true;
+    const result = await runCodeReview({ cwd: "/repo", target: { kind: "pull-request", value: "7" }, comment: true, effort: "low" }, { commands, agents: new FakeAgents() });
+    expect(result.status).toBe("incomplete");
+    expect(result.commented).toBe(false);
+    expect(result.failures.some((failure) => failure.stage === "comment" && failure.message.includes("duplicate"))).toBe(true);
+    expect(commands.commentCount).toBe(0);
   });
 
   it("rechecks the pull request immediately before publication", async () => {

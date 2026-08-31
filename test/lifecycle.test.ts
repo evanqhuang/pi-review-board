@@ -166,6 +166,19 @@ describe("managed review lifecycle", () => {
     expect(approved.ledger?.remediationBatches).toBe(1);
   });
 
+  it("resolves a relative plan path from the review checkout", async () => {
+    const { repo } = await fixture();
+    const result = await runManagedReview({
+      cwd: repo,
+      target: { kind: "current-diff" },
+      requestedPhase: "auto",
+      effort: "medium",
+      planPath: "../plan.md",
+    }, { commands: new NodeCommandRunner(), agents: new FakeAgents() });
+    expect(result.status).toBe("complete");
+    expect(result.sessionId).toBeTruthy();
+  });
+
   it("rejects an unknown session ID instead of silently starting over", async () => {
     const { repo, plan } = await fixture();
     const agents = new FakeAgents();

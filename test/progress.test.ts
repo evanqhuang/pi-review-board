@@ -59,6 +59,17 @@ describe("ReviewProgressPresenter", () => {
     expect(lines).not.toContain("other");
   });
 
+  it("surfaces bounded reviewer budget failures with usage", () => {
+    const mock = mockUI();
+    const presenter = new ReviewProgressPresenter({ ui: mock.ui, key: "review:budget" });
+    presenter.start();
+    presenter.update({ type: "reviewer-failed", role: "validator", attempt: 1, kind: "context-limit", usage: { role: "validator", turns: 8, inputTokens: 2_000, outputTokens: 500, contextTokens: 8_001 } });
+    const lines = (mock.widgets.get("review:budget") ?? []).join("\\n");
+    expect(lines).toContain("validator · failed");
+    expect(lines).toContain("context-limit");
+    expect(lines).toContain("ctx:8.0k");
+  });
+
   it("isolates cleanup for concurrent run keys and clears all state for the owner", () => {
     const mock = mockUI();
     let owner: string | undefined;

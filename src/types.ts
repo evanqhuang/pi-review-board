@@ -3,6 +3,16 @@ import type { ReviewerResultToolName, ReviewerSafeToolName } from "./reviewer-pr
 
 export type ReviewTargetKind = "pull-request" | "current-diff" | "branch" | "path" | "worktree";
 
+/** Bounded reviewer roles used by deterministic routing. */
+export type ReviewRole =
+  | "summary"
+  | "guidance-a"
+  | "guidance-b"
+  | "diff-only-bug"
+  | "contextual-bug"
+  | "integration"
+  | "validator";
+
 export interface PullRequestMetadata {
   readonly number: number;
   readonly title: string;
@@ -79,6 +89,8 @@ export interface ReviewCandidate {
   readonly evidence: string;
   readonly category: FindingCategory;
   readonly severity: FindingSeverity;
+  /** Internal request to inspect the nearest direct context; never reportable by itself. */
+  readonly needsContext: boolean;
   readonly finder: string;
 }
 
@@ -178,6 +190,9 @@ export type ReviewerFailureKind =
   | "validation"
   | "canceled"
   | "output-limit"
+  | "turn-limit"
+  | "context-limit"
+  | "compaction"
   | "spawn"
   | "transport"
   | "process";
@@ -232,6 +247,10 @@ export interface AgentInvocation {
   readonly cwd: string;
   readonly tools: readonly string[];
   readonly resultTool: ReviewerResultToolName;
+  /** Maximum model turns allowed for this isolated reviewer process. */
+  readonly maxTurns: number;
+  /** Maximum provider-reported context usage allowed for this reviewer. */
+  readonly contextBudget: number;
   readonly model?: string;
   readonly thinking: ReviewThinking;
 }

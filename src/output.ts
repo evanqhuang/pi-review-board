@@ -63,7 +63,13 @@ function matchingChangedPath(value: string, line: number, changedLocations: Read
   const normalized = normalizeReviewPath(value);
   const location = `${normalized}:${line}`;
   if (changedLocations.has(location)) return normalized;
-  const canonical = (changedLocations as Partial<ChangedLocations>).gitAliases?.get(location);
+  // A reviewer may include Git's a/ or b/ prefix. Strip it only as a
+  // fallback, so a real top-level directory named a or b remains intact.
+  const diffNormalized = normalizeDiffPath(normalized);
+  const diffLocation = `${diffNormalized}:${line}`;
+  if (changedLocations.has(diffLocation)) return diffNormalized;
+  const aliases = (changedLocations as Partial<ChangedLocations>).gitAliases;
+  const canonical = aliases?.get(location) ?? aliases?.get(diffLocation);
   return canonical ? canonical.slice(0, canonical.lastIndexOf(":")) : undefined;
 }
 
@@ -144,20 +150,41 @@ export function filterCandidatesToChangedLines(
   });
 }
 
+function normalizedCandidatePath(value: string): string {
+  // Filtering normally canonicalizes Git prefixes first. Do not strip a
+  // leading a/ or b/ here: those can be legitimate repository directories.
+  return normalizeReviewPath(value).trim();
+}
+
 function candidateKey(candidate: ReviewCandidate): string {
-  return `${candidate.category}:${normalize(candidate.rootCauseKey)}`;
+  // A root cause can legitimately occur at multiple changed locations or have
+  // multiple failure modes. Only collapse an observation when all three
+  // identifying dimensions overlap.
+  return [
+    normalize(candidate.rootCauseKey),
+    `${normalizedCandidatePath(candidate.file)}:${candidate.line}`,
+    normalize(candidate.failureScenario),
+  ].join("|");
 }
 
 export function deduplicateCandidates(candidates: readonly ReviewCandidate[]): ReviewCandidate[] {
-  const byRootCause = new Map<string, ReviewCandidate>();
+  const byObservation = new Map<string, ReviewCandidate>();
   for (const candidate of candidates) {
     const key = candidateKey(candidate);
-    const existing = byRootCause.get(key);
-    if (!existing || severityRank[candidate.severity] < severityRank[existing.severity]) {
-      byRootCause.set(key, candidate);
+    const existing = byObservation.get(key);
+    if (!existing) {
+      // Map insertion order is the finder order and candidate IDs are supplied
+      // by the caller, so retaining the first observation keeps both stable.
+      byObservation.set(key, candidate);
+      continue;
+    }
+    // needsContext is an escalation request, so losing it during a merge would
+    // silently discard a request for the nearest follow-up context.
+    if (existing.needsContext || candidate.needsContext) {
+      byObservation.set(key, { ...existing, needsContext: true });
     }
   }
-  return [...byRootCause.values()];
+  return [...byObservation.values()];
 }
 
 export interface FindingFilterOptions {
@@ -172,14 +199,16 @@ export function filterVerifiedFindings(
   options: FindingFilterOptions = {},
 ): VerifiedFinding[] {
   const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
-  const minimumConfidence = options.minimumConfidence ?? 80;
+  // Verification is intentionally strict regardless of the caller's effort
+  // mode: plausible and refuted observations are never reportable, and a
+  // confirmed result needs at least 85% confidence.
+  const minimumConfidence = Math.max(85, options.minimumConfidence ?? 85);
   const findings: VerifiedFinding[] = [];
   for (const verification of verifications) {
     const candidate = byId.get(verification.candidateId);
-    const acceptableDisposition = verification.disposition === "CONFIRMED" || (options.retainPlausible === true && verification.disposition === "PLAUSIBLE");
-    if (!candidate || !acceptableDisposition || verification.confidence < minimumConfidence) continue;
-    const file = verification.file ?? candidate.file;
-    const line = verification.line ?? candidate.line;
+    if (!candidate || verification.disposition !== "CONFIRMED" || verification.confidence < minimumConfidence) continue;
+    const file = candidate.file;
+    const line = candidate.line;
     const matchedFile = options.changedLocations ? matchingChangedPath(file, line, options.changedLocations) : normalizeReviewPath(file);
     if (!matchedFile) continue;
     findings.push({
@@ -190,15 +219,7 @@ export function filterVerifiedFindings(
       verification: verification.verification,
     });
   }
-  return findings.sort((left, right) => severityRank[left.severity] - severityRank[right.severity] || right.confidence - left.confidence || left.file.localeCompare(right.file) || left.line - right.line);
-}
-
-export function promoteDirectFindings(candidates: readonly ReviewCandidate[], verification: string): VerifiedFinding[] {
-  return candidates.map((candidate) => ({
-    ...candidate,
-    confidence: 100,
-    verification,
-  }));
+  return findings.sort((left, right) => severityRank[left.severity] - severityRank[right.severity] || right.confidence - left.confidence || left.file.localeCompare(right.file) || left.line - right.line || left.id.localeCompare(right.id));
 }
 
 function isOldSidePath(snapshot: ReviewSnapshot, file: string): boolean {
@@ -272,14 +293,15 @@ export function formatReviewReport(
   failures: readonly StageFailure[],
 ): string {
   const target = formatReviewTarget(snapshot);
-  if (status === "ineligible") return `### Code review\n\n${target}\n\nNot reviewed: ${summary}`;
+  const cleanSummary = summary.trim();
+  if (status === "ineligible") return `### Code review\n\n${target}\n\nNot reviewed${cleanSummary ? `: ${cleanSummary}` : ""}`;
   const title = findings.length > 0
     ? `Found ${findings.length} issue${findings.length === 1 ? "" : "s"}`
     : status === "complete"
       ? "No issues found"
       : "No verified findings";
   const lines = [`### Code review`, "", target, "", title + "."];
-  if (summary) lines.push("", summary);
+  if (cleanSummary) lines.push("", cleanSummary);
   if (findings.length > 0) lines.push("", ...findings.map((finding) => findingText(snapshot, finding)));
   if (failures.length > 0) {
     lines.push("", status === "incomplete" ? "Review incomplete:" : "Review warnings:");

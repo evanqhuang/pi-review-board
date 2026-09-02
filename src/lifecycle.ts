@@ -514,7 +514,7 @@ function managedReport(decision: ReviewDecision, ledger: Ledger, phase: string, 
 
 function resultFromLedger(ledger: Ledger, note: string): ReviewResult {
   return {
-    effort: "low", status: ledger.decision === "incomplete" || ledger.decision === "blocked" ? "incomplete" : "complete", summary: note,
+    effort: "normal", status: ledger.decision === "incomplete" || ledger.decision === "blocked" ? "incomplete" : "complete", summary: note,
     findings: [], failures: [], commented: false, usage: [], report: managedReport(ledger.decision, ledger, ledger.phase, [], note),
     decision: ledger.decision, sessionId: ledger.sessionId, ...(ledger.lastReviewedSnapshotHash ? { reviewedSnapshotHash: ledger.lastReviewedSnapshotHash } : {}),
     ledger: summary(ledger), ...(ledger.phase === "initial" || ledger.phase === "delta" || ledger.phase === "final" ? { phase: ledger.phase } : {}),
@@ -651,7 +651,7 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
       cwd: snapshot.cwd,
       target,
       comment: false,
-      effort: phase === "initial" ? input.effort : "low",
+      effort: phase === "initial" ? input.effort : "normal",
       phase,
       contract: current.contract,
       snapshot,

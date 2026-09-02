@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { collectChangedLocations, deduplicateCandidates, filterCandidatesToChangedLines, filterVerifiedFindings, formatReviewReport, normalizeReviewPath, promoteDirectFindings } from "../src/output.js";
-import type { ReviewCandidate, ReviewSnapshot } from "../src/types.js";
+import { collectChangedLocations, deduplicateCandidates, filterCandidatesToChangedLines, filterVerifiedFindings, formatReviewReport, normalizeReviewPath } from "../src/output.js";
+import type { ReviewCandidate, ReviewSnapshot, VerifiedFinding } from "../src/types.js";
 
 const snapshot: ReviewSnapshot = {
   target: { kind: "branch", ref: "topic" },
@@ -21,6 +21,7 @@ function candidate(overrides: Partial<ReviewCandidate> = {}): ReviewCandidate {
     evidence: "The changed branch skips refresh",
     category: "correctness",
     severity: "high",
+    needsContext: false,
     finder: "diff-correctness",
     ...overrides,
   };
@@ -29,7 +30,7 @@ function candidate(overrides: Partial<ReviewCandidate> = {}): ReviewCandidate {
 describe("review output", () => {
   it("deduplicates a root cause across wording and location while retaining distinct roots", () => {
     const first = candidate();
-    const sameRoot = candidate({
+    const sameRootDifferentLocation = candidate({
       id: "finder:two:0",
       finder: "history",
       file: "src/other.ts",
@@ -37,8 +38,17 @@ describe("review output", () => {
       summary: "Cold startup bypasses cache population",
       failureScenario: "The first read observes stale state",
     });
-    const distinct = candidate({ id: "finder:three:0", rootCauseKey: "errors:dropped-state", summary: "Drops error state" });
-    expect(deduplicateCandidates([first, sameRoot, distinct])).toHaveLength(2);
+    const sameObservation = candidate({
+      id: "finder:three:0",
+      needsContext: true,
+      summary: "Uses an old cache value",
+      failureScenario: "When the cache is cold, the result is wrong",
+    });
+    const distinctScenario = candidate({ id: "finder:four:0", failureScenario: "A warm cache returns an invalid value" });
+    const distinct = candidate({ id: "finder:five:0", rootCauseKey: "errors:dropped-state", summary: "Drops error state" });
+    const result = deduplicateCandidates([first, sameRootDifferentLocation, sameObservation, distinctScenario, distinct]);
+    expect(result.map((item) => item.id)).toEqual([first.id, sameRootDifferentLocation.id, distinctScenario.id, distinct.id]);
+    expect(result[0]?.needsContext).toBe(true);
   });
 
   it("accepts only changed locations and rejects verifier corrections outside them", () => {
@@ -54,8 +64,9 @@ describe("review output", () => {
     const changed = collectChangedLocations(diff);
     expect(changed).toEqual(new Set(["src/a.ts:11"]));
     expect(filterCandidatesToChangedLines([item], new Set(["src/a.ts:12"]))).toHaveLength(1);
+    expect(filterCandidatesToChangedLines([candidate({ file: "a/src/a.ts", needsContext: true, line: 11 })], changed)[0]?.needsContext).toBe(true);
     expect(filterCandidatesToChangedLines([candidate({ file: "src/other.ts" })], new Set(["src/a.ts:12"]))).toHaveLength(0);
-    expect(filterVerifiedFindings([item], [{ candidateId: item.id, confidence: 100, verification: "wrong location", confirmed: true, disposition: "CONFIRMED", file: "src/other.ts", line: 12 }], { changedLocations: changed })).toEqual([]);
+    expect(filterVerifiedFindings([item], [{ candidateId: item.id, confidence: 100, verification: "wrong location", disposition: "CONFIRMED" }], { changedLocations: changed })).toEqual([]);
   });
 
   it("tracks added lines whose content starts with diff marker characters", () => {
@@ -132,7 +143,11 @@ describe("review output", () => {
         comments: [],
         reviewerIdentityAvailable: true,
       },
-    }, "complete", "", [promoteDirectFindings([candidate({ file: "old.ts", line: 1 })], "verified")[0]!], []);
+    }, "complete", "", [{
+      ...candidate({ file: "old.ts", line: 1 }),
+      confidence: 100,
+      verification: "verified",
+    } satisfies VerifiedFinding], []);
     expect(report).toContain("**Target:** [acme/repo#7](https://github.com/acme/repo/pull/7)");
     expect(report).toContain("/blob/base-sha/old.ts#L1");
 
@@ -169,7 +184,11 @@ describe("review output", () => {
         comments: [],
         reviewerIdentityAvailable: true,
       },
-    }, "complete", "", [promoteDirectFindings([candidate({ file: "removed.ts", line: 1 })], "verified")[0]!], []);
+    }, "complete", "", [{
+      ...candidate({ file: "removed.ts", line: 1 }),
+      confidence: 100,
+      verification: "verified",
+    } satisfies VerifiedFinding], []);
     expect(deletedReport).toContain("/blob/base-sha/removed.ts#L1");
   });
 
@@ -208,21 +227,21 @@ describe("review output", () => {
     expect(normalizeReviewPath('"b/src/with\\t-tab.ts"')).toBe("b/src/with\t-tab.ts");
   });
 
-  it("keeps only confirmed scores at or above 80", () => {
+  it("keeps only confirmed scores at or above 85", () => {
     const item = candidate();
     expect(filterVerifiedFindings([item], [
-      { candidateId: item.id, confidence: 79, verification: "weak", confirmed: true, disposition: "CONFIRMED" },
+      { candidateId: item.id, confidence: 84, verification: "weak", disposition: "CONFIRMED" },
     ])).toEqual([]);
     expect(filterVerifiedFindings([item], [
-      { candidateId: item.id, confidence: 80, verification: "reproduced", confirmed: true, disposition: "CONFIRMED" },
-    ])[0]?.confidence).toBe(80);
+      { candidateId: item.id, confidence: 85, verification: "reproduced", disposition: "CONFIRMED" },
+    ])[0]?.confidence).toBe(85);
   });
 
-  it("retains plausible findings only for recall-biased effort levels", () => {
+  it("never reports plausible or refuted candidates, even when recall is requested", () => {
     const item = candidate();
-    const plausible = [{ candidateId: item.id, confidence: 80, verification: "likely", confirmed: false, disposition: "PLAUSIBLE" as const }];
-    expect(filterVerifiedFindings([item], plausible)).toEqual([]);
-    expect(filterVerifiedFindings([item], plausible, { retainPlausible: true })[0]?.confidence).toBe(80);
+    for (const disposition of ["PLAUSIBLE", "REFUTED"] as const) {
+      expect(filterVerifiedFindings([item], [{ candidateId: item.id, confidence: 100, verification: "not confirmed", disposition }], { retainPlausible: true })).toEqual([]);
+    }
   });
 
   it("does not claim a clean review when a required stage failed", () => {

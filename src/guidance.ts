@@ -14,6 +14,24 @@ export interface GuidanceDiscoveryResult {
   readonly failures: readonly string[];
 }
 
+/** Return whether a guidance file's directory governs a repository path. */
+export function guidanceCoversPath(cwd: string, guidancePath: string, changedPath: string): boolean {
+  const root = resolve(cwd);
+  const directory = resolve(dirname(guidancePath));
+  const target = resolve(root, changedPath);
+  const boundary = directory.endsWith(sep) ? directory : `${directory}${sep}`;
+  return target === directory || target.startsWith(boundary);
+}
+
+/** Restrict guidance to rules applicable to one changed repository path. */
+export function guidanceForPath(
+  cwd: string,
+  files: readonly GuidanceFile[],
+  changedPath: string,
+): GuidanceFile[] {
+  return files.filter((file) => guidanceCoversPath(cwd, file.path, changedPath));
+}
+
 function ancestorDirectories(start: string, stop: string): string[] {
   const directories: string[] = [];
   let current = resolve(start);

@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { buildBatchVerifierPrompt, buildFinderPrompt, FINDER_LENSES, validateBatchVerifier, validateFinder } from "../src/prompts.js";
+import {
+  buildContextualBugPrompt,
+  buildDiffOnlyBugPrompt,
+  buildGuidancePrompt,
+  buildIntegrationPrompt,
+  buildSummaryPrompt,
+  buildValidatorPrompt,
+  validateFinder,
+  validateVerifier,
+} from "../src/prompts.js";
 import type { ReviewCandidate, ReviewSnapshot } from "../src/types.js";
 
 const candidates: readonly ReviewCandidate[] = [
@@ -13,6 +22,7 @@ const candidates: readonly ReviewCandidate[] = [
     evidence: "The changed branch returns before refresh",
     category: "correctness",
     severity: "high",
+    needsContext: false,
     finder: "diff-correctness",
   },
   {
@@ -25,6 +35,7 @@ const candidates: readonly ReviewCandidate[] = [
     evidence: "The new adapter swallows the rejection",
     category: "contract",
     severity: "medium",
+    needsContext: true,
     finder: "cross-file",
   },
 ];
@@ -40,18 +51,8 @@ const snapshot: ReviewSnapshot = {
   snapshotHash: "hash",
 };
 
-function verdict(candidateId: string) {
-  return {
-    candidateId,
-    confidence: 95,
-    verification: "The failure is reachable from the changed branch",
-    confirmed: true,
-    disposition: "CONFIRMED" as const,
-  };
-}
-
-describe("finder and batch verifier contract", () => {
-  it("requires a semantic root-cause key from every finder candidate", () => {
+describe("bounded role prompt and result contracts", () => {
+  it("requires a semantic root-cause key, changed line, suspicion, and context flag", () => {
     expect(() => validateFinder({ candidates: [{
       id: "candidate-1",
       file: "src/cache.ts",
@@ -61,35 +62,131 @@ describe("finder and batch verifier contract", () => {
       evidence: "The changed branch returns before refresh",
       category: "correctness",
       severity: "high",
+      needsContext: false,
     }] })).toThrow("rootCauseKey");
-
-    const prompt = buildFinderPrompt(FINDER_LENSES[0]!, snapshot, [], "summary");
-    expect(prompt).toContain("rootCauseKey");
-    expect(prompt).toContain("not an ordinal");
+    expect(() => validateFinder({ candidates: [{
+      id: "candidate-1",
+      rootCauseKey: "cache:cold-refresh-skipped",
+      file: "src/cache.ts",
+      line: 12,
+      summary: "Skips cache refresh",
+      failureScenario: "A cold cache returns stale data",
+      evidence: "The changed branch returns before refresh",
+      category: "correctness",
+      severity: "low",
+      needsContext: false,
+    }] })).toThrow("severity");
+    expect(validateFinder({ candidates: [{
+      id: "candidate-1",
+      rootCauseKey: "cache:cold-refresh-skipped",
+      file: "src/cache.ts",
+      line: 12,
+      summary: "Skips cache refresh",
+      failureScenario: "A cold cache returns stale data",
+      evidence: "The changed branch returns before refresh",
+      category: "correctness",
+      severity: "high",
+      needsContext: true,
+    }] }).candidates[0]?.needsContext).toBe(true);
   });
 
-  it("validates one verdict for every candidate and preserves IDs", () => {
-    const result = validateBatchVerifier(
-      { verifications: [verdict(secondCandidate.id), verdict(firstCandidate.id)] },
-      new Set(candidates.map((candidate) => candidate.id)),
-    );
-
-    expect(result.verifications.map((item) => item.candidateId)).toEqual([secondCandidate.id, firstCandidate.id]);
+  it("uses one-candidate validation instead of a batch contract", () => {
+    expect(validateVerifier({
+      candidateId: firstCandidate.id,
+      confidence: 95,
+      verification: "The failure is reachable from the changed branch",
+      disposition: "CONFIRMED",
+    })).toEqual({
+      candidateId: firstCandidate.id,
+      confidence: 95,
+      verification: "The failure is reachable from the changed branch",
+      disposition: "CONFIRMED",
+    });
+    expect(() => validateVerifier({
+      candidateId: secondCandidate.id,
+      confidence: 95,
+      verification: "wrong candidate",
+      disposition: "CONFIRMED",
+    }, firstCandidate.id)).toThrow("candidateId");
   });
 
-  it("rejects duplicate, unknown, and missing candidate IDs", () => {
-    const ids = new Set(candidates.map((candidate) => candidate.id));
-    expect(() => validateBatchVerifier({ verifications: [verdict(firstCandidate.id), verdict(firstCandidate.id)] }, ids)).toThrow("Duplicate");
-    expect(() => validateBatchVerifier({ verifications: [verdict(firstCandidate.id), verdict("unknown")] }, ids)).toThrow("Unknown");
-    expect(() => validateBatchVerifier({ verifications: [verdict(firstCandidate.id)] }, ids)).toThrow("exactly one verdict");
+  it("bounds every role and gives each role only its required payload", () => {
+    const summaryPrompt = buildSummaryPrompt({
+      ...snapshot,
+      pullRequest: { title: "Cache refresh", body: "Keep cold reads fresh", number: 1, state: "OPEN", isDraft: false, authorLogin: "a", url: "", baseSha: "", headSha: "", repository: "acme/repo", changedPaths: snapshot.changedPaths, comments: [], reviewerIdentityAvailable: true },
+    }, []);
+    expect(summaryPrompt).toContain("\"title\":\"Cache refresh\"");
+    expect(summaryPrompt).toContain("\"paths\":[\"src/cache.ts\",\"src/client.ts\"]");
+    expect(summaryPrompt).toContain("Tools already work");
+    expect(summaryPrompt).toContain("exactly one terminating result tool");
+
+    const guidancePrompt = buildGuidancePrompt(snapshot, [
+      { path: "src/cache.ts", guidance: [{ path: "/repo/AGENTS.md", content: "Avoid stale cache state." }] },
+      { path: "src/client.ts", guidance: [{ path: "/repo/AGENTS.md", content: "Avoid stale cache state." }] },
+    ], "summary");
+    expect(guidancePrompt).toContain("Avoid stale cache state.");
+    expect(guidancePrompt).toContain("changedCode");
+    expect(guidancePrompt).toContain("summary");
+
+    const diffPrompt = buildDiffOnlyBugPrompt(snapshot);
+    expect(diffPrompt).toContain("Reason from the diff alone");
+    expect(diffPrompt).toContain("Do not assume unseen context");
+    expect(diffPrompt).toContain("title");
+    expect(diffPrompt).toContain("body");
+
+    for (const prompt of [buildContextualBugPrompt(snapshot), buildIntegrationPrompt(snapshot)]) {
+      expect(prompt).toContain("changedPaths");
+      expect(prompt).toContain("followUpConstraints");
+      expect(prompt).toContain("nearest");
+    }
   });
 
-  it("includes the complete candidate batch and requires exact correlation", () => {
-    const prompt = buildBatchVerifierPrompt(candidates, snapshot, [], "summary", { passLabel: "verifier" });
+  it("scopes nested guidance to its covered changed file while repeating root guidance", () => {
+    const guidancePrompt = buildGuidancePrompt(snapshot, [
+      {
+        path: "src/cache.ts",
+        guidance: [
+          { path: "/repo/AGENTS.md", content: "root rule" },
+          { path: "/repo/src/AGENTS.md", content: "cache-only rule" },
+        ],
+      },
+      {
+        path: "src/client.ts",
+        guidance: [
+          { path: "/repo/AGENTS.md", content: "root rule" },
+          { path: "/repo/src/client/AGENTS.md", content: "client-only rule" },
+        ],
+      },
+    ]);
+    const payload = JSON.parse(guidancePrompt.split("<review-input>\n")[1]!.split("\n</review-input>")[0]!) as {
+      guidance: readonly { path: string; guidance: string }[];
+    };
+    expect(payload.guidance).toEqual([
+      { path: "src/cache.ts", guidance: "### AGENTS.md\nroot rule\n\n### src/AGENTS.md\ncache-only rule" },
+      { path: "src/client.ts", guidance: "### AGENTS.md\nroot rule\n\n### src/client/AGENTS.md\nclient-only rule" },
+    ]);
+    expect(payload.guidance[0]?.guidance).not.toContain("client-only rule");
+    expect(payload.guidance[1]?.guidance).not.toContain("cache-only rule");
+  });
 
-    expect(prompt).toContain("as one batch (verifier pass)");
-    expect(prompt).toContain(firstCandidate.id);
-    expect(prompt).toContain(secondCandidate.id);
-    expect(prompt).toContain("exactly one verdict for every supplied candidate");
+  it("gives the validator one candidate, hunk, nearby context, and optional guidance", () => {
+    const validatorPrompt = buildValidatorPrompt(firstCandidate, {
+      ...snapshot,
+      diff: [
+        "diff --git a/src/cache.ts b/src/cache.ts",
+        "--- a/src/cache.ts",
+        "+++ b/src/cache.ts",
+        "@@ -11,2 +11,3 @@",
+        " context",
+        "+changed cache branch",
+        " context",
+      ].join("\n"),
+    }, [], "");
+    expect(validatorPrompt).toContain(firstCandidate.id);
+    expect(validatorPrompt).toContain("exactChangedHunk");
+    expect(validatorPrompt).toContain("+changed cache branch");
+    expect(validatorPrompt).toContain("nearbyContext");
+    expect(validatorPrompt).not.toContain(secondCandidate.id);
+    expect(validatorPrompt).not.toContain("optional summary supplied by another reviewer");
   });
 });

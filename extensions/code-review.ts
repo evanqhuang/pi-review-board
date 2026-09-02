@@ -26,7 +26,7 @@ interface ReviewToolParams {
   readonly action?: "run" | "loop" | "record" | "status" | "reset" | undefined;
   readonly target?: string | undefined;
   readonly comment?: boolean | undefined;
-  readonly effort?: string | undefined;
+  readonly effort?: ReviewEffort | undefined;
   readonly model?: string | undefined;
   readonly phase?: "auto" | ReviewPhase | undefined;
   readonly planPath?: string | undefined;
@@ -53,15 +53,12 @@ interface ReviewExecutionContext {
 
 const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
   { value: "loop", label: "loop — start or continue the managed review loop" },
-  { value: "low", label: "low — cheapest one-shot review (default)" },
+  { value: "normal", label: "normal — automatic tiny/small routing (default)" },
+  { value: "deep", label: "deep — normal review plus one integration pass" },
   { value: "status", label: "status — inspect a managed review session" },
   { value: "reset", label: "reset — reset a managed review session" },
-  { value: "--effort low", label: "--effort low — cheapest review (default)" },
-  { value: "--effort medium", label: "--effort medium — broader review" },
-  { value: "--effort high", label: "--effort high — expensive deep review" },
-  { value: "--effort xhigh", label: "--effort xhigh — very expensive review" },
-  { value: "--effort max", label: "--effort max — maximum-depth review" },
-  { value: "--effort ultra", label: "--effort ultra — maximum review plus second verification" },
+  { value: "--effort normal", label: "--effort normal — automatic tiny/small routing (default)" },
+  { value: "--effort deep", label: "--effort deep — normal review plus one integration pass" },
   { value: "--phase initial", label: "--phase initial — advanced managed override" },
   { value: "--phase auto", label: "--phase auto — advanced automatic override" },
   { value: "--phase delta", label: "--phase delta — advanced remediation override" },
@@ -392,7 +389,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("code-review", {
-    description: "Run a one-shot review or start/continue a managed review loop (default effort: low)",
+    description: "Run a one-shot review or start/continue a managed review loop (default effort: normal; normal auto-routes tiny/small, deep adds one integration pass)",
     getArgumentCompletions: getReviewArgumentCompletions,
     handler: async (args, ctx) => {
       try {
@@ -419,12 +416,15 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "code_review",
     label: "Code Review",
-    description: "Run a one-shot review or start/continue the bounded managed review loop. Results are report-only unless comment is explicitly true for a one-shot pull-request review.",
+    description: "Run a one-shot review or bounded managed loop. Normal auto-routes tiny/small changes; deep adds one integration pass. Results are report-only unless comment is explicitly true for a one-shot pull-request review.",
     parameters: Type.Object({
       action: Type.Optional(Type.Union([Type.Literal("run"), Type.Literal("loop"), Type.Literal("record"), Type.Literal("status"), Type.Literal("reset")])),
       target: Type.Optional(Type.String({ description: "Pull request number/URL, branch, path, worktree, or omit for current diff" })),
       comment: Type.Optional(Type.Boolean({ description: "Publish only for an explicit one-shot pull-request review" })),
-      effort: Type.Optional(Type.String({ description: "Review depth: low, medium, high, xhigh, max, or ultra" })),
+      effort: Type.Optional(Type.Union([
+        Type.Literal("normal"),
+        Type.Literal("deep"),
+      ], { description: "Review depth: normal automatically routes tiny/small changes; deep adds one integration pass" })),
       model: Type.Optional(Type.String({ description: "Reviewer model provider/id override" })),
       phase: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("initial"), Type.Literal("delta"), Type.Literal("final")])),
       planPath: Type.Optional(Type.String({ description: "Managed plan path whose review contract and implementation identity should be used" })),
@@ -475,7 +475,7 @@ export default function (pi: ExtensionAPI): void {
       } catch (error) {
         return {
           content: [{ type: "text", text: `Code review failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { effort: params.effort ?? "low", status: "incomplete", decision: "incomplete", findings: [], failures: [String(error)], commented: false },
+          details: { effort: params.effort ?? "normal", status: "incomplete", decision: "incomplete", findings: [], failures: [String(error)], commented: false },
           isError: true,
         };
       }

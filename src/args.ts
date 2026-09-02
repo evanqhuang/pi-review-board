@@ -73,7 +73,7 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
   const tokens = tokenize(input);
   let action: ReviewCommandAction = "run";
   let comment = false;
-  let effort: ReviewEffort = "low";
+  let effort: ReviewEffort = "normal";
   let effortProvided = false;
   let model: string | undefined;
   let phase: ReviewPhase | "auto" = "auto";
@@ -140,10 +140,17 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
       continue;
     }
     if (token.startsWith("-")) throw new Error(`Unknown option: ${token}`);
-    if (action === "run" && !effortProvided && target === undefined && isReviewEffort(token)) {
-      effort = parseReviewEffort(token);
-      effortProvided = true;
-      continue;
+    if (action === "run" && !effortProvided && target === undefined) {
+      if (isReviewEffort(token)) {
+        effort = parseReviewEffort(token);
+        effortProvided = true;
+        continue;
+      }
+      // Preserve the positional effort form while making the retired public
+      // values fail clearly instead of being mistaken for a target.
+      if (["low", "medium", "high", "xhigh", "max", "ultra"].includes(token.toLowerCase())) {
+        throw new Error(`Unknown effort level: ${token}. Expected normal or deep.`);
+      }
     }
     if (target !== undefined) throw new Error(`Ambiguous review target: ${target} and ${token}`);
     target = token;

@@ -9,7 +9,7 @@ import registerCodeReviewExtension, {
 import type { ReviewResult } from "../src/types.js";
 
 const result: ReviewResult = {
-  effort: "medium",
+  effort: "normal",
   status: "complete",
   summary: "No issues found.",
   findings: [],
@@ -23,9 +23,17 @@ describe("review extension helpers", () => {
   it("offers the managed loop prominently while preserving advanced phase completions", () => {
     const rootCompletions = getReviewArgumentCompletions("")?.map((item) => item.value);
     expect(rootCompletions?.[0]).toBe("loop");
-    expect(rootCompletions).toContain("--effort low");
+    expect(rootCompletions).toContain("normal");
+    expect(rootCompletions).toContain("deep");
+    expect(rootCompletions).toContain("--effort normal");
+    expect(rootCompletions).toContain("--effort deep");
+    for (const value of ["low", "medium", "high", "xhigh", "max", "ultra"]) {
+      expect(rootCompletions).not.toContain(value);
+      expect(rootCompletions).not.toContain(`--effort ${value}`);
+    }
     expect(rootCompletions).toContain("--phase initial");
-    expect(getReviewArgumentCompletions("--e")?.map((item) => item.value)).toContain("--effort low");
+    expect(getReviewArgumentCompletions("--e")?.map((item) => item.value)).toContain("--effort normal");
+    expect(getReviewArgumentCompletions("--e")?.map((item) => item.value)).toContain("--effort deep");
     expect(getReviewArgumentCompletions("status --s")?.map((item) => item.value)).toContain("status --session ");
     expect(getReviewArgumentCompletions("unknown")).toBeNull();
   });
@@ -66,9 +74,13 @@ describe("review extension helpers", () => {
   it("registers the tool and clears progress state when execution fails before target resolution", async () => {
     type RegisteredReviewTool = {
       readonly name: string;
+      readonly description: string;
+      readonly parameters: unknown;
       readonly execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: unknown, ctx: unknown) => Promise<{ readonly isError?: boolean }>;
     };
+    type RegisteredReviewCommand = { readonly description: string };
     const registeredTools: RegisteredReviewTool[] = [];
+    const registeredCommands: Array<{ readonly name: string; readonly command: RegisteredReviewCommand }> = [];
     const statuses = new Map<string, string | undefined>();
     const widgets = new Map<string, string[] | undefined>();
     const working: (string | undefined)[] = [];
@@ -82,13 +94,26 @@ describe("review extension helpers", () => {
     const pi = {
       on: vi.fn(),
       registerTool: (tool: RegisteredReviewTool) => registeredTools.push(tool),
-      registerCommand: vi.fn(),
+      registerCommand: (name: string, command: RegisteredReviewCommand) => registeredCommands.push({ name, command }),
       registerMessageRenderer: vi.fn(),
       registerEntryRenderer: vi.fn(),
     };
     registerCodeReviewExtension(pi as never);
     const tool = registeredTools.find((entry) => entry.name === "code_review");
     expect(tool).toBeDefined();
+    expect(registeredCommands.map((entry) => entry.name)).toContain("code-review");
+    const commandDescription = registeredCommands.find((entry) => entry.name === "code-review")?.command.description ?? "";
+    expect(commandDescription).toContain("default effort: normal");
+    for (const value of ["low", "medium", "high", "xhigh", "max", "ultra"]) {
+      expect(commandDescription).not.toContain(value);
+    }
+    expect(tool!.description).toContain("Normal auto-routes tiny/small changes; deep adds one integration pass");
+    const toolSchema = JSON.stringify(tool!.parameters);
+    expect(toolSchema).toContain('"const":"normal"');
+    expect(toolSchema).toContain('"const":"deep"');
+    for (const value of ["low", "medium", "high", "xhigh", "max", "ultra"]) {
+      expect(toolSchema).not.toContain(`"const":"${value}"`);
+    }
     const result = await tool!.execute(
       "tool-call",
       { action: "not-a-real-action" } as never,

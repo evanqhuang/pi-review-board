@@ -14,6 +14,7 @@ const validFinderResult = {
     evidence: "The changed branch returns before refresh",
     category: "correctness",
     severity: "high",
+    needsContext: false,
   }],
 } as const;
 
@@ -31,8 +32,14 @@ describe("private reviewer output tools", () => {
     }
 
     const finderProperties = reviewerOutputSchemas.finder.properties as unknown as { readonly candidates: { readonly maxItems?: number; readonly items: { readonly additionalProperties?: unknown } } };
-    expect(finderProperties.candidates.maxItems).toBe(100);
+    expect(finderProperties.candidates.maxItems).toBe(8);
     expect(finderProperties.candidates.items.additionalProperties).toBe(false);
+    const verifierProperties = reviewerOutputSchemas.verifier.properties as unknown as Record<string, unknown>;
+    expect(verifierProperties).toHaveProperty("candidateId");
+    expect(verifierProperties).toHaveProperty("disposition");
+    expect(verifierProperties).toHaveProperty("confidence");
+    expect(verifierProperties).toHaveProperty("verification");
+    expect(verifierProperties).not.toHaveProperty("verifications");
   });
 
   it("rejects missing, blank, whitespace, and unknown candidate categories before execution", () => {
@@ -47,6 +54,16 @@ describe("private reviewer output tools", () => {
       expect(Value.Check(candidateSchema, candidate)).toBe(false);
     }
     expect(Value.Check(candidateSchema, validFinderResult.candidates[0])).toBe(true);
+  });
+
+  it("rejects the deprecated batch shape for the registered validator tool", () => {
+    expect(Value.Check(reviewerOutputSchemas.verifier, { verifications: [] })).toBe(false);
+    expect(Value.Check(reviewerOutputSchemas.verifier, {
+      candidateId: "candidate-1",
+      disposition: "PLAUSIBLE",
+      confidence: 50,
+      verification: "Needs a nearby-context check",
+    })).toBe(true);
   });
 
   it("returns exact typed details and a terminating result without sensitive echo content", async () => {

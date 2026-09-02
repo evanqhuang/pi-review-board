@@ -6,16 +6,23 @@ describe("parseReviewArgs", () => {
     expect(parseReviewArgs("")).toEqual({
       action: "run",
       comment: false,
-      effort: "low",
+      effort: "normal",
       effortProvided: false,
       phase: "auto",
       confirmReset: false,
     });
   });
 
-  it("accepts legacy effort and target forms", () => {
-    expect(parseReviewArgs("high --comment 123")).toMatchObject({ action: "run", target: "123", comment: true, effort: "high", effortProvided: true });
-    expect(parseReviewArgs("--effort=ultra --comment 123")).toMatchObject({ action: "run", target: "123", comment: true, effort: "ultra" });
+  it("accepts normal and deep effort forms without changing target/comment parsing", () => {
+    expect(parseReviewArgs("normal --comment 123")).toMatchObject({ action: "run", target: "123", comment: true, effort: "normal", effortProvided: true });
+    expect(parseReviewArgs("--effort=deep --comment 123")).toMatchObject({ action: "run", target: "123", comment: true, effort: "deep", effortProvided: true });
+  });
+
+  it("rejects retired effort values with a clear error", () => {
+    for (const value of ["low", "medium", "high", "xhigh", "max", "ultra"]) {
+      expect(() => parseReviewArgs(value)).toThrow(`Unknown effort level: ${value}. Expected normal or deep.`);
+      expect(() => parseReviewArgs(`--effort=${value}`)).toThrow(`Unknown effort level: ${value}. Expected normal or deep.`);
+    }
   });
 
   it("keeps ordinary reviews one-shot and parses managed loop arguments", () => {
@@ -36,7 +43,7 @@ describe("parseReviewArgs", () => {
   });
 
   it("accepts an optional reviewer model override", () => {
-    expect(parseReviewArgs("low --model openai-codex/gpt-5.6-luna 123")).toMatchObject({ target: "123", effort: "low", model: "openai-codex/gpt-5.6-luna" });
+    expect(parseReviewArgs("normal --model openai-codex/gpt-5.6-luna 123")).toMatchObject({ target: "123", effort: "normal", model: "openai-codex/gpt-5.6-luna" });
     expect(() => parseReviewArgs("--model")).toThrow("--model requires a value");
     expect(() => parseReviewArgs("--model one --model two")).toThrow("Model may be provided only once");
   });

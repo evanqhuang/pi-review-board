@@ -5,7 +5,6 @@ import { StringDecoder } from "node:string_decoder";
 import { killProcessTree, PROCESS_KILL_GRACE_PERIOD_MS } from "./process.js";
 import {
   REVIEWER_RESULT_TOOLS,
-  type ReviewerResultToolName,
   type ReviewerSafeToolName,
 } from "./reviewer-protocol.js";
 import type {
@@ -20,6 +19,8 @@ import type {
 const MAX_REVIEWER_EVENT_BYTES = 16 * 1024 * 1024;
 const MAX_REVIEWER_STDOUT_BYTES = 64 * 1024 * 1024;
 const MAX_REVIEWER_STDERR_BYTES = 8 * 1024 * 1024;
+/** A protocol correction is safe only while the failed attempt remains short. */
+const MAX_PROTOCOL_RETRY_BYTES = 64 * 1024;
 const MAX_REVIEW_ATTEMPTS = 2;
 const RETRY_SUFFIX = [
   "Protocol correction: submit exactly one final result with the required terminating tool.",
@@ -45,6 +46,10 @@ function usageNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
+function reportedUsageNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 function addUsage(first: AgentUsage, second: AgentUsage): AgentUsage {
   return {
     role: first.role,
@@ -55,27 +60,29 @@ function addUsage(first: AgentUsage, second: AgentUsage): AgentUsage {
   };
 }
 
-function updateUsage(current: AgentUsage, rawUsage: unknown): AgentUsage {
+function updateAssistantUsage(current: AgentUsage, rawUsage: unknown): AgentUsage {
   const values = rawUsage && typeof rawUsage === "object"
     ? rawUsage as { readonly input?: unknown; readonly output?: unknown; readonly totalTokens?: unknown }
     : {};
+  const contextTokens = usageNumber(values.totalTokens);
   return {
     role: current.role,
-    turns: current.turns + 1,
+    // Turn count comes from turn_start events, not from message shape or usage.
+    turns: current.turns,
     inputTokens: current.inputTokens + usageNumber(values.input),
     outputTokens: current.outputTokens + usageNumber(values.output),
-    contextTokens: Math.max(current.contextTokens, usageNumber(values.totalTokens)),
+    // totalTokens is the provider-reported usage for this assistant response.
+    // Never derive context from cumulative input/output across turns.
+    contextTokens: Math.max(current.contextTokens, contextTokens),
   };
 }
 
-function formatTokenCount(value: number): string {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
-  return String(value);
+function updateContextUsage(current: AgentUsage, contextTokens: number): AgentUsage {
+  return { ...current, contextTokens: Math.max(current.contextTokens, contextTokens) };
 }
 
-function formatAgentProgress(usage: AgentUsage): string {
-  return `${usage.role}: turn ${usage.turns} · tokens in ${formatTokenCount(usage.inputTokens)} · out ${formatTokenCount(usage.outputTokens)} · context ${formatTokenCount(usage.contextTokens)}`;
+function incrementTurn(current: AgentUsage): AgentUsage {
+  return { ...current, turns: current.turns + 1 };
 }
 
 function extensionCandidates(): string[] {
@@ -138,6 +145,12 @@ function messageForFailure(kind: ReviewerFailureKind, role: string): string {
       return `${role} reviewer was canceled`;
     case "output-limit":
       return `${role} reviewer output exceeded the review limit`;
+    case "turn-limit":
+      return `${role} reviewer exceeded its turn limit`;
+    case "context-limit":
+      return `${role} reviewer exceeded its context budget`;
+    case "compaction":
+      return `${role} reviewer triggered automatic compaction`;
     case "spawn":
       return `${role} reviewer process could not start`;
     case "transport":
@@ -151,13 +164,16 @@ export class ReviewerRunError extends Error {
   public readonly role: string;
   public readonly kind: ReviewerFailureKind;
   public readonly usage: AgentUsage;
+  /** Only short, typed-result protocol misses may be recovered once. */
+  public readonly retryableProtocol: boolean;
 
-  public constructor(role: string, kind: ReviewerFailureKind, usage: AgentUsage) {
+  public constructor(role: string, kind: ReviewerFailureKind, usage: AgentUsage, retryableProtocol = false) {
     super(messageForFailure(kind, role));
     this.name = "ReviewerRunError";
     this.role = role;
     this.kind = kind;
     this.usage = usage;
+    this.retryableProtocol = retryableProtocol;
   }
 }
 
@@ -210,6 +226,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           : new ReviewerRunError(invocation.role, "transport", emptyUsage(invocation.role));
         aggregateUsage = addUsage(aggregateUsage, attemptError.usage);
         const canRetry = attempt < MAX_REVIEW_ATTEMPTS
+          && attemptError.retryableProtocol
           && (attemptError.kind === "missing-result" || attemptError.kind === "malformed-result")
           && !signal?.aborted;
         if (canRetry) {
@@ -255,6 +272,8 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
       let outputLimitExceeded = false;
       let aborted = false;
       let terminationRequested = false;
+      let terminalFailureKind: ReviewerFailureKind | undefined;
+      let currentContextUsage = 0;
       let usage = emptyUsage(invocation.role);
       let expectedResultCount = 0;
       let expectedDetails: unknown;
@@ -288,11 +307,18 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           killProcessTree(child, "SIGKILL");
         }, PROCESS_KILL_GRACE_PERIOD_MS);
       };
+      const requestFailure = (kind: ReviewerFailureKind): void => {
+        // The first bounded failure is authoritative. In particular, do not let
+        // a later nonzero close code turn a useful limit diagnosis into process.
+        if (terminalFailureKind || aborted) return;
+        terminalFailureKind = kind;
+        terminateProcess();
+      };
       const emitTool = (tool: unknown, status: "started" | "updated" | "completed"): void => {
         onProgress?.({ type: "reviewer-tool", role: invocation.role, attempt, tool: safeToolName(tool), status });
       };
       const processLine = (line: string): void => {
-        if (!line.trim()) return;
+        if (terminalFailureKind || !line.trim()) return;
         let event: unknown;
         try {
           event = JSON.parse(line) as unknown;
@@ -301,6 +327,21 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         }
         if (!event || typeof event !== "object") return;
         const record = event as Record<string, unknown>;
+        if (record.type === "compaction_start" && (record.reason === "threshold" || record.reason === "overflow")) {
+          requestFailure("compaction");
+          return;
+        }
+        // Keep this fallback so a complete event captured immediately before
+        // termination is still authoritative if compaction_start was omitted.
+        if (record.type === "compaction_end" && (record.reason === "threshold" || record.reason === "overflow")) {
+          requestFailure("compaction");
+          return;
+        }
+        if (record.type === "turn_start") {
+          usage = incrementTurn(usage);
+          if (usage.turns > invocation.maxTurns) requestFailure("turn-limit");
+          return;
+        }
         if (record.type === "tool_execution_start") {
           emitTool(record.toolName, "started");
           return;
@@ -328,10 +369,31 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           }
           return;
         }
+        if (record.type === "message_update") {
+          // JSON mode puts the latest cumulative provider usage directly on
+          // message_update. It is a live signal only: never add it to the
+          // authoritative message_end input/output accounting.
+          const rawUsage = record.usage && typeof record.usage === "object"
+            ? record.usage as { readonly totalTokens?: unknown }
+            : {};
+          const reportedContextUsage = reportedUsageNumber(rawUsage.totalTokens);
+          if (reportedContextUsage === undefined) return;
+          currentContextUsage = Math.max(currentContextUsage, reportedContextUsage);
+          usage = updateContextUsage(usage, reportedContextUsage);
+          onProgress?.({ type: "reviewer-turn", role: invocation.role, attempt, usage });
+          if (currentContextUsage > invocation.contextBudget) requestFailure("context-limit");
+          return;
+        }
         const message = isAssistantMessage(record);
         if (!message) return;
-        usage = updateUsage(usage, message.usage);
+        usage = updateAssistantUsage(usage, message.usage);
+        const rawUsage = message.usage && typeof message.usage === "object"
+          ? message.usage as { readonly totalTokens?: unknown }
+          : {};
+        const reportedContextUsage = reportedUsageNumber(rawUsage.totalTokens);
+        if (reportedContextUsage !== undefined) currentContextUsage = Math.max(currentContextUsage, reportedContextUsage);
         onProgress?.({ type: "reviewer-turn", role: invocation.role, attempt, usage });
+        if (currentContextUsage > invocation.contextBudget) requestFailure("context-limit");
       };
       const consumeStdout = (text: string): void => {
         if (outputLimitExceeded) return;
@@ -341,14 +403,14 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         for (const line of lines) {
           if (Buffer.byteLength(line, "utf8") > MAX_REVIEWER_EVENT_BYTES) {
             outputLimitExceeded = true;
-            terminateProcess();
+            requestFailure("output-limit");
             return;
           }
           processLine(line);
         }
         if (Buffer.byteLength(buffer, "utf8") > MAX_REVIEWER_EVENT_BYTES) {
           outputLimitExceeded = true;
-          terminateProcess();
+          requestFailure("output-limit");
         }
       };
       const consumeStdoutChunk = (chunk: Buffer | string): void => {
@@ -356,7 +418,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         stdoutBytes += bytes.byteLength;
         if (stdoutBytes > MAX_REVIEWER_STDOUT_BYTES) {
           outputLimitExceeded = true;
-          terminateProcess();
+          requestFailure("output-limit");
           return;
         }
         consumeStdout(stdoutDecoder.write(bytes));
@@ -365,7 +427,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         stderrBytes += typeof chunk === "string" ? Buffer.byteLength(chunk, "utf8") : chunk.byteLength;
         if (stderrBytes > MAX_REVIEWER_STDERR_BYTES) {
           outputLimitExceeded = true;
-          terminateProcess();
+          requestFailure("output-limit");
         }
       };
 
@@ -374,7 +436,8 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
       child.on("error", () => {
         removeAbortListener();
         clearEscalationTimer();
-        finish(() => reject(new ReviewerRunError(invocation.role, aborted ? "canceled" : "spawn", usage)));
+        const kind = terminalFailureKind ?? (aborted ? "canceled" : "spawn");
+        finish(() => reject(new ReviewerRunError(invocation.role, kind, usage)));
       });
       child.on("close", (code) => {
         const stdoutTail = stdoutDecoder.end();
@@ -386,6 +449,10 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         finish(() => {
           if (aborted) {
             reject(new ReviewerRunError(invocation.role, "canceled", usage));
+            return;
+          }
+          if (terminalFailureKind) {
+            reject(new ReviewerRunError(invocation.role, terminalFailureKind, usage));
             return;
           }
           if (outputLimitExceeded) {
@@ -404,12 +471,13 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
             reject(new ReviewerRunError(invocation.role, "wrong-result", usage));
             return;
           }
+          const retryableProtocol = stdoutBytes + stderrBytes <= MAX_PROTOCOL_RETRY_BYTES;
           if (expectedResultCount !== 1 || expectedCallErrored || !expectedDetailsPresent) {
-            reject(new ReviewerRunError(invocation.role, "missing-result", usage));
+            reject(new ReviewerRunError(invocation.role, "missing-result", usage, retryableProtocol));
             return;
           }
           if (!expectedDetails || typeof expectedDetails !== "object" || Array.isArray(expectedDetails)) {
-            reject(new ReviewerRunError(invocation.role, "malformed-result", usage));
+            reject(new ReviewerRunError(invocation.role, "malformed-result", usage, retryableProtocol));
             return;
           }
           try {
@@ -421,7 +489,9 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
       });
 
       const abort = (): void => {
-        if (aborted) return;
+        // Preserve a bound failure observed before cancellation as the
+        // authoritative diagnosis for this attempt.
+        if (aborted || terminalFailureKind) return;
         aborted = true;
         terminateProcess();
       };

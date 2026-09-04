@@ -199,8 +199,8 @@ describe("runCodeReview deterministic topology", () => {
     expect(result.summary).toBe("");
     expect(result.report).not.toContain("A bounded change summary");
     expect(agents.calls.map((call) => call.role)).toEqual(["diff-only-bug", "validator"]);
-    expect(agents.calls[0]).toMatchObject({ tools: [], model: "openai-codex/gpt-5.6-luna", thinking: "high", maxTurns: 4, contextBudget: 12_000 });
-    expect(agents.calls[1]).toMatchObject({ role: "validator", tools: [], model: "openai-codex/gpt-5.6-sol", thinking: "medium", maxTurns: 6, contextBudget: 8_000 });
+    expect(agents.calls[0]).toMatchObject({ tools: [], model: "openai-codex/gpt-5.6-luna", thinking: "high", maxTurns: 4, contextBudget: 220_000 });
+    expect(agents.calls[1]).toMatchObject({ role: "validator", tools: [], model: "openai-codex/gpt-5.6-sol", thinking: "medium", maxTurns: 6, contextBudget: 220_000 });
   });
 
   it("supplies bounded nearby source to validators without allowing traversal", async () => {
@@ -300,21 +300,21 @@ describe("runCodeReview deterministic topology", () => {
     const normal = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", snapshot: snapshot(normalDiff, ["src/auth.ts"]) }, dependencies(normalAgents));
     expect(normal.status).toBe("complete");
     expect(normalAgents.calls.slice(0, 5).map((call) => call.role)).toEqual(["summary", "guidance-a", "guidance-b", "diff-only-bug", "contextual-bug"]);
-    expect(normalAgents.calls.find((call) => call.role === "summary")).toMatchObject({ tools: [], maxTurns: 3, contextBudget: 8_000 });
+    expect(normalAgents.calls.find((call) => call.role === "summary")).toMatchObject({ tools: [], maxTurns: 3, contextBudget: 200_000 });
 
     const deepAgents = new RecordingAgents();
     const deep = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "deep", snapshot: snapshot(tinyDiff) }, dependencies(deepAgents));
     expect(deep.status).toBe("complete");
     expect(deepAgents.calls.slice(0, 6).map((call) => call.role)).toEqual(["summary", "guidance-a", "guidance-b", "diff-only-bug", "contextual-bug", "integration"]);
-    expect(deepAgents.calls.find((call) => call.role === "integration")).toMatchObject({ tools: ["read", "grep"], thinking: "high", maxTurns: 8, contextBudget: 16_000 });
+    expect(deepAgents.calls.find((call) => call.role === "integration")).toMatchObject({ tools: ["read", "grep"], thinking: "high", maxTurns: 16, contextBudget: 240_000 });
   });
 
   it("allows only the model override while preserving every routed budget", async () => {
     const agents = new RecordingAgents();
     await runCodeReview({ cwd: "/repo", target, comment: false, effort: "deep", snapshot: snapshot(tinyDiff) }, { ...dependencies(agents), reviewerModel: "provider/override" });
     expect(agents.calls.every((call) => call.model === "provider/override")).toBe(true);
-    expect(agents.calls.find((call) => call.role === "contextual-bug")).toMatchObject({ tools: ["read", "grep"], maxTurns: 8, contextBudget: 16_000 });
-    expect(agents.calls.find((call) => call.role === "validator")).toMatchObject({ tools: [], maxTurns: 6, contextBudget: 8_000 });
+    expect(agents.calls.find((call) => call.role === "contextual-bug")).toMatchObject({ tools: ["read", "grep"], maxTurns: 16, contextBudget: 240_000 });
+    expect(agents.calls.find((call) => call.role === "validator")).toMatchObject({ tools: [], maxTurns: 6, contextBudget: 220_000 });
   });
 
   it("validates each candidate independently with fixed concurrency and strict findings", async () => {

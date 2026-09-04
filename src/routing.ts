@@ -101,14 +101,18 @@ function roleConfig(
   });
 }
 
+// Direct GPT-5.6 routes expose a 272k context window. These ceilings leave at
+// least 32k tokens for reasoning/output while allowing every role—including
+// validators carrying the full snapshot—to inspect realistic diffs. Turn and
+// output limits remain the independent runaway guards.
 const ROLE_PLANS: Readonly<Record<ReviewRole, ReviewRoleConfig>> = Object.freeze({
-  summary: roleConfig(NO_REPOSITORY_TOOLS, 3, 8_000, 0, LUNA_MODEL, "medium"),
-  "guidance-a": roleConfig(NO_REPOSITORY_TOOLS, 6, 8_000, 4, LUNA_MODEL, "medium"),
-  "guidance-b": roleConfig(NO_REPOSITORY_TOOLS, 6, 8_000, 4, LUNA_MODEL, "medium"),
-  "diff-only-bug": roleConfig(NO_REPOSITORY_TOOLS, 4, 12_000, 4, LUNA_MODEL, "high"),
-  "contextual-bug": roleConfig(CONTEXT_TOOLS, 8, 16_000, 4, LUNA_MODEL, "high"),
-  integration: roleConfig(CONTEXT_TOOLS, 8, 16_000, 4, LUNA_MODEL, "high"),
-  validator: roleConfig(NO_REPOSITORY_TOOLS, 6, 8_000, 1, SOL_MODEL, "medium"),
+  summary: roleConfig(NO_REPOSITORY_TOOLS, 3, 200_000, 0, LUNA_MODEL, "medium"),
+  "guidance-a": roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 4, LUNA_MODEL, "medium"),
+  "guidance-b": roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 4, LUNA_MODEL, "medium"),
+  "diff-only-bug": roleConfig(NO_REPOSITORY_TOOLS, 4, 220_000, 4, LUNA_MODEL, "high"),
+  "contextual-bug": roleConfig(CONTEXT_TOOLS, 16, 240_000, 4, LUNA_MODEL, "high"),
+  integration: roleConfig(CONTEXT_TOOLS, 16, 240_000, 4, LUNA_MODEL, "high"),
+  validator: roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 1, SOL_MODEL, "medium"),
 });
 
 const ROUTE_PLANS: Readonly<Record<ReviewRoute, Readonly<Record<ReviewRole, ReviewRoleConfig>>>> = Object.freeze({

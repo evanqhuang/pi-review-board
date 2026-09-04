@@ -104,12 +104,35 @@ describe("review agent configuration", () => {
     expect(args[extensionIndex + 1]).toMatch(/reviewer-output\.(ts|js)$/u);
     const toolsIndex = args.indexOf("--tools");
     expect(args[toolsIndex + 1]).toBe("read,grep,find,ls,review_finder_result");
-    expect(args).toContain("Inspect the supplied change and submit the result.");
+    expect(args).not.toContain("Inspect the supplied change and submit the result.");
     expect(args).not.toContain("--max-turns");
   });
 });
 
 describe("PiReviewAgentRunner", () => {
+  it("streams prompts over stdin instead of placing them in argv", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-stdin-"));
+    const executable = await nodeScript(directory, `
+let prompt = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { prompt += chunk; });
+process.stdin.on("end", () => {
+  if (prompt.length !== 1_500_000) process.exit(2);
+  console.log(JSON.stringify(${JSON.stringify(turnStart())}));
+  console.log(JSON.stringify(${JSON.stringify(toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] }))}));
+});
+`);
+    try {
+      const result = await new PiReviewAgentRunner(executable).run(
+        { ...invocation(directory), prompt: "x".repeat(1_500_000) },
+        validateFinder,
+      );
+      expect(result.data).toEqual({ candidates: [] });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("accepts only the expected typed result details, not misleading assistant JSON", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-result-"));
     const executable = await emitScript(directory, [

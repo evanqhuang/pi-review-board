@@ -20,8 +20,8 @@ const caps: Readonly<Record<ReviewRole, number>> = {
   "guidance-a": 6,
   "guidance-b": 6,
   "diff-only-bug": 4,
-  "contextual-bug": 8,
-  integration: 8,
+  "contextual-bug": 16,
+  integration: 16,
   validator: 6,
 };
 
@@ -33,6 +33,16 @@ const candidateCaps: Readonly<Record<ReviewRole, number>> = {
   "contextual-bug": 4,
   integration: 4,
   validator: 1,
+};
+
+const contextBudgets: Readonly<Record<ReviewRole, number>> = {
+  summary: 200_000,
+  "guidance-a": 220_000,
+  "guidance-b": 220_000,
+  "diff-only-bug": 220_000,
+  "contextual-bug": 240_000,
+  integration: 240_000,
+  validator: 220_000,
 };
 
 const activeRoles = {
@@ -56,7 +66,7 @@ describe("review effort contract", () => {
 
   it("defines exact primary topology, tool restrictions, and role caps", () => {
     expect(Object.keys(REVIEW_ROLE_PLANS)).toEqual(["tiny", "small", "normal", "deep"]);
-    for (const [route, plan] of Object.entries(REVIEW_ROLE_PLANS)) {
+    for (const route of Object.keys(REVIEW_ROLE_PLANS)) {
       const reviewPlan = getReviewPlan(route as keyof typeof activeRoles, route === "deep" ? "deep" : "normal");
       expect(Object.keys(reviewPlan.roles), route).toEqual(roles);
       expect(reviewPlan.activeRoles, route).toEqual(activeRoles[route as keyof typeof activeRoles]);
@@ -64,6 +74,7 @@ describe("review effort contract", () => {
       for (const role of roles) {
         const rolePlan = reviewPlan.roles[role];
         expect(rolePlan.maxTurns, `${route}/${role}`).toBe(caps[role]);
+        expect(rolePlan.contextBudget, `${route}/${role}`).toBe(contextBudgets[role]);
         expect(rolePlan.candidateCap, `${route}/${role}`).toBe(candidateCaps[role]);
         expect(rolePlan.modelRoute.thinking, `${route}/${role}`).not.toMatch(/^(xhigh|max)$/);
         if ((noRepositoryTools as readonly string[]).includes(role)) {

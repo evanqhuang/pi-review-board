@@ -104,7 +104,7 @@ function permittedTools(invocation: AgentInvocation): string[] {
   return [...new Set([...tools, invocation.resultTool])];
 }
 
-export function buildReviewAgentArgs(invocation: AgentInvocation, prompt = invocation.prompt): string[] {
+export function buildReviewAgentArgs(invocation: AgentInvocation): string[] {
   const args = [
     "--mode",
     "json",
@@ -121,7 +121,6 @@ export function buildReviewAgentArgs(invocation: AgentInvocation, prompt = invoc
   args.push("--thinking", invocation.thinking);
   const tools = permittedTools(invocation);
   if (tools.length > 0) args.push("--tools", tools.join(","));
-  args.push(prompt);
   return args;
 }
 
@@ -254,11 +253,11 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
     return new Promise((resolve, reject) => {
       let child: ChildProcess;
       try {
-        child = spawn(this.executable, buildReviewAgentArgs(invocation, prompt), {
+        child = spawn(this.executable, buildReviewAgentArgs(invocation), {
           cwd: invocation.cwd,
           shell: false,
           detached: process.platform !== "win32",
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: ["pipe", "pipe", "pipe"],
         });
       } catch {
         reject(new ReviewerRunError(invocation.role, "spawn", emptyUsage(invocation.role)));
@@ -431,6 +430,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         }
       };
 
+      child.stdin?.on("error", () => requestFailure("transport"));
       child.stdout?.on("data", (chunk: Buffer | string) => consumeStdoutChunk(chunk));
       child.stderr?.on("data", (chunk: Buffer | string) => consumeStderrChunk(chunk));
       child.on("error", () => {
@@ -497,7 +497,10 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
       };
       abortListener = abort;
       if (signal?.aborted) abort();
-      else signal?.addEventListener("abort", abort, { once: true });
+      else {
+        signal?.addEventListener("abort", abort, { once: true });
+        child.stdin?.end(prompt);
+      }
     });
   }
 }

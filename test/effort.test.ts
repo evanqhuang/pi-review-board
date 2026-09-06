@@ -45,6 +45,16 @@ const contextBudgets: Readonly<Record<ReviewRole, number>> = {
   validator: 220_000,
 };
 
+const thinkingByRole: Readonly<Record<ReviewRole, "high" | "xhigh">> = {
+  summary: "high",
+  "guidance-a": "high",
+  "guidance-b": "high",
+  "diff-only-bug": "high",
+  "contextual-bug": "xhigh",
+  integration: "xhigh",
+  validator: "high",
+};
+
 const activeRoles = {
   tiny: ["diff-only-bug"],
   small: ["diff-only-bug", "guidance-a"],
@@ -76,7 +86,8 @@ describe("review effort contract", () => {
         expect(rolePlan.maxTurns, `${route}/${role}`).toBe(caps[role]);
         expect(rolePlan.contextBudget, `${route}/${role}`).toBe(contextBudgets[role]);
         expect(rolePlan.candidateCap, `${route}/${role}`).toBe(candidateCaps[role]);
-        expect(rolePlan.modelRoute.thinking, `${route}/${role}`).not.toMatch(/^(xhigh|max)$/);
+        expect(rolePlan.modelRoute.thinking, `${route}/${role}`).toBe(thinkingByRole[role]);
+        expect(rolePlan.modelRoute.thinking, `${route}/${role}`).not.toBe("max");
         if ((noRepositoryTools as readonly string[]).includes(role)) {
           expect(rolePlan.tools, `${route}/${role}`).toEqual([]);
         } else if ((repositoryTools as readonly string[]).includes(role)) {

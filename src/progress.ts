@@ -21,7 +21,11 @@ export interface ProgressUI {
 }
 
 interface ReviewerRow {
+  /** Composite key keeps same-role sharded workers distinct. */
+  readonly key: string;
   readonly role: string;
+  readonly unitId?: string | undefined;
+  readonly shardId?: string | undefined;
   readonly resultTool?: string | undefined;
   readonly attempt: number;
   readonly status: "starting" | "working" | "retrying" | "complete" | "failed";
@@ -58,6 +62,18 @@ function safeRole(role: string): string {
 
 function safeTool(tool: string): string {
   return tool.slice(0, MAX_ROLE_LENGTH).replace(/[^a-zA-Z0-9:_-]/gu, "_");
+}
+
+function reviewerKey(event: ReviewerProgressEvent): string {
+  return [event.role, event.unitId ?? "", event.shardId ?? ""].join("\u0000");
+}
+
+function workerIdentity(row: ReviewerRow): string {
+  const identity = [
+    row.unitId === undefined ? undefined : `unit ${safeRole(row.unitId)}`,
+    row.shardId === undefined ? undefined : `shard ${safeRole(row.shardId)}`,
+  ].filter((value): value is string => value !== undefined);
+  return identity.length === 0 ? "" : ` · ${identity.join(" · ")}`;
 }
 
 function isReviewerEvent(event: ReviewProgressEvent): event is ReviewerProgressEvent {
@@ -100,7 +116,7 @@ export class ReviewProgressPresenter {
       lines.push(...rows.map((row) => {
         const tool = row.activeTool ? ` · ${safeTool(row.activeTool)}` : "";
         const failure = row.failure ? ` · ${row.failure}` : "";
-        return `  ${safeRole(row.role)} · ${row.status} · attempt ${row.attempt}${tool} · ${formatUsage(row.usage)}${failure}`;
+        return `  ${safeRole(row.role)}${workerIdentity(row)} · ${row.status} · attempt ${row.attempt}${tool} · ${formatUsage(row.usage)}${failure}`;
       }));
       if (this.reviewers.size > MAX_REVIEWER_ROWS) lines.push(`  +${this.reviewers.size - MAX_REVIEWER_ROWS} more reviewers`);
     }
@@ -119,12 +135,20 @@ export class ReviewProgressPresenter {
   }
 
   private updateReviewer(event: ReviewerProgressEvent): void {
-    const previous = this.reviewers.get(event.role) ?? {
+    const exactKey = reviewerKey(event);
+    const existing = this.findReviewer(event, exactKey);
+    const key = existing?.key ?? exactKey;
+    let previous: ReviewerRow = existing ?? {
+      key,
       role: event.role,
+      ...(event.unitId === undefined ? {} : { unitId: event.unitId }),
+      ...(event.shardId === undefined ? {} : { shardId: event.shardId }),
       attempt: event.attempt,
       status: "starting" as const,
       usage: emptyUsage(event.role),
     };
+    if (previous.unitId === undefined && event.unitId !== undefined) previous = { ...previous, unitId: event.unitId };
+    if (previous.shardId === undefined && event.shardId !== undefined) previous = { ...previous, shardId: event.shardId };
     switch (event.type) {
       case "reviewer-start":
         this.setReviewer({ ...previous, resultTool: event.resultTool, attempt: event.attempt, status: "starting", failure: undefined });
@@ -152,9 +176,20 @@ export class ReviewProgressPresenter {
     }
   }
 
+  private findReviewer(event: ReviewerProgressEvent, exactKey: string): ReviewerRow | undefined {
+    const exact = this.reviewers.get(exactKey);
+    if (exact !== undefined) return exact;
+    const candidates = [...this.reviewers.values()].filter((row) => row.role === event.role);
+    if (candidates.length !== 1) return undefined;
+    const candidate = candidates[0]!;
+    const unitMatches = event.unitId === undefined || candidate.unitId === undefined || event.unitId === candidate.unitId;
+    const shardMatches = event.shardId === undefined || candidate.shardId === undefined || event.shardId === candidate.shardId;
+    return unitMatches && shardMatches ? candidate : undefined;
+  }
+
   private setReviewer(row: ReviewerRow): void {
-    if (!this.reviewers.has(row.role) && this.reviewers.size >= MAX_REVIEWER_ROWS) return;
-    this.reviewers.set(row.role, row);
+    if (!this.reviewers.has(row.key) && this.reviewers.size >= MAX_REVIEWER_ROWS) return;
+    this.reviewers.set(row.key, row);
   }
 
   private isOwner(): boolean {

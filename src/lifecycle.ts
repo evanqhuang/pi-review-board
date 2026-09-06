@@ -9,16 +9,28 @@ import type {
   CommandRunner,
   FindingLedgerEntry,
   FindingLedgerStatus,
+  AgentUsage,
   ReviewContract,
+  ReviewCoverage,
+  ReviewCoverageCandidate,
+  ReviewCoverageValidation,
   ReviewDecision,
   ReviewDependencies,
+  ReviewLedgerAttempt,
   ReviewLedgerSummary,
   ReviewOptions,
   ReviewPhase,
   ReviewResult,
   ReviewSnapshot,
+  ReviewStage,
   ReviewTarget,
   VerifiedFinding,
+  WorkLimitPolicy,
+} from "./types.js";
+import {
+  DEFAULT_WORK_LIMIT_POLICY,
+  REVIEW_WORK_POLICY,
+  REVIEW_WORK_POLICY_VERSION,
 } from "./types.js";
 
 const VERSION = 2;
@@ -63,6 +75,8 @@ export interface ManagedReviewRunInput {
   readonly sessionId?: string;
   readonly planPath?: string;
   readonly contract?: ReviewContract;
+  readonly maxReviewWorkUnits?: number;
+  readonly workLimitPolicy?: WorkLimitPolicy;
 }
 
 export interface RecordReviewInput {
@@ -73,6 +87,9 @@ export interface RecordReviewInput {
 }
 
 export interface ReviewStatus extends ReviewLedgerSummary {
+  /** Status always materializes legacy missing coverage as unknown. */
+  readonly coverage: ReviewCoverage;
+  readonly coverageValidation: ReviewCoverageValidation;
   readonly currentHead?: string;
   readonly stale: boolean;
   readonly nextAction: string;
@@ -103,6 +120,11 @@ interface Ledger {
   incompleteAttemptsThisPhase: number;
   awaitingAdjudication: boolean;
   findings: MutableFinding[];
+  /** Optional additive coverage state; absent means legacy coverage is unknown. */
+  coverage?: ReviewCoverage;
+  coverageValidation?: ReviewCoverageValidation;
+  workLimitPolicy?: WorkLimitPolicy;
+  lastAttempt?: ReviewLedgerAttempt;
   createdAt: string;
   updatedAt: string;
 }
@@ -117,6 +139,218 @@ function text(value: unknown, max = 500): string {
 
 function normalize(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/gu, " ").trim();
+}
+
+const MAX_PERSISTED_COVERAGE_ITEMS = 200;
+const MAX_PERSISTED_COVERAGE_RANGES = 200;
+const MAX_PERSISTED_COVERAGE_CANDIDATES = 20;
+const MAX_PERSISTED_FAILURES = 20;
+const MAX_PERSISTED_USAGE = 32;
+const MAX_PERSISTED_FINDINGS = 5;
+
+const FINDING_CATEGORIES = new Set(["correctness", "guidance", "history", "integration", "contract"]);
+const FINDING_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
+const COVERAGE_STATES = new Set(["complete", "incomplete", "unknown"]);
+
+function cleanIds(items: readonly string[] | undefined, limit = MAX_PERSISTED_COVERAGE_ITEMS): string[] {
+  return (items ?? []).slice(0, limit).map((item) => text(item, 300)).filter(Boolean);
+}
+
+function unknownCoverage(snapshotHash: string, reason: string): ReviewCoverage {
+  const empty = Object.freeze([]) as readonly string[];
+  const ranges = Object.freeze([]) as readonly ReviewCoverage["uncoveredRanges"][number][];
+  const candidates = Object.freeze([]) as readonly ReviewCoverageCandidate[];
+  return {
+    snapshotHash: text(snapshotHash, 300),
+    state: "unknown",
+    plannedUnitIds: empty,
+    coveredUnitIds: empty,
+    uncoveredUnitIds: empty,
+    plannedUnits: empty,
+    coveredUnits: empty,
+    uncoveredUnits: empty,
+    uncoveredRanges: ranges,
+    uncoveredRangeEvidence: ranges,
+    uncoveredCandidates: candidates,
+    unvalidatedCandidates: candidates,
+    reason: text(reason),
+  };
+}
+
+function cleanCoverageCandidate(candidate: ReviewCoverageCandidate): ReviewCoverageCandidate {
+  return {
+    id: text(candidate.id, 300),
+    ...(candidate.unitId ? { unitId: text(candidate.unitId, 300) } : {}),
+    ...(candidate.file ? { file: text(candidate.file, 500) } : {}),
+    ...(Number.isSafeInteger(candidate.line) ? { line: candidate.line } : {}),
+    reason: text(candidate.reason),
+  };
+}
+
+function cleanCoverage(coverage: ReviewCoverage | undefined, fallbackSnapshotHash: string, fallbackReason: string): ReviewCoverage {
+  if (!coverage) return unknownCoverage(fallbackSnapshotHash, fallbackReason);
+  const planned = cleanIds(coverage.plannedUnitIds);
+  const covered = cleanIds(coverage.coveredUnitIds);
+  const uncovered = cleanIds(coverage.uncoveredUnitIds);
+  const evidenceTruncated = coverage.plannedUnitIds.length > MAX_PERSISTED_COVERAGE_ITEMS
+    || coverage.coveredUnitIds.length > MAX_PERSISTED_COVERAGE_ITEMS
+    || coverage.uncoveredUnitIds.length > MAX_PERSISTED_COVERAGE_ITEMS
+    || coverage.uncoveredCandidates.length > MAX_PERSISTED_COVERAGE_CANDIDATES
+    || (coverage.unvalidatedCandidates?.length ?? 0) > MAX_PERSISTED_COVERAGE_CANDIDATES;
+  const attempted = coverage.attemptedUnitIds === undefined ? undefined : cleanIds(coverage.attemptedUnitIds);
+  const plannedShards = coverage.plannedShardIds === undefined && coverage.plannedShards === undefined ? undefined : cleanIds(coverage.plannedShardIds ?? coverage.plannedShards);
+  const coveredShards = coverage.coveredShardIds === undefined && coverage.coveredShards === undefined ? undefined : cleanIds(coverage.coveredShardIds ?? coverage.coveredShards);
+  const uncoveredShards = coverage.uncoveredShardIds === undefined && coverage.uncoveredShards === undefined ? undefined : cleanIds(coverage.uncoveredShardIds ?? coverage.uncoveredShards);
+  const ranges = coverage.uncoveredRanges.slice(0, MAX_PERSISTED_COVERAGE_RANGES).map((range) => ({
+    ...(range.unitId ? { unitId: text(range.unitId, 300) } : {}),
+    ...(range.shardId ? { shardId: text(range.shardId, 300) } : {}),
+    ...(range.role ? { role: text(range.role, 100) } : {}),
+    ...(range.fileIdentity ? { fileIdentity: text(range.fileIdentity, 500) } : {}),
+    ...(range.oldRange ? { oldRange: range.oldRange } : {}),
+    ...(range.newRange ? { newRange: range.newRange } : {}),
+    reason: text(range.reason),
+  }));
+  const candidates = coverage.uncoveredCandidates.slice(0, MAX_PERSISTED_COVERAGE_CANDIDATES).map(cleanCoverageCandidate);
+  const unvalidated = (coverage.unvalidatedCandidates ?? candidates).slice(0, MAX_PERSISTED_COVERAGE_CANDIDATES).map(cleanCoverageCandidate);
+  const attempts = coverage.attempts
+    ? Object.fromEntries(Object.entries(coverage.attempts).slice(0, MAX_PERSISTED_COVERAGE_ITEMS).map(([id, count]) => [text(id, 300), Number.isSafeInteger(count) && count >= 0 ? count : 0]))
+    : undefined;
+  const budgetValues = [
+    coverage.budget?.maxWeight ?? coverage.budgetMaxWeight ?? coverage.maxWeight,
+    coverage.budget?.reservedWeight ?? coverage.budgetReservedWeight ?? coverage.reservedWeight,
+    coverage.budget?.spentWeight ?? coverage.budgetSpentWeight ?? coverage.spentWeight,
+  ];
+  const budget = budgetValues.every((item) => Number.isFinite(item) && (item as number) >= 0)
+    ? {
+        maxWeight: budgetValues[0] as number,
+        reservedWeight: budgetValues[1] as number,
+        spentWeight: budgetValues[2] as number,
+      }
+    : undefined;
+  const state: ReviewCoverage["state"] = evidenceTruncated
+    ? "incomplete"
+    : COVERAGE_STATES.has(coverage.state) ? coverage.state : "unknown";
+  return {
+    snapshotHash: text(coverage.snapshotHash, 300),
+    state,
+    ...(coverage.policyVersion === undefined ? {} : { policyVersion: coverage.policyVersion }),
+    ...(coverage.policy === undefined ? {} : { policy: text(coverage.policy, 200) }),
+    ...(coverage.workLimitPolicy === undefined ? {} : { workLimitPolicy: coverage.workLimitPolicy }),
+    ...(coverage.mode === undefined ? {} : { mode: coverage.mode }),
+    ...(coverage.sharded === undefined ? {} : { sharded: coverage.sharded }),
+    plannedUnitIds: planned,
+    coveredUnitIds: covered,
+    uncoveredUnitIds: uncovered,
+    plannedUnits: planned,
+    coveredUnits: covered,
+    uncoveredUnits: uncovered,
+    ...(attempted === undefined ? {} : { attemptedUnitIds: attempted }),
+    ...(attempts === undefined ? {} : { attempts }),
+    ...(coverage.reason || fallbackReason || evidenceTruncated ? { reason: text(coverage.reason || fallbackReason || "coverage evidence exceeded the persistence bound") } : {}),
+    uncoveredRanges: ranges,
+    uncoveredRangeEvidence: ranges,
+    uncoveredCandidates: candidates,
+    unvalidatedCandidates: unvalidated,
+    ...(plannedShards === undefined ? {} : { plannedShardIds: plannedShards, plannedShards, plannedShardCount: plannedShards.length }),
+    ...(coveredShards === undefined ? {} : { coveredShardIds: coveredShards, coveredShards, coveredShardCount: coveredShards.length }),
+    ...(uncoveredShards === undefined ? {} : { uncoveredShardIds: uncoveredShards, uncoveredShards, uncoveredShardCount: uncoveredShards.length }),
+    ...(budget === undefined ? {} : {
+      budget,
+      budgetMaxWeight: budget.maxWeight,
+      budgetReservedWeight: budget.reservedWeight,
+      budgetSpentWeight: budget.spentWeight,
+      maxWeight: budget.maxWeight,
+      reservedWeight: budget.reservedWeight,
+      spentWeight: budget.spentWeight,
+    }),
+  };
+}
+
+function coverageIssues(
+  coverage: ReviewCoverage,
+  expectedSnapshotHash: string | undefined,
+  expectedWorkLimitPolicy: WorkLimitPolicy,
+): string[] {
+  const issues: string[] = [];
+  if (coverage.state !== "complete") issues.push(`coverage is ${coverage.state}`);
+  if (!expectedSnapshotHash) issues.push("no reviewed snapshot is recorded");
+  else if (coverage.snapshotHash !== expectedSnapshotHash) issues.push("coverage snapshot does not match the reviewed snapshot");
+  if (coverage.policyVersion === undefined) issues.push("coverage policy version is missing");
+  else if (coverage.policyVersion !== REVIEW_WORK_POLICY_VERSION) {
+    issues.push(`coverage policy version ${String(coverage.policyVersion)} does not match ${REVIEW_WORK_POLICY_VERSION}`);
+  }
+  if (coverage.policy === undefined) issues.push("coverage policy is missing");
+  else if (coverage.policy !== REVIEW_WORK_POLICY) {
+    issues.push("coverage policy does not match the current review policy");
+  }
+  if (coverage.workLimitPolicy === undefined) issues.push("coverage work-limit policy is missing");
+  else if (coverage.workLimitPolicy !== expectedWorkLimitPolicy) {
+    issues.push(`coverage work-limit policy ${coverage.workLimitPolicy} does not match ${expectedWorkLimitPolicy}`);
+  }
+  if (coverage.plannedUnitIds.length === 0) issues.push("coverage contains no planned work units");
+  if (coverage.uncoveredUnitIds.length > 0 || coverage.uncoveredUnits.length > 0
+    || coverage.plannedUnitIds.some((id) => !coverage.coveredUnitIds.includes(id))) issues.push("coverage has uncovered work units");
+  if (coverage.uncoveredCandidates.length > 0) issues.push("coverage has uncovered candidates");
+  if ((coverage.unvalidatedCandidates?.length ?? 0) > 0) issues.push("coverage has unvalidated candidates");
+  return [...new Set(issues)];
+}
+
+function cleanFinding(finding: VerifiedFinding): VerifiedFinding {
+  const category = FINDING_CATEGORIES.has(finding.category) ? finding.category : "correctness";
+  const severity = FINDING_SEVERITIES.has(finding.severity) ? finding.severity : "medium";
+  return {
+    id: text(finding.id, 300),
+    rootCauseKey: text(finding.rootCauseKey, 500),
+    file: text(finding.file, 500),
+    line: Number.isSafeInteger(finding.line) && finding.line > 0 ? finding.line : 1,
+    summary: text(finding.summary, 1_000),
+    failureScenario: text(finding.failureScenario, 1_000),
+    evidence: text(finding.evidence, 2_000),
+    category,
+    severity,
+    needsContext: finding.needsContext === true,
+    finder: text(finding.finder, 100),
+    confidence: Number.isFinite(finding.confidence) ? Math.max(0, Math.min(100, finding.confidence)) : 0,
+    verification: text(finding.verification, 2_000),
+  };
+}
+
+function cleanUsage(usage: AgentUsage): AgentUsage {
+  const boundedNumber = (value: number): number => Number.isFinite(value) && value >= 0 ? Math.min(Number.MAX_SAFE_INTEGER, value) : 0;
+  return {
+    role: text(usage.role, 100),
+    turns: boundedNumber(usage.turns),
+    inputTokens: boundedNumber(usage.inputTokens),
+    outputTokens: boundedNumber(usage.outputTokens),
+    contextTokens: boundedNumber(usage.contextTokens),
+  };
+}
+
+function cleanFailures(failures: readonly { readonly stage: string; readonly message: string }[]): Array<{ readonly stage: ReviewStage; readonly message: string }> {
+  return failures.slice(0, MAX_PERSISTED_FAILURES).map((failure) => ({
+    stage: failure.stage as ReviewStage,
+    message: text(failure.message),
+  }));
+}
+
+function currentCoverage(ledger: Ledger): ReviewCoverage {
+  return ledger.coverage ?? unknownCoverage(ledger.lastReviewedSnapshotHash ?? "", "coverage was not recorded by this legacy ledger");
+}
+
+function ledgerCoverageIssues(ledger: Ledger): string[] {
+  const coverage = currentCoverage(ledger);
+  const policy = ledger.workLimitPolicy ?? coverage.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY;
+  const issues = coverageIssues(coverage, ledger.lastReviewedSnapshotHash, policy);
+  return [...new Set([...issues, ...(ledger.coverageValidation?.issues ?? [])])];
+}
+
+function coverageAuthorized(ledger: Ledger): boolean {
+  return ledgerCoverageIssues(ledger).length === 0;
+}
+
+function effectiveDecision(ledger: Ledger): ReviewDecision {
+  if ((ledger.decision === "approve" || ledger.decision === "comment") && !coverageAuthorized(ledger)) return "incomplete";
+  return ledger.decision;
 }
 
 function targetIdentity(target: ReviewTarget): string {
@@ -185,12 +419,54 @@ function pathFor(directory: string, sessionId: string): string {
   return join(directory, `${sessionId}.json`);
 }
 
+function isReviewCoverage(value: unknown): value is ReviewCoverage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const coverage = value as Partial<ReviewCoverage>;
+  return typeof coverage.snapshotHash === "string"
+    && typeof coverage.state === "string"
+    && COVERAGE_STATES.has(coverage.state)
+    && Array.isArray(coverage.plannedUnitIds)
+    && Array.isArray(coverage.coveredUnitIds)
+    && Array.isArray(coverage.uncoveredUnitIds)
+    && Array.isArray(coverage.plannedUnits)
+    && Array.isArray(coverage.coveredUnits)
+    && Array.isArray(coverage.uncoveredUnits)
+    && Array.isArray(coverage.uncoveredRanges)
+    && Array.isArray(coverage.uncoveredCandidates)
+    && (coverage.policyVersion === undefined || Number.isSafeInteger(coverage.policyVersion))
+    && (coverage.policy === undefined || typeof coverage.policy === "string")
+    && (coverage.workLimitPolicy === undefined || coverage.workLimitPolicy === "reject" || coverage.workLimitPolicy === "partial");
+}
+
+function isReviewCoverageValidation(value: unknown): value is ReviewCoverageValidation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const validation = value as Partial<ReviewCoverageValidation>;
+  return typeof validation.valid === "boolean"
+    && Array.isArray(validation.issues)
+    && validation.issues.every((issue) => typeof issue === "string");
+}
+
+function isReviewLedgerAttempt(value: unknown): value is ReviewLedgerAttempt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const attempt = value as Partial<ReviewLedgerAttempt>;
+  return attempt.version === 1
+    && typeof attempt.snapshotHash === "string"
+    && isReviewCoverage(attempt.coverage)
+    && Array.isArray(attempt.findings)
+    && Array.isArray(attempt.failures)
+    && Array.isArray(attempt.usage)
+    && (attempt.validationIssues === undefined || (Array.isArray(attempt.validationIssues) && attempt.validationIssues.every((issue) => typeof issue === "string")));
+}
+
 function validateLedger(value: unknown): Ledger {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Review ledger is malformed");
   const ledger = value as Partial<Ledger>;
   if (ledger.version !== VERSION || ledger.policyVersion !== VERSION || typeof ledger.sessionId !== "string"
     || typeof ledger.repositoryRoot !== "string" || !isReviewTarget(ledger.target) || typeof ledger.targetIdentity !== "string"
-    || typeof ledger.baseSha !== "string" || !Array.isArray(ledger.findings)) {
+    || typeof ledger.baseSha !== "string" || !Array.isArray(ledger.findings)
+    || (ledger.coverage !== undefined && !isReviewCoverage(ledger.coverage))
+    || (ledger.coverageValidation !== undefined && !isReviewCoverageValidation(ledger.coverageValidation))
+    || (ledger.lastAttempt !== undefined && !isReviewLedgerAttempt(ledger.lastAttempt))) {
     throw new Error("Review ledger is incompatible or incomplete");
   }
   return ledger as Ledger;
@@ -377,13 +653,19 @@ async function managedSnapshot(input: ManagedReviewRunInput & { readonly target:
 }
 
 function summary(ledger: Ledger): ReviewLedgerSummary {
+  const coverage = currentCoverage(ledger);
+  const issues = ledgerCoverageIssues(ledger);
+  const validation: ReviewCoverageValidation = {
+    valid: issues.length === 0,
+    issues,
+  };
   return {
     sessionId: ledger.sessionId,
     ...(ledger.implementationId ? { implementationId: ledger.implementationId } : {}),
     target: ledger.target,
     targetIdentity: ledger.targetIdentity,
     phase: ledger.phase,
-    decision: ledger.decision,
+    decision: effectiveDecision(ledger),
     baseSha: ledger.baseSha,
     ...(ledger.lastReviewedHead ? { lastReviewedHead: ledger.lastReviewedHead } : {}),
     ...(ledger.lastReviewedSnapshotHash ? { lastReviewedSnapshotHash: ledger.lastReviewedSnapshotHash } : {}),
@@ -392,6 +674,10 @@ function summary(ledger: Ledger): ReviewLedgerSummary {
     incompleteAttemptsThisPhase: ledger.incompleteAttemptsThisPhase,
     awaitingAdjudication: ledger.awaitingAdjudication,
     findings: ledger.findings,
+    coverage,
+    coverageValidation: validation,
+    ...(ledger.workLimitPolicy === undefined ? {} : { workLimitPolicy: ledger.workLimitPolicy }),
+    ...(ledger.lastAttempt ? { lastAttempt: ledger.lastAttempt } : {}),
   };
 }
 
@@ -434,6 +720,8 @@ function newLedger(root: string, target: ReviewTarget, base: string, implementat
     incompleteAttemptsThisPhase: 0,
     awaitingAdjudication: false,
     findings: [],
+    coverage: unknownCoverage("", "no review attempt has completed"),
+    coverageValidation: { valid: false, issues: ["coverage is unknown", "no review attempt has completed"] },
     createdAt: created,
     updatedAt: created,
   };
@@ -481,6 +769,22 @@ function mergeFindings(ledger: Ledger, findings: readonly VerifiedFinding[], hea
   return output;
 }
 
+function coverageReportLines(ledger: Ledger): string[] {
+  const coverage = currentCoverage(ledger);
+  const issues = ledgerCoverageIssues(ledger);
+  const gaps = coverage.uncoveredUnitIds.length || coverage.uncoveredCandidates.length || 0;
+  const budget = coverage.budget;
+  const lines = [
+    `**Coverage:** ${coverage.state} (snapshot ${coverage.snapshotHash ? `\`${coverage.snapshotHash.slice(0, 12)}\`` : "unknown"})`,
+    `**Coverage policy:** ${coverage.policy ?? "unknown"}${coverage.policyVersion === undefined ? "" : ` v${coverage.policyVersion}`}`,
+    `**Coverage budget:** ${budget ? `${budget.spentWeight}/${budget.maxWeight} weighted units spent` : "unknown"}`,
+  ];
+  if (gaps > 0) lines.push(`**Coverage gaps:** ${gaps} bounded gap(s)`);
+  if (coverage.unvalidatedCandidates?.length) lines.push(`**Unvalidated candidates:** ${coverage.unvalidatedCandidates.length}`);
+  if (issues.length) lines.push(`**Coverage evidence:** ${issues.slice(0, 3).join("; ")}`);
+  return lines;
+}
+
 function managedReport(decision: ReviewDecision, ledger: Ledger, phase: string, findings: readonly VerifiedFinding[], note = ""): string {
   const lines = [
     `## Decision: ${decision.toUpperCase().replaceAll("-", " ")}`,
@@ -489,6 +793,7 @@ function managedReport(decision: ReviewDecision, ledger: Ledger, phase: string, 
     `**Phase:** ${phase}`,
     `**Passes:** ${ledger.completedPasses}/${MAX_PASSES}`,
     `**Remediation batches:** ${ledger.remediationBatches}/${MAX_REMEDIATIONS}`,
+    ...coverageReportLines(ledger),
   ];
   if (findings.length) {
     lines.push("", "### Candidate findings requiring parent adjudication", "");
@@ -512,19 +817,92 @@ function managedReport(decision: ReviewDecision, ledger: Ledger, phase: string, 
   return lines.join("\n");
 }
 
+function persistAttempt(
+  ledger: Ledger,
+  expectedSnapshotHash: string,
+  pass: ReviewResult | undefined,
+  message: string,
+  extraIssues: readonly string[] = [],
+  expectedWorkLimitPolicy: WorkLimitPolicy = DEFAULT_WORK_LIMIT_POLICY,
+): string[] {
+  const suppliedCoverage = pass?.coverage === undefined
+    ? undefined
+    : {
+        ...pass.coverage,
+        ...(pass.coverage.policyVersion === undefined ? { policyVersion: REVIEW_WORK_POLICY_VERSION } : {}),
+        ...(pass.coverage.policy === undefined ? { policy: REVIEW_WORK_POLICY } : {}),
+        ...(pass.coverage.workLimitPolicy === undefined ? { workLimitPolicy: expectedWorkLimitPolicy } : {}),
+      };
+  const coverage = cleanCoverage(suppliedCoverage, expectedSnapshotHash, pass ? "review pipeline did not provide coverage" : message);
+  ledger.workLimitPolicy = expectedWorkLimitPolicy;
+  const issues = [
+    ...coverageIssues(coverage, expectedSnapshotHash, expectedWorkLimitPolicy),
+    ...(pass && pass.status !== "complete" ? [`review result status is ${pass.status}`] : []),
+    ...(pass && pass.failures.length > 0 ? ["review result contains failures"] : []),
+    ...extraIssues,
+  ];
+  const failures = cleanFailures(pass?.failures ?? []);
+  const failureMessages = new Set(failures.map((failure) => failure.message));
+  for (const issue of issues) {
+    if (failureMessages.has(issue)) continue;
+    failures.push({ stage: "eligibility", message: text(issue) });
+    failureMessages.add(issue);
+  }
+  if (!pass && failures.length === 0 && message) failures.push({ stage: "eligibility", message: text(message) });
+  const findings = (pass?.findings ?? []).slice(0, MAX_PERSISTED_FINDINGS).map(cleanFinding);
+  const usage = (pass?.usage ?? []).slice(0, MAX_PERSISTED_USAGE).map(cleanUsage);
+  const validationIssues = [...new Set(issues)];
+  const persistedFailures = failures.slice(0, MAX_PERSISTED_FAILURES);
+  const validation: ReviewCoverageValidation = { valid: validationIssues.length === 0, issues: validationIssues };
+  ledger.coverage = coverage;
+  ledger.coverageValidation = validation;
+  ledger.lastAttempt = {
+    version: 1,
+    snapshotHash: text(expectedSnapshotHash, 300),
+    coverage,
+    findings,
+    failures: persistedFailures,
+    usage,
+    ...(validationIssues.length ? { validationIssues } : {}),
+  };
+  return validationIssues;
+}
+
 function resultFromLedger(ledger: Ledger, note: string): ReviewResult {
+  const decision = effectiveDecision(ledger);
+  const attempt = ledger.lastAttempt;
+  const incomplete = decision === "incomplete" || decision === "blocked";
+  const attemptFindings = incomplete ? attempt?.findings ?? [] : [];
+  const attemptFailures = incomplete ? attempt?.failures ?? [] : [];
+  const attemptUsage = incomplete ? attempt?.usage ?? [] : [];
+  const resultSnapshotHash = attempt?.snapshotHash || ledger.lastReviewedSnapshotHash;
   return {
-    effort: "normal", status: ledger.decision === "incomplete" || ledger.decision === "blocked" ? "incomplete" : "complete", summary: note,
-    findings: [], failures: [], commented: false, usage: [], report: managedReport(ledger.decision, ledger, ledger.phase, [], note),
-    decision: ledger.decision, sessionId: ledger.sessionId, ...(ledger.lastReviewedSnapshotHash ? { reviewedSnapshotHash: ledger.lastReviewedSnapshotHash } : {}),
+    effort: "normal", status: incomplete ? "incomplete" : "complete", summary: note,
+    findings: attemptFindings, failures: attemptFailures, commented: false, usage: attemptUsage, report: managedReport(decision, ledger, ledger.phase, attemptFindings, note),
+    coverage: currentCoverage(ledger),
+    decision, sessionId: ledger.sessionId, ...(resultSnapshotHash ? { reviewedSnapshotHash: resultSnapshotHash } : {}),
     ledger: summary(ledger), ...(ledger.phase === "initial" || ledger.phase === "delta" || ledger.phase === "final" ? { phase: ledger.phase } : {}),
   };
 }
 
-async function markIncomplete(path: string, ledger: Ledger, phase: ReviewPhase, message: string): Promise<ReviewResult> {
+async function markIncomplete(
+  path: string,
+  ledger: Ledger,
+  phase: ReviewPhase,
+  message: string,
+  expectedSnapshotHash = "",
+  pass?: ReviewResult,
+  extraIssues: readonly string[] = [],
+  expectedWorkLimitPolicy: WorkLimitPolicy = DEFAULT_WORK_LIMIT_POLICY,
+): Promise<ReviewResult> {
+  persistAttempt(ledger, expectedSnapshotHash, pass, message, extraIssues, expectedWorkLimitPolicy);
   ledger.incompleteAttemptsThisPhase += 1;
   ledger.decision = ledger.incompleteAttemptsThisPhase >= MAX_INCOMPLETE ? "blocked" : "incomplete";
+  // An incomplete attempt is not an adjudicable pass. Keep the historical
+  // head/pass counters intact but identify the phase that was attempted.
   if (ledger.decision === "blocked") ledger.phase = "blocked";
+  else ledger.phase = phase;
+  ledger.awaitingAdjudication = false;
   await writeLedger(path, ledger);
   return resultFromLedger(ledger, `${phase} review incomplete: ${message}`);
 }
@@ -622,13 +1000,13 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
       await writeLedger(path, current);
       return resultFromLedger(current, "The review base changed after the session started; explicit reset is required.");
     }
-    if (input.requestedPhase === "auto" && (current.decision === "approve" || current.decision === "comment")) {
+    if (input.requestedPhase === "auto" && (current.decision === "approve" || current.decision === "comment") && coverageAuthorized(current)) {
       try {
         if (await approvedHeadStillCurrent(target, current, input.cwd, dependencies, signal)) {
           return resultFromLedger(current, "The current committed head is already review-complete.");
         }
       } catch (error) {
-        return markIncomplete(path, current, current.completedPasses === 0 ? "initial" : current.completedPasses === 1 ? "delta" : "final", error instanceof Error ? error.message : String(error));
+        return markIncomplete(path, current, current.completedPasses === 0 ? "initial" : current.completedPasses === 1 ? "delta" : "final", error instanceof Error ? error.message : String(error), "", undefined, [], input.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY);
       }
     }
     const phase = selectPhase(current, input.requestedPhase);
@@ -643,10 +1021,10 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
     try {
       snapshot = await managedSnapshot({ ...input, target }, phase, current.lastReviewedHead, dependencies, signal);
     } catch (error) {
-      return markIncomplete(path, current, phase, error instanceof Error ? error.message : String(error));
+      return markIncomplete(path, current, phase, error instanceof Error ? error.message : String(error), "", undefined, [], input.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY);
     }
     const beforeError = await revalidateManagedSnapshot(target, snapshot, current, dependencies, signal);
-    if (beforeError) return markIncomplete(path, current, phase, beforeError);
+    if (beforeError) return markIncomplete(path, current, phase, beforeError, snapshot.snapshotHash, undefined, [beforeError], input.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY);
     const options: ReviewOptions = {
       cwd: snapshot.cwd,
       target,
@@ -656,12 +1034,32 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
       contract: current.contract,
       snapshot,
       openFindings: current.findings.filter((finding) => finding.status === "open").slice(0, 3),
+      ...(input.maxReviewWorkUnits === undefined ? {} : { maxReviewWorkUnits: input.maxReviewWorkUnits }),
+      ...(input.workLimitPolicy === undefined ? {} : { workLimitPolicy: input.workLimitPolicy }),
     };
-    const pass = await runCodeReview(options, dependencies, signal);
+    let pass: ReviewResult;
+    try {
+      pass = await runCodeReview(options, dependencies, signal);
+    } catch (error) {
+      return markIncomplete(path, current, phase, error instanceof Error ? error.message : String(error), snapshot.snapshotHash, undefined, [], input.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY);
+    }
     const afterError = await revalidateManagedSnapshot(target, snapshot, current, dependencies, signal);
-    if (afterError) return markIncomplete(path, current, phase, afterError);
-    if (pass.status !== "complete") {
-      return markIncomplete(path, current, phase, pass.failures.map((failure) => `${failure.stage}: ${failure.message}`).join("; ") || pass.summary);
+    if (afterError) {
+      return markIncomplete(path, current, phase, afterError, snapshot.snapshotHash, pass, [afterError], input.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY);
+    }
+    const passIssues = persistAttempt(
+      current,
+      snapshot.snapshotHash,
+      pass,
+      pass.summary,
+      [],
+      input.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY,
+    );
+    if (pass.status !== "complete" || passIssues.length > 0) {
+      const message = passIssues.length > 0
+        ? passIssues.join("; ")
+        : pass.failures.map((failure) => `${failure.stage}: ${failure.message}`).join("; ") || pass.summary;
+      return markIncomplete(path, current, phase, message, snapshot.snapshotHash, pass, passIssues, input.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY);
     }
     if (phase !== "initial") current.remediationBatches += 1;
 
@@ -673,6 +1071,7 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
     current.lastReviewedSnapshotHash = snapshot.snapshotHash;
     current.initialReviewedHead ??= snapshot.headSha!;
     const mapped = mergeFindings(current, pass.findings, snapshot.headSha!, phase);
+    if (current.lastAttempt) current.lastAttempt = { ...current.lastAttempt, findings: mapped.slice(0, MAX_PERSISTED_FINDINGS).map(cleanFinding) };
     current.awaitingAdjudication = mapped.length > 0 || current.findings.some((finding) => finding.status === "open");
     if (!current.awaitingAdjudication) {
       current.phase = "approved";
@@ -682,6 +1081,7 @@ export async function runManagedReview(input: ManagedReviewRunInput, dependencie
     return {
       ...pass,
       findings: mapped,
+      coverage: currentCoverage(current),
       report: managedReport(current.decision, current, phase, mapped),
       phase,
       decision: current.decision,
@@ -710,6 +1110,10 @@ export async function recordReviewDispositions(input: RecordReviewInput, depende
     if (!ledger) throw new Error(`Review session not found: ${input.sessionId}`);
     const status = await getReviewStatus(input.cwd, dependencies, { sessionId: input.sessionId, target: ledger.target });
     if (!status || status.stale) throw new Error("The target or approved plan changed after review; stale dispositions were not recorded");
+    const authorizationIssues = ledgerCoverageIssues(ledger);
+    if (authorizationIssues.length > 0) {
+      throw new Error(`Cannot record review dispositions: coverage cannot authorize approval (${authorizationIssues.slice(0, 4).join("; ")}). Retry the managed review with the current policy and snapshot.`);
+    }
     if (!ledger.awaitingAdjudication || ledger.lastReviewedSnapshotHash !== input.reviewedSnapshotHash) throw new Error("Adjudication is stale or this session is not awaiting it");
     const seen = new Set<string>();
     for (const disposition of input.dispositions) {
@@ -759,6 +1163,7 @@ async function locate(cwd: string, commands: CommandRunner, options: { sessionId
 function nextAction(ledger: Ledger, stale: boolean, planChanged = false): string {
   if (ledger.decision === "blocked") return "Stop for architecture/product attention or explicitly reset the session.";
   if (planChanged) return "The approved plan changed after review; reapprove it and explicitly reset before another managed review.";
+  if (!coverageAuthorized(ledger)) return "Coverage is not approval-authorized; retry this managed review with the current snapshot and policy.";
   if (ledger.awaitingAdjudication) return "Inspect candidates and record parent dispositions before editing.";
   if (ledger.decision === "request-changes") return "Apply one coherent remediation commit, then run phase=auto.";
   if (ledger.decision === "incomplete") return "Fix the target/reviewer problem, then retry the same phase.";
@@ -789,7 +1194,15 @@ export async function getReviewStatus(cwd: string, dependencies: Pick<ReviewDepe
   const planChanged = Boolean(planPath && currentPlan?.planHash !== found.ledger.planHash);
   const stale = planChanged || dirty || targetMismatch || !currentHead
     || Boolean(found.ledger.lastReviewedHead && currentHead !== found.ledger.lastReviewedHead);
-  return { ...summary(found.ledger), currentHead, stale, nextAction: nextAction(found.ledger, stale, planChanged) };
+  const ledgerSummary = summary(found.ledger);
+  return {
+    ...ledgerSummary,
+    coverage: ledgerSummary.coverage ?? currentCoverage(found.ledger),
+    coverageValidation: ledgerSummary.coverageValidation ?? { valid: false, issues: ledgerCoverageIssues(found.ledger) },
+    currentHead,
+    stale,
+    nextAction: nextAction(found.ledger, stale, planChanged),
+  };
 }
 
 export async function resetReviewSession(cwd: string, dependencies: Pick<ReviewDependencies, "commands">, options: { sessionId?: string; implementationId?: string; planPath?: string; confirm: boolean }): Promise<string> {
@@ -803,11 +1216,18 @@ export async function resetReviewSession(cwd: string, dependencies: Pick<ReviewD
 export function formatStatusReport(status: ReviewStatus | undefined): string {
   if (!status) return "### Code review status\n\nNo managed review session exists for this target or approved plan.";
   const open = status.findings.filter((finding) => finding.status === "open").length;
+  const coverage = status.coverage;
+  const budget = coverage.budget;
   return [
     "### Code review status", "", `**Session:** \`${status.sessionId}\``,
     `**Decision:** ${status.decision.toUpperCase().replaceAll("-", " ")}`,
     `**Phase:** ${status.phase}`, `**Passes:** ${status.completedPasses}/${MAX_PASSES}`,
     `**Remediation batches:** ${status.remediationBatches}/${MAX_REMEDIATIONS}`,
+    `**Coverage:** ${coverage.state}`, `**Coverage snapshot:** ${coverage.snapshotHash ? `\`${coverage.snapshotHash.slice(0, 12)}\`` : "unknown"}`,
+    `**Coverage policy:** ${coverage.policy ?? "unknown"}${coverage.policyVersion === undefined ? "" : ` v${coverage.policyVersion}`}`,
+    `**Coverage gaps:** ${coverage.uncoveredUnitIds.length + coverage.uncoveredCandidates.length}`,
+    `**Coverage budget:** ${budget ? `${budget.spentWeight}/${budget.maxWeight} weighted units spent` : "unknown"}`,
+    ...(status.coverageValidation.issues.length ? [`**Coverage evidence:** ${status.coverageValidation.issues.slice(0, 3).join("; ")}`] : []),
     `**Open blockers:** ${open}`, `**Current head stale:** ${status.stale ? "yes" : "no"}`, "", status.nextAction,
   ].join("\n");
 }

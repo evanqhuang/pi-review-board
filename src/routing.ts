@@ -1,4 +1,5 @@
 import { DEFAULT_REVIEW_ROUTING_CONFIG, type ReviewConfig } from "./config.js";
+import { DEFAULT_INPUT_BUDGET_BYTES, DEFAULT_RESERVED_TOKENS } from "./input-budget.js";
 import { DEFAULT_REVIEW_EFFORT, defaultReviewEffort, type ReviewEffort, type ReviewThinking } from "./effort.js";
 import type { ReviewRole } from "./types.js";
 
@@ -13,8 +14,12 @@ export interface ReviewRoleConfig {
   readonly tools: readonly string[];
   /** Maximum turns granted to this role. */
   readonly maxTurns: number;
-  /** Maximum context supplied to this role, in tokens. */
+  /** Maximum provider-reported context usage supplied to this role, in tokens. */
   readonly contextBudget: number;
+  /** Maximum UTF-8 prompt bytes accepted by this role. */
+  readonly inputBudgetBytes: number;
+  /** Tokens reserved for output and provider overhead. */
+  readonly reservedTokens: number;
   /** Maximum candidates accepted from this role. */
   readonly candidateCap: number;
   readonly modelRoute: ReviewModelRoute;
@@ -96,23 +101,25 @@ function roleConfig(
     tools,
     maxTurns,
     contextBudget,
+    inputBudgetBytes: DEFAULT_INPUT_BUDGET_BYTES,
+    reservedTokens: DEFAULT_RESERVED_TOKENS,
     candidateCap,
     modelRoute: modelRoute(model, thinking),
   });
 }
 
-// Direct GPT-5.6 routes expose a 272k context window. These ceilings leave at
-// least 32k tokens for reasoning/output while allowing every role—including
-// validators carrying the full snapshot—to inspect realistic diffs. Turn and
-// output limits remain the independent runaway guards.
+// Role ceilings are fixed routing limits, independent of provider metadata.
+// Callers may resolve a model's actual window through resolveInputBudget before
+// invoking a role; no model identity is inferred by this routing table. Turn
+// and output limits remain independent runaway guards.
 const ROLE_PLANS: Readonly<Record<ReviewRole, ReviewRoleConfig>> = Object.freeze({
-  summary: roleConfig(NO_REPOSITORY_TOOLS, 3, 200_000, 0, LUNA_MODEL, "medium"),
-  "guidance-a": roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 4, LUNA_MODEL, "medium"),
-  "guidance-b": roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 4, LUNA_MODEL, "medium"),
+  summary: roleConfig(NO_REPOSITORY_TOOLS, 3, 200_000, 0, LUNA_MODEL, "high"),
+  "guidance-a": roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 4, LUNA_MODEL, "high"),
+  "guidance-b": roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 4, LUNA_MODEL, "high"),
   "diff-only-bug": roleConfig(NO_REPOSITORY_TOOLS, 4, 220_000, 4, LUNA_MODEL, "high"),
-  "contextual-bug": roleConfig(CONTEXT_TOOLS, 16, 240_000, 4, LUNA_MODEL, "high"),
-  integration: roleConfig(CONTEXT_TOOLS, 16, 240_000, 4, LUNA_MODEL, "high"),
-  validator: roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 1, SOL_MODEL, "medium"),
+  "contextual-bug": roleConfig(CONTEXT_TOOLS, 16, 240_000, 4, LUNA_MODEL, "xhigh"),
+  integration: roleConfig(CONTEXT_TOOLS, 16, 240_000, 4, LUNA_MODEL, "xhigh"),
+  validator: roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 1, SOL_MODEL, "high"),
 });
 
 const ROUTE_PLANS: Readonly<Record<ReviewRoute, Readonly<Record<ReviewRole, ReviewRoleConfig>>>> = Object.freeze({

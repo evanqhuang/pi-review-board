@@ -1,5 +1,6 @@
 import type { PullRequestMetadata, ReviewCandidate, ReviewSnapshot } from "./types.js";
-import { formatGuidance, type GuidanceFile } from "./guidance.js";
+import { formatGuidance, guidanceCoversPath, type GuidanceFile } from "./guidance.js";
+import { DEFAULT_INPUT_BUDGET_BYTES, InputLimitError, assertInputBudget } from "./input-budget.js";
 import { REVIEWER_RESULT_TOOLS } from "./reviewer-protocol.js";
 
 export interface EligibilityOutput {
@@ -38,7 +39,6 @@ export interface VerifierOutput {
   readonly verification: string;
   readonly disposition: VerificationDisposition;
 }
-
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected a JSON object");
@@ -147,6 +147,11 @@ export const BOUNDED_WORKER_INSTRUCTIONS = [
   "Use exactly one terminating result tool, once, as the final action; do not emit another response afterward.",
 ].join("\n");
 
+const OMITTED_METADATA = "[omitted optional pull-request metadata to fit input budget]";
+const OMITTED_SUMMARY = "[omitted optional summary to fit input budget]";
+const OMITTED_CONTEXT = "[omitted optional nearby context to fit input budget]";
+const OMITTED_SOURCE = "[omitted optional nearby source to fit input budget]";
+
 function pullRequest(snapshot: ReviewSnapshot): PullRequestMetadata | undefined {
   if (snapshot.pullRequest) return snapshot.pullRequest;
   return snapshot.target.kind === "pull-request" ? snapshot.target.metadata : undefined;
@@ -158,7 +163,9 @@ function changeMetadata(snapshot: ReviewSnapshot): { readonly title: string; rea
 }
 
 function reviewInput(payload: unknown): string {
-  return ["<review-input>", JSON.stringify(payload), "</review-input>"].join("\n");
+  const serialized = JSON.stringify(payload);
+  if (serialized === undefined) throw new Error("Prompt payload must be JSON serializable");
+  return ["<review-input>", serialized, "</review-input>"].join("\n");
 }
 
 function finderResultInstructions(): string {
@@ -170,32 +177,205 @@ function finderResultInstructions(): string {
   ].join("\n");
 }
 
+function summaryResultInstructions(): string {
+  return `Call ${REVIEWER_RESULT_TOOLS.summary} exactly once as the final action with a concise summary string.`;
+}
+
+function validatorResultInstructions(): string {
+  return `Call ${REVIEWER_RESULT_TOOLS.verifier} exactly once as the final action with candidateId, disposition (CONFIRMED, PLAUSIBLE, or REFUTED), confidence from 0 to 100, and verification.`;
+}
+
 function rolePrompt(role: string, focus: string, payload: unknown): string {
+  const resultInstructions = role === "summary"
+    ? summaryResultInstructions()
+    : role.startsWith("validator")
+      ? validatorResultInstructions()
+      : finderResultInstructions();
   return [
     `You are the bounded ${role} reviewer. ${focus}`,
     BOUNDED_WORKER_INSTRUCTIONS,
-    finderResultInstructions(),
+    resultInstructions,
     reviewInput(payload),
   ].join("\n");
 }
 
-export function buildEligibilityPrompt(pullRequest: PullRequestMetadata): string {
+/** Try complete structured payloads; never slice an already serialized prompt. */
+function boundedRolePrompt(
+  role: string,
+  focus: string,
+  payloads: readonly Record<string, unknown>[],
+  inputBudgetBytes: number,
+): string {
+  let lastPrompt = "";
+  for (const payload of payloads) {
+    const prompt = rolePrompt(role, focus, payload);
+    lastPrompt = prompt;
+    try {
+      assertInputBudget(prompt, inputBudgetBytes);
+      return prompt;
+    } catch (error) {
+      if (!(error instanceof InputLimitError)) throw error;
+    }
+  }
+  // Preserve the typed error and useful byte details from the least optional
+  // representation when no structured representation can fit.
+  assertInputBudget(lastPrompt, inputBudgetBytes);
+  return lastPrompt;
+}
+
+function uniqueSorted(values: readonly string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+function metadataVariants(metadata: { readonly title: string; readonly body: string }): Array<{ readonly title: string; readonly body: string }> {
+  return [
+    metadata,
+    { title: metadata.title, body: metadata.body ? OMITTED_METADATA : metadata.body },
+    { title: metadata.title ? OMITTED_METADATA : metadata.title, body: metadata.body },
+    { title: metadata.title ? OMITTED_METADATA : metadata.title, body: metadata.body ? OMITTED_METADATA : metadata.body },
+  ];
+}
+
+function diffVariants(diff: string): string[] {
+  const compacted = compactDiff(diff);
+  return compacted === diff ? [diff] : [diff, compacted];
+}
+
+export interface GuidanceScope {
+  readonly path: string;
+  readonly guidance: readonly GuidanceFile[];
+}
+
+interface GuidancePayload {
+  readonly files: readonly { readonly path: string; readonly content: string }[];
+  readonly pathToFiles: readonly { readonly path: string; readonly files: readonly string[] }[];
+}
+
+/**
+ * Serialize repository guidance once and refer to it from each changed path.
+ * The references retain nested scope; only duplicate file bodies are removed.
+ */
+function guidancePayload(scopes: readonly GuidanceScope[], cwd: string): GuidancePayload {
+  const sortedScopes = [...scopes].sort((left, right) => left.path.localeCompare(right.path));
+  const filesByKey = new Map<string, { readonly path: string; readonly content: string }>();
+  const refsByPath = new Map<string, Set<string>>();
+  for (const scope of sortedScopes) {
+    const refs = refsByPath.get(scope.path) ?? new Set<string>();
+    for (const file of scope.guidance) {
+      const key = file.path;
+      if (!filesByKey.has(key)) {
+        filesByKey.set(key, {
+          path: relativeGuidancePath(file.path, cwd),
+          content: file.content,
+        });
+      }
+      refs.add(key);
+    }
+    refsByPath.set(scope.path, refs);
+  }
+  const files = [...filesByKey.entries()]
+    .sort((left, right) => left[1].path.localeCompare(right[1].path) || left[0].localeCompare(right[0]))
+    .map(([, file]) => file);
+  const outputPathByKey = new Map([...filesByKey.keys()].map((key) => [key, filesByKey.get(key)!.path]));
+  const pathToFiles = [...refsByPath.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([path, refs]) => ({
+      path,
+      files: [...refs].map((key) => outputPathByKey.get(key)!).filter((value): value is string => value !== undefined).sort(),
+    }));
+  return { files, pathToFiles };
+}
+
+function relativeGuidancePath(path: string, cwd: string): string {
+  // Keep the same readable paths used by formatGuidance, while preserving an
+  // absolute path when a caller supplies guidance outside the repository.
+  const root = cwd.endsWith("/") ? cwd : `${cwd}/`;
+  if (path === cwd) return ".";
+  return path.startsWith(root) ? path.slice(root.length) : path;
+}
+
+function scopedGuidance(snapshot: ReviewSnapshot, files: readonly GuidanceFile[]): GuidanceScope[] {
+  return uniqueSorted(snapshot.changedPaths).map((path) => ({
+    path,
+    guidance: files.filter((file) => guidanceCoversPath(
+      snapshot.cwd,
+      file.path.startsWith("/") ? file.path : `${snapshot.cwd}/${file.path}`,
+      path,
+    )),
+  }));
+}
+
+function guidanceForRole(snapshot: ReviewSnapshot, files: readonly GuidanceFile[]): GuidancePayload {
+  return guidancePayload(scopedGuidance(snapshot, files), snapshot.cwd);
+}
+
+function eligibilityPrompt(pullRequest: PullRequestMetadata): string {
+  const serialized = JSON.stringify(pullRequest);
+  if (serialized === undefined) throw new Error("Pull-request metadata must be JSON serializable");
   return [
     "Decide whether this open pull request needs a substantive code review.",
     "Return JSON only: {\"proceed\":true|false,\"reason\":\"...\"}.",
     "Reject automated, trivial, already-reviewed, closed, or draft changes. Do not reject a real change merely because tests are absent.",
-    JSON.stringify(pullRequest),
+    serialized,
   ].join("\n");
 }
 
-export function buildSummaryPrompt(snapshot: ReviewSnapshot, _guidance: readonly GuidanceFile[] = []): string {
-  const { title, body } = changeMetadata(snapshot);
-  return [
+export function buildEligibilityPrompt(
+  pullRequest: PullRequestMetadata,
+  inputBudgetBytes = DEFAULT_INPUT_BUDGET_BYTES,
+): string {
+  const variants: PullRequestMetadata[] = [pullRequest];
+  if (pullRequest.comments.length > 0) variants.push({ ...pullRequest, comments: [{ authorLogin: OMITTED_METADATA, body: OMITTED_METADATA }] });
+  variants.push({
+    ...pullRequest,
+    title: pullRequest.title ? OMITTED_METADATA : pullRequest.title,
+    body: pullRequest.body ? OMITTED_METADATA : pullRequest.body,
+    comments: pullRequest.comments.length > 0 ? [{ authorLogin: OMITTED_METADATA, body: OMITTED_METADATA }] : [],
+  });
+  let lastPrompt = "";
+  for (const variant of variants) {
+    const prompt = eligibilityPrompt(variant);
+    lastPrompt = prompt;
+    try {
+      assertInputBudget(prompt, inputBudgetBytes);
+      return prompt;
+    } catch (error) {
+      if (!(error instanceof InputLimitError)) throw error;
+    }
+  }
+  assertInputBudget(lastPrompt, inputBudgetBytes);
+  return lastPrompt;
+}
+
+export function buildSummaryPrompt(
+  snapshot: ReviewSnapshot,
+  _guidance: readonly GuidanceFile[] = [],
+  inputBudgetBytes = DEFAULT_INPUT_BUDGET_BYTES,
+): string {
+  const metadata = changeMetadata(snapshot);
+  const payloads: Record<string, unknown>[] = [];
+  const makePayload = (diff: string, optional: { readonly title: string; readonly body: string }): Record<string, unknown> => ({
+    title: optional.title,
+    body: optional.body,
+    paths: uniqueSorted(snapshot.changedPaths),
+    diff,
+  });
+  const variants = metadataVariants(metadata);
+  const diffs = diffVariants(snapshot.diff);
+  payloads.push(makePayload(diffs[0]!, variants[0]!));
+  if (diffs[1] !== undefined) payloads.push(makePayload(diffs[1], variants[0]!));
+  for (const variant of variants.slice(1)) {
+    payloads.push(makePayload(diffs[1] ?? diffs[0]!, variant));
+  }
+  if (diffs[1] !== undefined) {
+    for (const variant of variants.slice(1)) payloads.push(makePayload(diffs[0]!, variant));
+  }
+  return boundedRolePrompt(
+    "summary",
     "Summarize only the supplied change for the other bounded reviewers.",
-    BOUNDED_WORKER_INSTRUCTIONS,
-    `Call ${REVIEWER_RESULT_TOOLS.summary} exactly once as the final action with a concise summary string.`,
-    reviewInput({ title, body, paths: snapshot.changedPaths, diff: snapshot.diff }),
-  ].join("\n");
+    payloads,
+    inputBudgetBytes,
+  );
 }
 
 function guidanceIntent(snapshot: ReviewSnapshot, summary: string): string {
@@ -205,64 +385,165 @@ function guidanceIntent(snapshot: ReviewSnapshot, summary: string): string {
   return [title, body].filter((part) => part.trim().length > 0).join("\n\n") || "No summary or pull-request intent supplied.";
 }
 
-export interface GuidanceScope {
-  readonly path: string;
-  readonly guidance: readonly GuidanceFile[];
+function guidanceSummaryVariants(snapshot: ReviewSnapshot, summary: string): string[] {
+  const intent = guidanceIntent(snapshot, summary);
+  return [intent, OMITTED_SUMMARY];
 }
 
 export function buildGuidancePrompt(
   snapshot: ReviewSnapshot,
   guidanceByPath: readonly GuidanceScope[],
   summary = "",
+  inputBudgetBytes = DEFAULT_INPUT_BUDGET_BYTES,
 ): string {
   const changedFiles = [...guidanceByPath]
-    .sort((left, right) => left.path.localeCompare(right.path))
-    .map(({ path, guidance }) => ({ path, guidance: formatGuidance(guidance, snapshot.cwd) }));
-  return rolePrompt(
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const guidance = guidancePayload(changedFiles, snapshot.cwd);
+  const payloads: Record<string, unknown>[] = [];
+  const diffs = diffVariants(snapshot.diff);
+  const summaries = guidanceSummaryVariants(snapshot, summary);
+  const makePayload = (diff: string, intent: string): Record<string, unknown> => ({
+    summary: intent,
+    guidance,
+    changedCode: { paths: uniqueSorted(snapshot.changedPaths), diff },
+  });
+  payloads.push(makePayload(diffs[0]!, summaries[0]!));
+  if (diffs[1] !== undefined) payloads.push(makePayload(diffs[1], summaries[0]!));
+  for (const intent of summaries.slice(1)) payloads.push(makePayload(diffs[1] ?? diffs[0]!, intent));
+  if (diffs[1] !== undefined) {
+    for (const intent of summaries.slice(1)) payloads.push(makePayload(diffs[0]!, intent));
+  }
+  return boundedRolePrompt(
     "guidance",
     "Check only the changed code against the applicable repository guidance. Do not invent guidance or report a rule that does not apply to a changed line.",
-    {
-      summary: guidanceIntent(snapshot, summary),
-      guidance: changedFiles,
-      changedCode: { paths: snapshot.changedPaths, diff: snapshot.diff },
-    },
+    payloads,
+    inputBudgetBytes,
   );
+}
+
+interface DiffRoleArgument {
+  readonly guidance: readonly GuidanceFile[] | undefined;
+  readonly legacyTitle: string | undefined;
+}
+
+function diffRoleArgument(argument: readonly GuidanceFile[] | string): DiffRoleArgument {
+  if (typeof argument === "string") return { guidance: undefined, legacyTitle: argument };
+  return { guidance: argument, legacyTitle: undefined };
+}
+
+function optionalSummary(value: string): { readonly summary?: string } {
+  const trimmed = value.trim();
+  return trimmed ? { summary: trimmed } : {};
 }
 
 export function buildDiffOnlyBugPrompt(
   snapshot: ReviewSnapshot,
-  _guidanceOrTitle: readonly GuidanceFile[] | string = [],
-  _body = "",
+  arg: readonly GuidanceFile[] | string = [],
+  summary = "",
+  inputBudgetBytes = DEFAULT_INPUT_BUDGET_BYTES,
 ): string {
-  const { title, body } = changeMetadata(snapshot);
-  return rolePrompt(
+  const argument = diffRoleArgument(arg);
+  const metadata = argument.legacyTitle === undefined
+    ? changeMetadata(snapshot)
+    : { title: argument.legacyTitle, body: summary };
+  const metadataOptions = metadataVariants(metadata);
+  const summaryValue = argument.legacyTitle === undefined ? optionalSummary(summary) : {};
+  const payloads: Record<string, unknown>[] = [];
+  const diffs = diffVariants(snapshot.diff);
+  const makePayload = (diff: string, optional: { readonly title: string; readonly body: string }, includeSummary: boolean): Record<string, unknown> => ({
+    title: optional.title,
+    body: optional.body,
+    changedPaths: uniqueSorted(snapshot.changedPaths),
+    diff,
+    ...(includeSummary && Object.keys(summaryValue).length > 0 ? summaryValue : {}),
+  });
+  payloads.push(makePayload(diffs[0]!, metadataOptions[0]!, true));
+  if (diffs[1] !== undefined) payloads.push(makePayload(diffs[1], metadataOptions[0]!, true));
+  for (const option of metadataOptions.slice(1)) payloads.push(makePayload(diffs[1] ?? diffs[0]!, option, true));
+  if (summaryValue.summary !== undefined) {
+    for (const option of metadataOptions) payloads.push({ ...makePayload(diffs[1] ?? diffs[0]!, option, false), summary: OMITTED_SUMMARY });
+  }
+  if (diffs[1] !== undefined) {
+    for (const option of metadataOptions.slice(1)) payloads.push(makePayload(diffs[0]!, option, true));
+    if (summaryValue.summary !== undefined) {
+      for (const option of metadataOptions) payloads.push({ ...makePayload(diffs[0]!, option, false), summary: OMITTED_SUMMARY });
+    }
+  }
+  return boundedRolePrompt(
     "diff-only bug",
     "Reason from the diff alone. Do not assume unseen context, callers, repository conventions, or intended behavior; do not request context for a vague concern.",
-    { title, body, diff: snapshot.diff },
+    payloads,
+    inputBudgetBytes,
   );
+}
+
+function finderPayloadGuidance(snapshot: ReviewSnapshot, argument: readonly GuidanceFile[] | string): GuidancePayload | undefined {
+  if (typeof argument === "string" || argument.length === 0) return undefined;
+  return guidanceForRole(snapshot, argument);
+}
+
+function finderPayloads(
+  snapshot: ReviewSnapshot,
+  argument: readonly GuidanceFile[] | string,
+  summary: string,
+  followUpConstraints: string,
+): Record<string, unknown>[] {
+  const guidance = finderPayloadGuidance(snapshot, argument);
+  const diffs = diffVariants(snapshot.diff);
+  const summaryValue = summary.trim();
+  const base = (diff: string, includeSummary: boolean): Record<string, unknown> => ({
+    changedPaths: uniqueSorted(snapshot.changedPaths),
+    diff,
+    followUpConstraints,
+    ...(guidance ? { guidance } : {}),
+    ...(includeSummary && summaryValue ? { summary: summaryValue } : {}),
+  });
+  const payloads: Record<string, unknown>[] = [base(diffs[0]!, true)];
+  if (diffs[1] !== undefined) payloads.push(base(diffs[1], true));
+  if (summaryValue) {
+    payloads.push({ ...base(diffs[1] ?? diffs[0]!, false), summary: OMITTED_SUMMARY });
+  }
+  if (diffs[1] !== undefined && summaryValue) payloads.push({ ...base(diffs[0]!, false), summary: OMITTED_SUMMARY });
+  return payloads;
 }
 
 export function buildContextualBugPrompt(
   snapshot: ReviewSnapshot,
-  _guidance: readonly GuidanceFile[] | string = [],
-  _summary = "",
+  arg: readonly GuidanceFile[] | string = [],
+  summary = "",
+  inputBudgetBytes = DEFAULT_INPUT_BUDGET_BYTES,
 ): string {
-  return rolePrompt(
+  const payloads = finderPayloads(
+    snapshot,
+    arg,
+    summary,
+    "Nearest direct callers, consumers, and definitions only; no unrelated files or broad repository exploration.",
+  );
+  return boundedRolePrompt(
     "contextual bug",
     "Inspect only the nearest direct context needed to establish an introduced defect. Follow up through direct callers or consumers only; stop once the changed-line suspicion is established.",
-    { changedPaths: snapshot.changedPaths, diff: snapshot.diff, followUpConstraints: "Nearest direct callers, consumers, and definitions only; no unrelated files or broad repository exploration." },
+    payloads,
+    inputBudgetBytes,
   );
 }
 
 export function buildIntegrationPrompt(
   snapshot: ReviewSnapshot,
-  _guidance: readonly GuidanceFile[] | string = [],
-  _summary = "",
+  arg: readonly GuidanceFile[] | string = [],
+  summary = "",
+  inputBudgetBytes = DEFAULT_INPUT_BUDGET_BYTES,
 ): string {
-  return rolePrompt(
+  const payloads = finderPayloads(
+    snapshot,
+    arg,
+    summary,
+    "Immediate callers, consumers, adapters, and public boundaries only; do not inspect unrelated subsystems.",
+  );
+  return boundedRolePrompt(
     "integration",
     "Check only direct integration boundaries touched by the change. Follow up to the immediate consumer or contract boundary, and report only a concrete introduced failure.",
-    { changedPaths: snapshot.changedPaths, diff: snapshot.diff, followUpConstraints: "Immediate callers, consumers, adapters, and public boundaries only; do not inspect unrelated subsystems." },
+    payloads,
+    inputBudgetBytes,
   );
 }
 
@@ -282,6 +563,46 @@ interface DiffHunk {
   readonly lines: readonly string[];
 }
 
+/** Compact only unchanged hunk context; all paths, hunk headers and changes remain. */
+function compactDiff(diff: string): string {
+  const lines = diff.split(/\r?\n/u);
+  const output: string[] = [];
+  let inHunk = false;
+  let omittedOld = 0;
+  let omittedNew = 0;
+  const flush = (): void => {
+    if (omittedOld > 0 || omittedNew > 0) {
+      output.push(`[omitted unchanged context: old=${omittedOld} new=${omittedNew}]`);
+      omittedOld = 0;
+      omittedNew = 0;
+    }
+  };
+  for (const line of lines) {
+    const isHunkHeader = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/u.test(line);
+    if (line.startsWith("diff --git ") || isHunkHeader) {
+      flush();
+      output.push(line);
+      inHunk = isHunkHeader;
+      continue;
+    }
+    if (!inHunk) {
+      output.push(line);
+      continue;
+    }
+    if (line.startsWith(" ") || line.length === 0) {
+      omittedOld += 1;
+      omittedNew += 1;
+      continue;
+    }
+    flush();
+    output.push(line);
+    if (line.startsWith("--- ") || line.startsWith("+++ ")) inHunk = false;
+  }
+  flush();
+  const compacted = output.join("\n");
+  return compacted === diff ? diff : compacted;
+}
+
 function candidateHunk(diff: string, candidate: ReviewCandidate): { readonly hunk: string; readonly nearby: string } {
   const hunks: DiffHunk[] = [];
   let oldPath: string | undefined;
@@ -292,7 +613,7 @@ function candidateHunk(diff: string, candidate: ReviewCandidate): { readonly hun
     current = undefined;
   };
 
-  for (const line of diff.split("\n")) {
+  for (const line of diff.split(/\r?\n/u)) {
     if (line.startsWith("diff --git ")) {
       finish();
       oldPath = undefined;
@@ -327,10 +648,7 @@ function candidateHunk(diff: string, candidate: ReviewCandidate): { readonly hun
     const inOldRange = candidate.line >= hunk.oldStart && candidate.line < hunk.oldStart + hunk.oldCount;
     const inNewRange = candidate.line >= hunk.newStart && candidate.line < hunk.newStart + hunk.newCount;
     return inOldRange || inNewRange;
-  })
-    ?? hunks.find((hunk) => hunk.paths.some((path) => promptPath(path) === targetPath))
-    // A focused caller may supply a single hunk without file headers.
-    ?? (hunks.length === 1 ? hunks[0] : undefined);
+  }) ?? (hunks.length === 1 ? hunks[0] : undefined);
 
   if (!selected) return { hunk: "No matching changed hunk was supplied.", nearby: "No nearby context was supplied." };
   let oldLine = selected.oldStart;
@@ -359,30 +677,63 @@ function candidateHunk(diff: string, candidate: ReviewCandidate): { readonly hun
   };
 }
 
+function deduplicateGuidance(files: readonly GuidanceFile[]): GuidanceFile[] {
+  const unique = new Map<string, GuidanceFile>();
+  for (const file of files) if (!unique.has(file.path)) unique.set(file.path, file);
+  return [...unique.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
 export function buildValidatorPrompt(
   candidate: ReviewCandidate,
   snapshot: ReviewSnapshot,
   guidance: readonly GuidanceFile[],
   summary = "",
-  options: { readonly passLabel?: string; readonly source?: string | undefined } = {},
+  options: { readonly passLabel?: string; readonly source?: string | undefined; readonly inputBudgetBytes?: number } = {},
 ): string {
   const selected = candidateHunk(snapshot.diff, candidate);
-  const payload = {
+  const exactVariants = diffVariants(selected.hunk);
+  const relevantGuidance = formatGuidance(deduplicateGuidance(guidance), snapshot.cwd);
+  const context = selected.nearby;
+  const source = options.source?.trim() || selected.nearby;
+  const trimmedSummary = summary.trim();
+  const optionalFields: Array<{ readonly context: string; readonly source: string; readonly summary?: string }> = [];
+  const fullOptional = { context, source, ...(trimmedSummary ? { summary: trimmedSummary } : {}) };
+  optionalFields.push(fullOptional);
+  // Prefer the least omission necessary, but always leave a truthful marker
+  // when optional context is dropped.
+  const combinations = [1, 2, 4, 3, 5, 6, 7];
+  for (const mask of combinations) {
+    const next: { context: string; source: string; summary?: string } = {
+      context: mask & 1 ? OMITTED_CONTEXT : context,
+      source: mask & 2 ? OMITTED_SOURCE : source,
+    };
+    if (trimmedSummary) next.summary = mask & 4 ? OMITTED_SUMMARY : trimmedSummary;
+    optionalFields.push(next);
+  }
+  const makePayload = (
+    exactChangedHunk: string,
+    optional: { readonly context: string; readonly source: string; readonly summary?: string },
+  ): Record<string, unknown> => ({
     candidate,
-    exactChangedHunk: selected.hunk,
-    nearbyContext: selected.nearby,
-    nearbySource: options.source?.trim() || selected.nearby,
-    relevantGuidance: formatGuidance(guidance, snapshot.cwd),
-    ...(summary.trim() ? { summary: summary.trim() } : {}),
-  };
-  return [
-    `You are the single-candidate validator (${options.passLabel ?? "primary"} pass).`,
-    BOUNDED_WORKER_INSTRUCTIONS,
+    exactChangedHunk,
+    nearbyContext: optional.context,
+    nearbySource: optional.source,
+    relevantGuidance,
+    ...(optional.summary !== undefined ? { summary: optional.summary } : {}),
+  });
+  const payloads: Record<string, unknown>[] = [];
+  payloads.push(makePayload(exactVariants[0]!, optionalFields[0]!));
+  if (exactVariants[1] !== undefined) payloads.push(makePayload(exactVariants[1], optionalFields[0]!));
+  for (const optional of optionalFields.slice(1)) payloads.push(makePayload(exactVariants[1] ?? exactVariants[0]!, optional));
+  if (exactVariants[1] !== undefined) {
+    for (const optional of optionalFields.slice(1)) payloads.push(makePayload(exactVariants[0]!, optional));
+  }
+  return boundedRolePrompt(
+    `validator (${options.passLabel ?? "primary"} pass)`,
     "Validate only this candidate. Check the exact changed hunk, nearby diff context, and bounded nearby source supplied below; use relevant guidance and the optional summary only to establish this candidate's stated failure scenario.",
-    "Do not invent, merge, or validate any other candidate. PLAUSIBLE and REFUTED results are never reportable; CONFIRMED requires concrete evidence.",
-    `Call ${REVIEWER_RESULT_TOOLS.verifier} exactly once as the final action with candidateId, disposition (CONFIRMED, PLAUSIBLE, or REFUTED), confidence from 0 to 100, and verification.`,
-    reviewInput(payload),
-  ].join("\n");
+    payloads,
+    options.inputBudgetBytes ?? DEFAULT_INPUT_BUDGET_BYTES,
+  );
 }
 
 /** The protocol name remains verifier while the role is a candidate validator. */

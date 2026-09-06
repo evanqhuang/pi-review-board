@@ -9,6 +9,7 @@ import {
   validateFinder,
   validateVerifier,
 } from "../src/prompts.js";
+import { InputLimitError } from "../src/input-budget.js";
 import type { ReviewCandidate, ReviewSnapshot } from "../src/types.js";
 
 const candidates: readonly ReviewCandidate[] = [
@@ -159,14 +160,22 @@ describe("bounded role prompt and result contracts", () => {
       },
     ]);
     const payload = JSON.parse(guidancePrompt.split("<review-input>\n")[1]!.split("\n</review-input>")[0]!) as {
-      guidance: readonly { path: string; guidance: string }[];
+      guidance: {
+        files: readonly { path: string; content: string }[];
+        pathToFiles: readonly { path: string; files: readonly string[] }[];
+      };
     };
-    expect(payload.guidance).toEqual([
-      { path: "src/cache.ts", guidance: "### AGENTS.md\nroot rule\n\n### src/AGENTS.md\ncache-only rule" },
-      { path: "src/client.ts", guidance: "### AGENTS.md\nroot rule\n\n### src/client/AGENTS.md\nclient-only rule" },
+    expect(payload.guidance.files).toEqual([
+      { path: "AGENTS.md", content: "root rule" },
+      { path: "src/AGENTS.md", content: "cache-only rule" },
+      { path: "src/client/AGENTS.md", content: "client-only rule" },
     ]);
-    expect(payload.guidance[0]?.guidance).not.toContain("client-only rule");
-    expect(payload.guidance[1]?.guidance).not.toContain("cache-only rule");
+    expect(payload.guidance.pathToFiles).toEqual([
+      { path: "src/cache.ts", files: ["AGENTS.md", "src/AGENTS.md"] },
+      { path: "src/client.ts", files: ["AGENTS.md", "src/client/AGENTS.md"] },
+    ]);
+    expect(payload.guidance.pathToFiles[0]?.files).not.toContain("src/client/AGENTS.md");
+    expect(payload.guidance.pathToFiles[1]?.files).not.toContain("src/AGENTS.md");
   });
 
   it("gives the validator one candidate, hunk, nearby context, and optional guidance", () => {
@@ -188,5 +197,88 @@ describe("bounded role prompt and result contracts", () => {
     expect(validatorPrompt).toContain("nearbyContext");
     expect(validatorPrompt).not.toContain(secondCandidate.id);
     expect(validatorPrompt).not.toContain("optional summary supplied by another reviewer");
+  });
+
+  it("bounds UTF-8 prompts by omitting metadata before changed content", () => {
+    const metadataSnapshot: ReviewSnapshot = {
+      ...snapshot,
+      pullRequest: {
+        title: "title-😀".repeat(5000),
+        body: "body-é".repeat(5000),
+        number: 1,
+        state: "OPEN",
+        isDraft: false,
+        authorLogin: "a",
+        url: "",
+        baseSha: "",
+        headSha: "",
+        repository: "acme/repo",
+        changedPaths: snapshot.changedPaths,
+        comments: [],
+        reviewerIdentityAvailable: true,
+      },
+    };
+    const prompt = buildSummaryPrompt({
+      ...metadataSnapshot,
+      diff: [
+        "diff --git a/src/cache.ts b/src/cache.ts",
+        "--- a/src/cache.ts",
+        "+++ b/src/cache.ts",
+        "@@ -11,1 +11,1 @@",
+        "+changed cache branch",
+      ].join("\n"),
+    }, [], 8_000);
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(8_000);
+    expect(prompt).toContain("omitted optional pull-request metadata");
+    expect(prompt).toContain("+changed cache branch");
+  });
+
+  it("compacts unchanged context with hunk locations but never drops changes", () => {
+    const manyHunks = [
+      "diff --git a/src/cache.ts b/src/cache.ts",
+      "--- a/src/cache.ts",
+      "+++ b/src/cache.ts",
+      ...Array.from({ length: 40 }, (_, index) => [
+        `@@ -${index * 100 + 1},80 +${index * 100 + 1},80 @@`,
+        ...Array.from({ length: 70 }, () => " unchanged context"),
+        `+changed-${index}-😀`,
+        " unchanged context",
+      ].join("\n")),
+    ].join("\n");
+    const prompt = buildDiffOnlyBugPrompt({ ...snapshot, diff: manyHunks }, [], "", 8_000);
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(8_000);
+    expect(prompt).toContain("omitted unchanged context: old=");
+    for (let index = 0; index < 40; index += 1) expect(prompt).toContain(`+changed-${index}-😀`);
+  });
+
+  it("fails closed when one changed line cannot fit", () => {
+    const hugeLine = `+${"x".repeat(20_000)}`;
+    expect(() => buildDiffOnlyBugPrompt({ ...snapshot, diff: [
+      "diff --git a/src/cache.ts b/src/cache.ts",
+      "--- a/src/cache.ts",
+      "+++ b/src/cache.ts",
+      "@@ -11,1 +11,1 @@",
+      hugeLine,
+    ].join("\n") }, [], "", 4_000)).toThrow(InputLimitError);
+  });
+
+  it("isolates validator input to the candidate hunk and bounds optional source", () => {
+    const diff = [
+      "diff --git a/src/cache.ts b/src/cache.ts",
+      "--- a/src/cache.ts",
+      "+++ b/src/cache.ts",
+      "@@ -12,1 +12,1 @@",
+      "+first candidate",
+      "@@ -80,1 +80,1 @@",
+      "+other candidate hunk",
+    ].join("\n");
+    const prompt = buildValidatorPrompt(firstCandidate, { ...snapshot, diff }, [], "summary", {
+      source: "source-😀".repeat(10_000),
+      inputBudgetBytes: 8_000,
+    });
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(8_000);
+    expect(prompt).toContain("+first candidate");
+    expect(prompt).not.toContain("+other candidate hunk");
+    expect(prompt).toContain("omitted optional nearby source");
   });
 });

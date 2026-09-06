@@ -2,6 +2,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { DEFAULT_INPUT_BUDGET_BYTES } from "../src/input-budget.js";
 import { REVIEWER_RESULT_TOOLS } from "../src/reviewer-protocol.js";
 import { buildReviewAgentArgs, PiReviewAgentRunner, ReviewerRunError, reviewAgentConfiguration, reviewerOutputLimits } from "../src/runner.js";
 import { validateFinder } from "../src/prompts.js";
@@ -124,10 +125,45 @@ process.stdin.on("end", () => {
 `);
     try {
       const result = await new PiReviewAgentRunner(executable).run(
-        { ...invocation(directory), prompt: "x".repeat(1_500_000) },
+        { ...invocation(directory), prompt: "x".repeat(1_500_000), inputBudgetBytes: 2_000_000 },
         validateFinder,
       );
       expect(result.data).toEqual({ candidates: [] });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized prompt before spawn with zero usage", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-input-limit-"));
+    const marker = join(directory, "spawned");
+    const executable = await nodeScript(directory, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "spawned");`);
+    try {
+      const error = await new PiReviewAgentRunner(executable).run(
+        { ...invocation(directory), prompt: "sensitive prompt ".repeat(DEFAULT_INPUT_BUDGET_BYTES) },
+        validateFinder,
+      ).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(ReviewerRunError);
+      expect((error as ReviewerRunError).kind).toBe("input-limit");
+      expect((error as ReviewerRunError).usage).toEqual({ role: "finder:diff-correctness", turns: 0, inputTokens: 0, outputTokens: 0, contextTokens: 0 });
+      expect((error as Error).message).not.toContain("sensitive prompt");
+      await expect(readFile(marker, "utf8")).rejects.toThrow();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not spawn a retry when the correction suffix cannot fit", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-retry-input-limit-"));
+    const executable = await countScript(directory, [turnStart(), messageEnd(10, 2, 12)], [toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] })]);
+    try {
+      const error = await new PiReviewAgentRunner(executable).run(
+        { ...invocation(directory), prompt: "x".repeat(DEFAULT_INPUT_BUDGET_BYTES - 1) },
+        validateFinder,
+      ).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(ReviewerRunError);
+      expect((error as ReviewerRunError).kind).toBe("input-limit");
+      expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -170,6 +206,22 @@ process.stdin.on("end", () => {
       expect(progress.filter((event) => event.type === "reviewer-start")).toHaveLength(2);
       expect(progress.some((event) => event.type === "reviewer-retry" && event.attempt === 2)).toBe(true);
       expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("2");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("denies a retry before spawning its second process when admission is exhausted", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-retry-admission-"));
+    const executable = await countScript(directory, [turnStart(), messageEnd(10, 1, 11)], [turnStart(), toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] })]);
+    try {
+      const error = await new PiReviewAgentRunner(executable).run(
+        { ...invocation(directory), retryAdmission: () => false },
+        validateFinder,
+      ).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(ReviewerRunError);
+      expect((error as ReviewerRunError).kind).toBe("input-limit");
+      expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -225,6 +277,62 @@ process.stdin.on("end", () => {
       expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
     } finally {
       await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes result-tool errors from malformed result details", async () => {
+    for (const [name, event, expectedKind] of [
+      ["tool-error", toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] }, true), "result-tool-error"],
+      ["missing-details", { type: "tool_execution_end", toolCallId: "tool-call-id", toolName: REVIEWER_RESULT_TOOLS.finder, result: { content: [] }, isError: false }, "malformed-result"],
+    ] as const) {
+      const directory = await mkdtemp(join(tmpdir(), `pi-review-runner-${name}-`));
+      const executable = await countScript(directory, [turnStart(), event], [event]);
+      try {
+        const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
+        expect(error).toBeInstanceOf(ReviewerRunError);
+        expect((error as ReviewerRunError).kind).toBe(expectedKind);
+        expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe(name === "missing-details" ? "2" : "1");
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("classifies a provider context error without leaking its message", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-provider-context-"));
+    const base = messageEnd(10, 2, 12) as { type: string; message: Record<string, unknown> };
+    const executable = await emitScript(directory, [
+      turnStart(),
+      { ...base, message: { ...base.message, stopReason: "error", errorMessage: "secret context_length_exceeded transcript" } },
+    ]);
+    try {
+      const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(ReviewerRunError);
+      expect((error as ReviewerRunError).kind).toBe("context-limit");
+      expect((error as Error).message).not.toContain("secret context_length_exceeded transcript");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry provider, length, or aborted assistant stops", async () => {
+    for (const [name, stopReason, expectedKind] of [
+      ["provider", "error", "provider"],
+      ["length", "length", "length"],
+      ["aborted", "aborted", "canceled"],
+    ] as const) {
+      const directory = await mkdtemp(join(tmpdir(), `pi-review-runner-stop-${name}-`));
+      const assistant = { ...messageEnd(10, 2, 12), message: { ...(messageEnd(10, 2, 12) as { message: object }).message, stopReason } };
+      const executable = await countScript(directory, [turnStart(), assistant], [toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] })]);
+      try {
+        const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
+        expect(error).toBeInstanceOf(ReviewerRunError);
+        expect((error as ReviewerRunError).kind).toBe(expectedKind);
+        expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
+        expect((error as Error).message).not.toContain("assistant");
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
     }
   });
 
@@ -363,8 +471,28 @@ process.stdin.on("end", () => {
       ).catch((value: unknown) => value);
       expect(error).toBeInstanceOf(ReviewerRunError);
       expect((error as ReviewerRunError).kind).toBe("context-limit");
-      expect((error as ReviewerRunError).usage).toEqual({ role: "finder:diff-correctness", turns: 1, inputTokens: 0, outputTokens: 0, contextTokens: 21 });
+      expect((error as ReviewerRunError).usage).toEqual({ role: "finder:diff-correctness", turns: 1, inputTokens: 10, outputTokens: 2, contextTokens: 21 });
       expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("uses cumulative live usage and falls back to cache components without double counting", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-usage-fallback-"));
+    const executable = await emitScript(directory, [
+      turnStart(),
+      { type: "message_update", usage: { input: 10, output: 4, cacheRead: 3, cacheWrite: 2, totalTokens: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "first" } },
+      { type: "message_update", usage: { input: 11, output: 5, cacheRead: 4, cacheWrite: 2, totalTokens: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "second" } },
+      { type: "message_end", message: { role: "assistant", usage: { input: 11, output: 5, cacheRead: 4, cacheWrite: 2, totalTokens: 0 } } },
+      toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] }),
+    ]);
+    try {
+      const progress: ReviewerProgressEvent[] = [];
+      const result = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder, undefined, (event) => progress.push(event));
+      expect(result.usage).toEqual({ role: "finder:diff-correctness", turns: 1, inputTokens: 11, outputTokens: 5, contextTokens: 22 });
+      const liveTurns = progress.filter((event) => event.type === "reviewer-turn");
+      expect(liveTurns.at(1)?.usage).toEqual({ role: "finder:diff-correctness", turns: 1, inputTokens: 11, outputTokens: 5, contextTokens: 22 });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -397,6 +525,29 @@ process.stdin.on("end", () => {
       expect((error as ReviewerRunError).kind).toBe("compaction");
       expect(progress.some((event) => event.type === "reviewer-failed" && event.kind === "compaction")).toBe(true);
       expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a context bound authoritative over a late result", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-late-result-"));
+    const result = JSON.stringify(toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] }));
+    const executable = await nodeScript(directory, `
+const first = ${JSON.stringify(JSON.stringify(turnStart()))};
+const bound = ${JSON.stringify(JSON.stringify(messageUpdate(10, 2, 21)))};
+console.log(first);
+console.log(bound);
+process.on("SIGTERM", () => setTimeout(() => { console.log(${JSON.stringify(result)}); process.exit(9); }, 20));
+setInterval(() => {}, 1000);
+`);
+    try {
+      const error = await new PiReviewAgentRunner(executable).run(
+        { ...invocation(directory), contextBudget: 20 },
+        validateFinder,
+      ).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(ReviewerRunError);
+      expect((error as ReviewerRunError).kind).toBe("context-limit");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

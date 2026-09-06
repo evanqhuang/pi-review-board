@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { collectChangedLocations, deduplicateCandidates, filterCandidatesToChangedLines, filterVerifiedFindings, formatReviewReport, normalizeReviewPath } from "../src/output.js";
-import type { ReviewCandidate, ReviewSnapshot, VerifiedFinding } from "../src/types.js";
+import type { ReviewCandidate, ReviewCoverage, ReviewSnapshot, VerifiedFinding } from "../src/types.js";
 
 const snapshot: ReviewSnapshot = {
   target: { kind: "branch", ref: "topic" },
@@ -242,6 +242,45 @@ describe("review output", () => {
     for (const disposition of ["PLAUSIBLE", "REFUTED"] as const) {
       expect(filterVerifiedFindings([item], [{ candidateId: item.id, confidence: 100, verification: "not confirmed", disposition }], { retainPlausible: true })).toEqual([]);
     }
+  });
+
+  it("renders incomplete coverage without clean wording and bounds grouped gap detail", () => {
+    const uncoveredRanges = Array.from({ length: 20 }, (_, index) => ({
+      unitId: `hash:work:diff:unit-${index}`,
+      shardId: `shard-${index}`,
+      role: "diff",
+      fileIdentity: `src/file-${index}.ts`,
+      newRange: { start: index + 1, count: 1 },
+      reason: "review work limit leaves unit uncovered",
+    }));
+    const coverage: ReviewCoverage = {
+      snapshotHash: snapshot.snapshotHash,
+      state: "unknown",
+      plannedUnitIds: uncoveredRanges.map((range) => range.unitId),
+      coveredUnitIds: [],
+      uncoveredUnitIds: uncoveredRanges.map((range) => range.unitId),
+      plannedUnits: uncoveredRanges.map((range) => range.unitId),
+      coveredUnits: [],
+      uncoveredUnits: uncoveredRanges.map((range) => range.unitId),
+      uncoveredRanges,
+      uncoveredCandidates: [],
+      unvalidatedCandidates: [{ id: "candidate-1", unitId: uncoveredRanges[0]!.unitId, reason: "validator not scheduled" }],
+      plannedShardIds: uncoveredRanges.map((range) => range.shardId),
+      coveredShardIds: ["shard-covered"],
+      uncoveredShardIds: uncoveredRanges.map((range) => range.shardId),
+      budgetMaxWeight: 8,
+      budgetReservedWeight: 4,
+      budgetSpentWeight: 3,
+    };
+    const report = formatReviewReport(snapshot, "complete", "No issues found.", [], [], coverage);
+    expect(report).toContain("INCOMPLETE REVIEW — Covered 1/20 shards");
+    expect(report).toContain("role diff");
+    expect(report).toContain("reason: review work limit leaves unit uncovered");
+    expect(report).toContain("Budget: spent 3 · reserved 4 · max 8 weighted units");
+    expect(report).toContain("Unvalidated candidates: 1");
+    expect(report).not.toContain("No issues found");
+    expect(report).not.toMatch(/\b(?:clean|pass|approved?)\b/iu);
+    expect(report).not.toContain("shard-19");
   });
 
   it("does not claim a clean review when a required stage failed", () => {

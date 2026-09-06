@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { Type } from "typebox";
-import { parseReviewArgs } from "../src/args.js";
+import { parseReviewArgs, validateMaxReviewWorkUnits, validateWorkLimitPolicy } from "../src/args.js";
 import { cancelActiveReviews, startReviewCancellation } from "../src/cancellation.js";
 import { parseReviewEffort, type ReviewEffort } from "../src/effort.js";
 import { NodeCommandRunner } from "../src/commands.js";
@@ -20,13 +20,16 @@ import {
   type FindingDispositionInput,
 } from "../src/lifecycle.js";
 import { captureReviewSnapshot, resolveReviewTarget } from "../src/targets.js";
-import type { ReviewDecision, ReviewPhase, ReviewProgressEvent, ReviewResult, ReviewTarget } from "../src/types.js";
+import { MAX_REVIEW_WORK_UNITS } from "../src/types.js";
+import type { ReviewDecision, ReviewPhase, ReviewProgressEvent, ReviewResult, ReviewTarget, WorkLimitPolicy } from "../src/types.js";
 
 interface ReviewToolParams {
   readonly action?: "run" | "loop" | "record" | "status" | "reset" | undefined;
   readonly target?: string | undefined;
   readonly comment?: boolean | undefined;
   readonly effort?: ReviewEffort | undefined;
+  readonly maxReviewWorkUnits?: number | undefined;
+  readonly workLimitPolicy?: WorkLimitPolicy | undefined;
   readonly model?: string | undefined;
   readonly phase?: "auto" | ReviewPhase | undefined;
   readonly planPath?: string | undefined;
@@ -44,11 +47,24 @@ interface ReviewUI {
   setWidget?: ((key: string, content: string[] | undefined) => void) | undefined;
 }
 
+interface ReviewModelRegistry {
+  find(provider: string, modelId: string): { readonly contextWindow?: number } | undefined;
+}
+
 interface ReviewExecutionContext {
   readonly cwd: string;
   readonly signal?: AbortSignal | undefined;
   readonly ui: ReviewUI;
   readonly onUpdate?: AgentToolUpdateCallback<unknown> | undefined;
+  readonly resolveModelContextWindow?: ((model: string) => number | undefined) | undefined;
+}
+
+interface ReviewContextSource {
+  readonly cwd: string;
+  readonly signal?: AbortSignal | undefined;
+  readonly ui: ReviewUI;
+  readonly onUpdate?: AgentToolUpdateCallback<unknown> | undefined;
+  readonly modelRegistry?: ReviewModelRegistry | undefined;
 }
 
 const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
@@ -59,6 +75,9 @@ const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
   { value: "reset", label: "reset — reset a managed review session" },
   { value: "--effort normal", label: "--effort normal — automatic tiny/small routing (default)" },
   { value: "--effort deep", label: "--effort deep — normal review plus one integration pass" },
+  { value: "--max-work-units ", label: "--max-work-units <1..128> — cap weighted review work" },
+  { value: "--work-limit-policy reject", label: "--work-limit-policy reject — reject over-budget work" },
+  { value: "--work-limit-policy partial", label: "--work-limit-policy partial — cover work up to the budget" },
   { value: "--phase initial", label: "--phase initial — advanced managed override" },
   { value: "--phase auto", label: "--phase auto — advanced automatic override" },
   { value: "--phase delta", label: "--phase delta — advanced remediation override" },
@@ -79,6 +98,31 @@ export function getReviewArgumentCompletions(prefix: string): AutocompleteItem[]
     .filter((item) => item.value.toLowerCase().startsWith(currentToken))
     .map((item) => ({ ...item, value: `${completedPrefix}${item.value}` }));
   return matches.length > 0 ? matches : null;
+}
+
+export function resolveModelContextWindowFromRegistry(
+  modelRegistry: ReviewModelRegistry | undefined,
+  model: string,
+): number | undefined {
+  if (!modelRegistry) return undefined;
+  const separator = model.indexOf("/");
+  if (separator <= 0 || separator === model.length - 1) return undefined;
+  const provider = model.slice(0, separator);
+  const modelId = model.slice(separator + 1);
+  return modelRegistry.find(provider, modelId)?.contextWindow;
+}
+
+export function createReviewExecutionContext(ctx: ReviewContextSource): ReviewExecutionContext {
+  const resolveModelContextWindow = ctx.modelRegistry
+    ? (model: string): number | undefined => resolveModelContextWindowFromRegistry(ctx.modelRegistry, model)
+    : undefined;
+  return {
+    cwd: ctx.cwd,
+    ui: ctx.ui,
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
+    ...(ctx.onUpdate ? { onUpdate: ctx.onUpdate } : {}),
+    ...(resolveModelContextWindow ? { resolveModelContextWindow } : {}),
+  };
 }
 
 const FINDING_DISPOSITIONS = new Set<FindingDispositionInput["disposition"]>([
@@ -118,10 +162,21 @@ function operationCwd(ctx: ReviewExecutionContext, target: ReviewTarget): string
 }
 
 function contextAt(ctx: ReviewExecutionContext, cwd: string): ReviewExecutionContext {
-  return { cwd, ui: ctx.ui, ...(ctx.signal ? { signal: ctx.signal } : {}) };
+  return {
+    cwd,
+    ui: ctx.ui,
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
+    ...(ctx.resolveModelContextWindow ? { resolveModelContextWindow: ctx.resolveModelContextWindow } : {}),
+  };
 }
 
-function plainResult(report: string, effort: ReviewEffort, decision?: ReviewDecision, status: ReviewResult["status"] = "complete"): ReviewResult {
+function plainResult(
+  report: string,
+  effort: ReviewEffort,
+  decision?: ReviewDecision,
+  status: ReviewResult["status"] = "complete",
+  coverage?: ReviewResult["coverage"],
+): ReviewResult {
   return {
     effort,
     status,
@@ -132,7 +187,13 @@ function plainResult(report: string, effort: ReviewEffort, decision?: ReviewDeci
     commented: false,
     usage: [],
     ...(decision ? { decision } : {}),
+    ...(coverage === undefined ? {} : { coverage }),
   };
+}
+
+export function validateReviewToolOptions(params: Pick<ReviewToolParams, "maxReviewWorkUnits" | "workLimitPolicy">): void {
+  if (params.maxReviewWorkUnits !== undefined) validateMaxReviewWorkUnits(params.maxReviewWorkUnits);
+  if (params.workLimitPolicy !== undefined) validateWorkLimitPolicy(params.workLimitPolicy);
 }
 
 export function validateFindingDispositionInputs(dispositions: readonly FindingDispositionInput[]): void {
@@ -246,6 +307,7 @@ async function executeReview(
   activeReviews: Set<AbortController>,
   runKey = `code-review:${randomUUID()}`,
 ): Promise<ReviewResult> {
+  validateReviewToolOptions(params);
   const presenter = progressPresenter(ctx, runKey);
   const cancellation = startReviewCancellation(activeReviews, ctx.signal);
   presenter.start();
@@ -268,6 +330,7 @@ async function executeReview(
       commands,
       agents: new PiReviewAgentRunner(),
       ...(params.model?.trim() ? { reviewerModel: params.model.trim() } : {}),
+      ...(ctx.resolveModelContextWindow ? { resolveModelContextWindow: ctx.resolveModelContextWindow } : {}),
       onProgress: emitProgress,
     };
     let target: ReviewTarget;
@@ -326,7 +389,10 @@ async function executeReview(
       : undefined;
     if (managed) {
       await requireManagedTargetCheckout(targetContext, target, commands);
-      return await runManagedReview({
+      // Keep policy ingress on the managed call as well. The managed lifecycle
+      // currently ignores these optional fields when building ReviewOptions;
+      // it must be updated there before managed runs enforce the policy.
+      const managedInput = {
         cwd,
         target,
         requestedPhase: phase,
@@ -334,13 +400,18 @@ async function executeReview(
         ...(implementationId ? { implementationId } : {}),
         ...(params.sessionId?.trim() ? { sessionId: params.sessionId.trim() } : {}),
         ...(planPath ? { planPath } : {}),
-      }, dependencies, signal);
+        ...(params.maxReviewWorkUnits === undefined ? {} : { maxReviewWorkUnits: params.maxReviewWorkUnits }),
+        ...(params.workLimitPolicy === undefined ? {} : { workLimitPolicy: params.workLimitPolicy }),
+      };
+      return await runManagedReview(managedInput, dependencies, signal);
     }
     return await runCodeReview({
       cwd,
       target,
       comment: params.comment === true,
       effort,
+      ...(params.maxReviewWorkUnits === undefined ? {} : { maxReviewWorkUnits: params.maxReviewWorkUnits }),
+      ...(params.workLimitPolicy === undefined ? {} : { workLimitPolicy: params.workLimitPolicy }),
     }, dependencies, signal);
   } finally {
     cancellation.dispose();
@@ -394,12 +465,14 @@ export default function (pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       try {
         const parsed = parseReviewArgs(args);
-        const result = await executeReview(ctx, {
+        const result = await executeReview(createReviewExecutionContext(ctx), {
           action: parsed.action,
           comment: parsed.comment,
           effort: parsed.effort,
           phase: parsed.phase,
           confirmReset: parsed.confirmReset,
+          ...(parsed.maxReviewWorkUnits === undefined ? {} : { maxReviewWorkUnits: parsed.maxReviewWorkUnits }),
+          ...(parsed.workLimitPolicy === undefined ? {} : { workLimitPolicy: parsed.workLimitPolicy }),
           ...(parsed.target ? { target: parsed.target } : {}),
           ...(parsed.model ? { model: parsed.model } : {}),
           ...(parsed.planPath ? { planPath: parsed.planPath } : {}),
@@ -425,6 +498,11 @@ export default function (pi: ExtensionAPI): void {
         Type.Literal("normal"),
         Type.Literal("deep"),
       ], { description: "Review depth: normal automatically routes tiny/small changes; deep adds one integration pass" })),
+      maxReviewWorkUnits: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_REVIEW_WORK_UNITS, description: "Maximum weighted review work units (1-128)" })),
+      workLimitPolicy: Type.Optional(Type.Union([
+        Type.Literal("reject"),
+        Type.Literal("partial"),
+      ], { description: "Whether work beyond maxReviewWorkUnits is rejected or partially covered" })),
       model: Type.Optional(Type.String({ description: "Reviewer model provider/id override" })),
       phase: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("initial"), Type.Literal("delta"), Type.Literal("final")])),
       planPath: Type.Optional(Type.String({ description: "Managed plan path whose review contract and implementation identity should be used" })),
@@ -450,12 +528,13 @@ export default function (pi: ExtensionAPI): void {
     }),
     execute: async (toolCallId, params: ReviewToolParams, signal, onUpdate, ctx) => {
       try {
-        const result = await executeReview({
+        const result = await executeReview(createReviewExecutionContext({
           cwd: ctx.cwd,
           ui: ctx.ui,
+          modelRegistry: ctx.modelRegistry,
           ...(signal ? { signal } : {}),
           ...(onUpdate ? { onUpdate } : {}),
-        }, params, activeReviews, `code-review:tool:${toolCallId}`);
+        }), params, activeReviews, `code-review:tool:${toolCallId}`);
         return {
           content: [{ type: "text", text: result.report }],
           details: {
@@ -470,6 +549,7 @@ export default function (pi: ExtensionAPI): void {
             failures: result.failures,
             commented: result.commented,
             usage: result.usage,
+            ...(result.coverage === undefined ? {} : { coverage: result.coverage }),
           },
         };
       } catch (error) {

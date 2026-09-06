@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { Value } from "typebox/value";
 import registerCodeReviewExtension, {
   buildManagedImplementationId,
+  createReviewExecutionContext,
   getReviewArgumentCompletions,
   injectReviewResult,
   reviewExecutionSelection,
@@ -17,6 +19,24 @@ const result: ReviewResult = {
   commented: false,
   report: "### Code review\n\nNo issues found.",
   usage: [],
+  coverage: {
+    snapshotHash: "snapshot",
+    state: "complete",
+    plannedUnitIds: [],
+    coveredUnitIds: [],
+    uncoveredUnitIds: [],
+    plannedUnits: [],
+    coveredUnits: [],
+    uncoveredUnits: [],
+    uncoveredRanges: [],
+    uncoveredCandidates: [],
+    plannedShardIds: [],
+    coveredShardIds: [],
+    uncoveredShardIds: [],
+    budgetMaxWeight: 8,
+    budgetReservedWeight: 0,
+    budgetSpentWeight: 0,
+  },
 };
 
 describe("review extension helpers", () => {
@@ -55,6 +75,7 @@ describe("review extension helpers", () => {
       display: true,
       details: result,
     });
+    expect(sendMessage.mock.calls[0]?.[0].details).toMatchObject({ coverage: { state: "complete" } });
   });
 
   it("binds an explicit managed review identity to checkout, branch, and plan path", () => {
@@ -71,12 +92,40 @@ describe("review extension helpers", () => {
     }])).toThrow("Unknown finding disposition");
   });
 
+  it("wires exact registry metadata for command and tool execution contexts", () => {
+    const find = vi.fn((provider: string, modelId: string) => {
+      if (provider === "provider" && modelId === "explicit") return { contextWindow: 128_000 };
+      if (provider === "provider" && modelId === "role/default") return { contextWindow: 96_000 };
+      return undefined;
+    });
+    const registry = { find };
+    const ui = { notify: vi.fn() };
+    const commandContext = createReviewExecutionContext({ cwd: "/repo", ui, modelRegistry: registry });
+    const toolContext = createReviewExecutionContext({ cwd: "/repo", ui, modelRegistry: registry });
+
+    expect(commandContext.resolveModelContextWindow?.("provider/explicit")).toBe(128_000);
+    expect(toolContext.resolveModelContextWindow?.("provider/role/default")).toBe(96_000);
+    expect(commandContext.resolveModelContextWindow?.("provider/unknown")).toBeUndefined();
+    expect(toolContext.resolveModelContextWindow?.("unknown/explicit")).toBeUndefined();
+    expect(toolContext.resolveModelContextWindow?.("provider/explicit/extra")).toBeUndefined();
+    expect(find).toHaveBeenNthCalledWith(1, "provider", "explicit");
+    expect(find).toHaveBeenNthCalledWith(2, "provider", "role/default");
+    expect(find).toHaveBeenNthCalledWith(3, "provider", "unknown");
+    expect(find).toHaveBeenNthCalledWith(4, "unknown", "explicit");
+    expect(find).toHaveBeenNthCalledWith(5, "provider", "explicit/extra");
+  });
+
+  it("keeps stub execution contexts safe when no model registry is present", () => {
+    const context = createReviewExecutionContext({ cwd: "/repo", ui: { notify: vi.fn() } });
+    expect(context.resolveModelContextWindow).toBeUndefined();
+  });
+
   it("registers the tool and clears progress state when execution fails before target resolution", async () => {
     type RegisteredReviewTool = {
       readonly name: string;
       readonly description: string;
       readonly parameters: unknown;
-      readonly execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: unknown, ctx: unknown) => Promise<{ readonly isError?: boolean }>;
+      readonly execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: unknown, ctx: unknown) => Promise<{ readonly isError?: boolean; readonly content?: readonly { readonly type: string; readonly text?: string }[] }>;
     };
     type RegisteredReviewCommand = { readonly description: string };
     const registeredTools: RegisteredReviewTool[] = [];
@@ -109,6 +158,12 @@ describe("review extension helpers", () => {
     }
     expect(tool!.description).toContain("Normal auto-routes tiny/small changes; deep adds one integration pass");
     const toolSchema = JSON.stringify(tool!.parameters);
+    expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 1, workLimitPolicy: "reject" })).toBe(true);
+    expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 128, workLimitPolicy: "partial" })).toBe(true);
+    expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 0 })).toBe(false);
+    expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 129 })).toBe(false);
+    expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 1.5 })).toBe(false);
+    expect(Value.Check(tool!.parameters as never, { workLimitPolicy: "maybe" })).toBe(false);
     expect(toolSchema).toContain('"const":"normal"');
     expect(toolSchema).toContain('"const":"deep"');
     for (const value of ["low", "medium", "high", "xhigh", "max", "ultra"]) {
@@ -121,8 +176,17 @@ describe("review extension helpers", () => {
       undefined,
       { cwd: "/repo", ui } as never,
     );
+    const invalidOptions = await tool!.execute(
+      "tool-call-invalid-options",
+      { maxReviewWorkUnits: 0 } as never,
+      undefined,
+      undefined,
+      { cwd: "/repo", ui } as never,
+    );
 
     expect(result.isError).toBe(true);
+    expect(invalidOptions.isError).toBe(true);
+    expect(invalidOptions.content?.[0]?.text).toContain("maxReviewWorkUnits");
     expect([...statuses.values()].every((value) => value === undefined)).toBe(true);
     expect([...widgets.values()].every((value) => value === undefined)).toBe(true);
     expect(working.at(-1)).toBeUndefined();

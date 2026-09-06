@@ -1,4 +1,11 @@
-import type { ReviewCandidate, ReviewSnapshot, StageFailure, VerifiedFinding } from "./types.js";
+import type {
+  ReviewCandidate,
+  ReviewCoverage,
+  ReviewCoverageRange,
+  ReviewSnapshot,
+  StageFailure,
+  VerifiedFinding,
+} from "./types.js";
 import type { VerifierOutput } from "./prompts.js";
 
 const severityRank: Record<ReviewCandidate["severity"], number> = {
@@ -285,23 +292,193 @@ function formatReviewTarget(snapshot: ReviewSnapshot): string {
   }
 }
 
+const MAX_COVERAGE_GROUPS = 12;
+const MAX_RANGES_PER_COVERAGE_GROUP = 4;
+const MAX_COVERAGE_TEXT = 160;
+
+function boundedCoverageText(value: string, limit = MAX_COVERAGE_TEXT): string {
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  return normalized.length <= limit ? normalized : `${normalized.slice(0, Math.max(0, limit - 1))}…`;
+}
+
+function coverageRoleFromUnit(unitId: string | undefined): string | undefined {
+  if (unitId === undefined) return undefined;
+  const marker = ":work:";
+  const markerIndex = unitId.indexOf(marker);
+  if (markerIndex < 0) return undefined;
+  const role = unitId.slice(markerIndex + marker.length).split(":", 1)[0];
+  return role || undefined;
+}
+
+function coverageRangeText(range: ReviewCoverageRange): string {
+  const file = range.fileIdentity === undefined ? "diff" : boundedCoverageText(range.fileIdentity, 80);
+  const sides: string[] = [];
+  const formatSide = (label: string, value: { readonly start: number; readonly count: number }): string => {
+    const end = value.count > 0 ? value.start + value.count - 1 : value.start;
+    return `${label} ${value.start}-${end}`;
+  };
+  if (range.oldRange !== undefined) sides.push(formatSide("old", range.oldRange));
+  if (range.newRange !== undefined) sides.push(formatSide("new", range.newRange));
+  return `${file}${sides.length > 0 ? ` (${sides.join(", ")})` : ""}`;
+}
+
+interface CoverageDetailGroup {
+  readonly shard: string;
+  readonly role: string;
+  readonly reason: string;
+  readonly ranges: string[];
+  readonly units: string[];
+}
+
+function coverageDetailGroups(coverage: ReviewCoverage): CoverageDetailGroup[] {
+  const groups = new Map<string, CoverageDetailGroup>();
+  const ranges = coverage.uncoveredRanges.length > 0
+    ? coverage.uncoveredRanges
+    : coverage.uncoveredRangeEvidence ?? [];
+  const add = (shard: string, role: string, reason: string, range?: string, unit?: string): void => {
+    const boundedShard = boundedCoverageText(shard, 100) || "unknown";
+    const boundedRole = boundedCoverageText(role, 100) || "unknown";
+    const boundedReason = boundedCoverageText(reason) || "coverage is unavailable";
+    const key = `${boundedShard}\u0000${boundedRole}\u0000${boundedReason}`;
+    const existing = groups.get(key);
+    if (existing === undefined) {
+      groups.set(key, {
+        shard: boundedShard,
+        role: boundedRole,
+        reason: boundedReason,
+        ranges: range === undefined ? [] : [range],
+        units: unit === undefined ? [] : [unit],
+      });
+      return;
+    }
+    if (range !== undefined && !existing.ranges.includes(range)) existing.ranges.push(range);
+    if (unit !== undefined && !existing.units.includes(unit)) existing.units.push(unit);
+  };
+
+  const representedUnits = new Set<string>();
+  const representedShards = new Set<string>();
+  for (const range of ranges) {
+    if (range.unitId !== undefined) representedUnits.add(range.unitId);
+    if (range.shardId !== undefined) representedShards.add(range.shardId);
+    add(
+      range.shardId ?? "unknown",
+      range.role ?? coverageRoleFromUnit(range.unitId) ?? "unknown",
+      range.reason || coverage.reason || "coverage is unavailable",
+      coverageRangeText(range),
+      range.unitId,
+    );
+  }
+  for (const unitId of coverage.uncoveredUnitIds) {
+    if (representedUnits.has(unitId)) continue;
+    add("unknown", coverageRoleFromUnit(unitId) ?? "unknown", coverage.reason ?? "work unit is uncovered", undefined, unitId);
+  }
+  const uncoveredShardIds = coverage.uncoveredShardIds && coverage.uncoveredShardIds.length > 0
+    ? coverage.uncoveredShardIds
+    : coverage.uncoveredShards ?? coverage.uncoveredShardIds ?? [];
+  for (const shardId of uncoveredShardIds) {
+    if (representedShards.has(shardId)) continue;
+    add(shardId, "unknown", coverage.reason ?? "shard is uncovered");
+  }
+  return [...groups.values()];
+}
+
+function coverageShardCount(coverage: ReviewCoverage, kind: "planned" | "covered"): number {
+  const count = kind === "planned"
+    ? coverage.plannedShardCount ?? coverage.plannedShardIds?.length ?? coverage.plannedShards?.length
+    : coverage.coveredShardCount ?? coverage.coveredShardIds?.length ?? coverage.coveredShards?.length;
+  return count ?? 0;
+}
+
+function coverageIsIncomplete(coverage: ReviewCoverage | undefined): boolean {
+  if (coverage === undefined) return false;
+  return coverage.state !== "complete"
+    || coverage.uncoveredUnitIds.length > 0
+    || coverage.uncoveredRanges.length > 0
+    || (coverage.uncoveredRangeEvidence?.length ?? 0) > 0
+    || (coverage.uncoveredShardIds?.length ?? 0) > 0
+    || (coverage.uncoveredShards?.length ?? 0) > 0
+    || (coverage.unvalidatedCandidates !== undefined && coverage.unvalidatedCandidates.length > 0)
+    || coverage.uncoveredCandidates.length > 0;
+}
+
+function formatCoverageDetails(coverage: ReviewCoverage): string[] {
+  const groups = coverageDetailGroups(coverage);
+  const lines = ["Coverage gaps (bounded):"];
+  if (groups.length === 0) {
+    lines.push("- No uncovered range, shard, or work-unit detail was supplied.");
+  } else {
+    for (const group of groups.slice(0, MAX_COVERAGE_GROUPS)) {
+      const ranges = group.ranges.slice(0, MAX_RANGES_PER_COVERAGE_GROUP);
+      const rangeText = ranges.length > 0 ? ` · ranges ${ranges.join(", ")}` : "";
+      const units = group.units.slice(0, MAX_RANGES_PER_COVERAGE_GROUP);
+      const unitText = units.length > 0
+        ? ` · units ${units.map((unit) => boundedCoverageText(unit, 100)).join(", ")}`
+        : "";
+      const omittedRanges = group.ranges.length - ranges.length;
+      const omittedUnits = group.units.length - units.length;
+      const omitted = [
+        omittedRanges > 0 ? `+${omittedRanges} more ranges` : undefined,
+        omittedUnits > 0 ? `+${omittedUnits} more units` : undefined,
+      ].filter((value): value is string => value !== undefined);
+      lines.push(`- shard ${group.shard} · role ${group.role}${rangeText}${unitText} · reason: ${group.reason}${omitted.length > 0 ? ` · ${omitted.join(" · ")}` : ""}`);
+    }
+    if (groups.length > MAX_COVERAGE_GROUPS) lines.push(`- +${groups.length - MAX_COVERAGE_GROUPS} more coverage groups`);
+  }
+  const budget = coverage.budget ?? {
+    maxWeight: coverage.budgetMaxWeight ?? coverage.maxWeight ?? 0,
+    reservedWeight: coverage.budgetReservedWeight ?? coverage.reservedWeight ?? 0,
+    spentWeight: coverage.budgetSpentWeight ?? coverage.spentWeight ?? 0,
+  };
+  const unvalidated = coverage.unvalidatedCandidates && coverage.unvalidatedCandidates.length > 0
+    ? coverage.unvalidatedCandidates
+    : coverage.uncoveredCandidates;
+  lines.push(
+    `Budget: spent ${budget.spentWeight} · reserved ${budget.reservedWeight} · max ${budget.maxWeight} weighted units`,
+    `Unvalidated candidates: ${unvalidated?.length ?? 0}`,
+  );
+  return lines;
+}
+
 export function formatReviewReport(
   snapshot: ReviewSnapshot,
   status: "complete" | "ineligible" | "incomplete",
   summary: string,
   findings: readonly VerifiedFinding[],
   failures: readonly StageFailure[],
+  coverage?: ReviewCoverage,
 ): string {
   const target = formatReviewTarget(snapshot);
   const cleanSummary = summary.trim();
-  if (status === "ineligible") return `### Code review\n\n${target}\n\nNot reviewed${cleanSummary ? `: ${cleanSummary}` : ""}`;
+  const incompleteCoverage = coverageIsIncomplete(coverage);
+  const reportIsIncomplete = status !== "complete" || incompleteCoverage;
+  // Summaries originate in the review pipeline and may say "No issues found"
+  // even when a later coverage record proves that the review was partial.
+  // Never repeat clean/approval language in that case.
+  const reportSummary = reportIsIncomplete && /(?:no\s+issues?|no\s+findings?|clean|pass(?:ed)?|approval|approved|all\s+clear)/iu.test(cleanSummary)
+    ? ""
+    : cleanSummary;
+  if (status === "ineligible" && coverage === undefined) {
+    return `### Code review\n\n${target}\n\nNot reviewed${reportSummary ? `: ${reportSummary}` : ""}`;
+  }
   const title = findings.length > 0
     ? `Found ${findings.length} issue${findings.length === 1 ? "" : "s"}`
-    : status === "complete"
-      ? "No issues found"
-      : "No verified findings";
-  const lines = [`### Code review`, "", target, "", title + "."];
-  if (cleanSummary) lines.push("", cleanSummary);
+    : status === "complete" && incompleteCoverage
+      ? "Review incomplete"
+      : status === "complete"
+        ? "No issues found"
+        : "No verified findings";
+  const lines = [`### Code review`, "", target];
+  if (incompleteCoverage && coverage !== undefined) {
+    lines.push("", `INCOMPLETE REVIEW — Covered ${coverageShardCount(coverage, "covered")}/${coverageShardCount(coverage, "planned")} shards`);
+  }
+  if (status === "ineligible") {
+    lines.push("", `Not reviewed${reportSummary ? `: ${reportSummary}` : ""}`);
+    if (incompleteCoverage && coverage !== undefined) lines.push("", ...formatCoverageDetails(coverage));
+    return lines.join("\n");
+  }
+  lines.push("", title + ".");
+  if (reportSummary) lines.push("", reportSummary);
+  if (incompleteCoverage && coverage !== undefined) lines.push("", ...formatCoverageDetails(coverage));
   if (findings.length > 0) lines.push("", ...findings.map((finding) => findingText(snapshot, finding)));
   if (failures.length > 0) {
     lines.push("", status === "incomplete" ? "Review incomplete:" : "Review warnings:");
@@ -316,6 +493,7 @@ export function formatPrComment(
   summary: string,
   findings: readonly VerifiedFinding[],
   failures: readonly StageFailure[],
+  coverage?: ReviewCoverage,
 ): string {
-  return formatReviewReport(snapshot, status, summary, findings, failures);
+  return formatReviewReport(snapshot, status, summary, findings, failures, coverage);
 }

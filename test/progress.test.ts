@@ -59,6 +59,18 @@ describe("ReviewProgressPresenter", () => {
     expect(lines).not.toContain("other");
   });
 
+  it("keeps same-role sharded workers distinct using optional unit and shard identity", () => {
+    const mock = mockUI();
+    const presenter = new ReviewProgressPresenter({ ui: mock.ui, key: "review:sharded" });
+    presenter.start();
+    presenter.update({ type: "reviewer-start", role: "diff-only-bug", unitId: "unit-a", shardId: "shard-a", resultTool: "review_finder_result", attempt: 1 });
+    presenter.update({ type: "reviewer-start", role: "diff-only-bug", unitId: "unit-b", shardId: "shard-b", resultTool: "review_finder_result", attempt: 1 });
+    presenter.update({ type: "reviewer-turn", role: "diff-only-bug", unitId: "unit-a", shardId: "shard-a", attempt: 1, usage: { role: "diff-only-bug", turns: 1, inputTokens: 10, outputTokens: 5, contextTokens: 15 } });
+    const lines = (mock.widgets.get("review:sharded") ?? []).join("\n");
+    expect(lines).toContain("diff-only-bug · unit unit-a · shard shard-a");
+    expect(lines).toContain("diff-only-bug · unit unit-b · shard shard-b");
+  });
+
   it("surfaces bounded reviewer budget failures with usage", () => {
     const mock = mockUI();
     const presenter = new ReviewProgressPresenter({ ui: mock.ui, key: "review:budget" });

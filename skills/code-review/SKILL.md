@@ -45,7 +45,7 @@ The route controls a fixed role set; it is not a general exploration framework:
 
 Primary role passes run in parallel. They inspect only the supplied change and the nearest permitted context. Each candidate is tied to a changed line, then gets one fresh, single-candidate validator; validator concurrency is bounded (at most four). Only `CONFIRMED` verdicts with confidence `>=85` are reportable. `PLAUSIBLE`, `REFUTED`, and lower-confidence results are not findings.
 
-Do not perform broad exploration, a batch verifier, a gap sweep, independent whole-set verification, or recursive agent delegation. Candidate and output limits are enforced. Reviewer turn/context/output-cap failures and compaction failures make the review incomplete and never publish. A short missing or malformed protocol result may receive one internal retry; a persistent miss is incomplete, never approval.
+Do not perform broad exploration, a batch verifier, a gap sweep, independent whole-set verification, or recursive agent delegation. Candidate and output limits are enforced. Reviewer turn/context/output-cap failures, input-budget failures, and compaction failures make the review incomplete and never publish. Input-limit failures are reported by stage and prevent that reviewer from spawning; summary, finder, or validator failures never produce clean/approval wording. A short missing or malformed protocol result may receive one internal retry; a persistent miss is incomplete, never approval.
 
 ## Managed implementation review
 

@@ -1,5 +1,6 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_REVIEW_ROUTING_CONFIG, loadReviewConfig } from "../src/config.js";
 import { analyzeDiff, classifyDiff, routeReview } from "../src/routing.js";
@@ -126,7 +127,7 @@ describe("deterministic diff routing", () => {
   });
 
   it("loads additive root configuration and fails closed for malformed files", async () => {
-    const cwd = await mkdtemp(join("/tmp", "pi-code-review-routing-"));
+    const cwd = await mkdtemp(join(tmpdir(), "pi-code-review-routing-"));
     tempDirectories.push(cwd);
     expect(loadReviewConfig(cwd)).toEqual(DEFAULT_REVIEW_ROUTING_CONFIG);
 
@@ -156,5 +157,17 @@ describe("deterministic diff routing", () => {
     expect(routeReview(tiny, "normal").route).toBe("tiny");
     expect(routeReview(tiny, "deep").route).toBe("deep");
     expect(routeReview({ diff: tiny, effort: "deep" }).plan.route).toBe("deep");
+  });
+
+  it("keeps every routed role bounded and uses the required thinking floors", () => {
+    const plan = routeReview(patch("src/a.ts", "new"), "deep").plan;
+    expect(plan.roles.summary).toMatchObject({ inputBudgetBytes: 64 * 1024, reservedTokens: 32_000, contextBudget: 200_000 });
+    expect(plan.roles.summary.modelRoute.thinking).toBe("high");
+    expect(plan.roles["guidance-a"].modelRoute.thinking).toBe("high");
+    expect(plan.roles["guidance-b"].modelRoute.thinking).toBe("high");
+    expect(plan.roles["diff-only-bug"].modelRoute.thinking).toBe("high");
+    expect(plan.roles["contextual-bug"].modelRoute.thinking).toBe("xhigh");
+    expect(plan.roles.integration.modelRoute.thinking).toBe("xhigh");
+    expect(plan.roles.validator.modelRoute.thinking).toBe("high");
   });
 });

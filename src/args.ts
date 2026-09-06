@@ -1,5 +1,9 @@
 import { isReviewEffort, parseReviewEffort, type ReviewEffort } from "./effort.js";
-import type { ReviewPhase } from "./types.js";
+import {
+  MAX_REVIEW_WORK_UNITS,
+  type ReviewPhase,
+  type WorkLimitPolicy,
+} from "./types.js";
 
 export type ReviewCommandAction = "run" | "loop" | "status" | "reset";
 
@@ -9,6 +13,8 @@ export interface ParsedReviewArgs {
   readonly comment: boolean;
   readonly effort: ReviewEffort;
   readonly effortProvided: boolean;
+  readonly maxReviewWorkUnits?: number;
+  readonly workLimitPolicy?: WorkLimitPolicy;
   readonly model?: string;
   readonly phase: ReviewPhase | "auto";
   readonly planPath?: string;
@@ -69,12 +75,35 @@ function isPhase(value: string): value is ReviewPhase | "auto" {
   return value === "auto" || value === "initial" || value === "delta" || value === "final";
 }
 
+/** Validate the external work-unit limit before it reaches the planner. */
+export function validateMaxReviewWorkUnits(value: unknown, label = "maxReviewWorkUnits"): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new Error(`${label} must be a safe integer between 1 and ${MAX_REVIEW_WORK_UNITS}`);
+  }
+  if (value < 1 || value > MAX_REVIEW_WORK_UNITS) {
+    throw new Error(`${label} must be between 1 and ${MAX_REVIEW_WORK_UNITS}`);
+  }
+  return value;
+}
+
+/** Validate the external work-limit policy shared by CLI and tool ingress. */
+export function validateWorkLimitPolicy(value: unknown, label = "workLimitPolicy"): WorkLimitPolicy {
+  if (value !== "reject" && value !== "partial") throw new Error(`${label} must be reject or partial`);
+  return value;
+}
+
+function parseMaxReviewWorkUnits(value: string): number {
+  return validateMaxReviewWorkUnits(Number(value), "--max-work-units");
+}
+
 export function parseReviewArgs(input: string): ParsedReviewArgs {
   const tokens = tokenize(input);
   let action: ReviewCommandAction = "run";
   let comment = false;
   let effort: ReviewEffort = "normal";
   let effortProvided = false;
+  let maxReviewWorkUnits: number | undefined;
+  let workLimitPolicy: WorkLimitPolicy | undefined;
   let model: string | undefined;
   let phase: ReviewPhase | "auto" = "auto";
   let planPath: string | undefined;
@@ -93,6 +122,20 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
     if (token === "--comment") {
       if (comment) throw new Error("--comment may be provided only once");
       comment = true;
+      continue;
+    }
+    if (token === "--max-work-units" || token.startsWith("--max-work-units=")) {
+      if (maxReviewWorkUnits !== undefined) throw new Error("--max-work-units may be provided only once");
+      const parsed = optionValue(tokens, index, "--max-work-units");
+      maxReviewWorkUnits = parseMaxReviewWorkUnits(parsed.value);
+      index += parsed.consumed;
+      continue;
+    }
+    if (token === "--work-limit-policy" || token.startsWith("--work-limit-policy=")) {
+      if (workLimitPolicy !== undefined) throw new Error("--work-limit-policy may be provided only once");
+      const parsed = optionValue(tokens, index, "--work-limit-policy");
+      workLimitPolicy = validateWorkLimitPolicy(parsed.value, "--work-limit-policy");
+      index += parsed.consumed;
       continue;
     }
     if (token === "--confirm") {
@@ -168,6 +211,8 @@ export function parseReviewArgs(input: string): ParsedReviewArgs {
     effortProvided,
     phase,
     confirmReset,
+    ...(maxReviewWorkUnits === undefined ? {} : { maxReviewWorkUnits }),
+    ...(workLimitPolicy === undefined ? {} : { workLimitPolicy }),
     ...(target === undefined ? {} : { target }),
     ...(model === undefined ? {} : { model }),
     ...(planPath === undefined ? {} : { planPath }),

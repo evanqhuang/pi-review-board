@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NodeCommandRunner } from "../src/commands.js";
-import { getReviewStatus, recordReviewDispositions, runManagedReview, withLedgerLock } from "../src/lifecycle.js";
+import { formatStatusReport, getReviewStatus, recordReviewDispositions, runManagedReview, withLedgerLock } from "../src/lifecycle.js";
 import type { AgentInvocation, AgentResult, ReviewAgentRunner } from "../src/types.js";
 
 const roots: string[] = [];
@@ -99,6 +99,90 @@ describe("managed review lifecycle", () => {
     expect(delta.ledger?.remediationBatches).toBe(1);
     const approved = await recordReviewDispositions({ cwd: repo, sessionId: delta.sessionId!, reviewedSnapshotHash: delta.reviewedSnapshotHash!, dispositions: [{ id: "REV-001", disposition: "resolved", parentEvidence: "The remediation commit removes the reproduced behavior." }] }, dependencies);
     expect(approved.decision).toBe("approve");
+  });
+
+  it("persists managed partial coverage, findings, failures, usage, and budget without advancing the pass", async () => {
+    const { repo, plan } = await fixture();
+    const lines = Array.from({ length: 5_000 }, (_, index) => `export const value${index} = ${index};`).join("\n") + "\n";
+    await writeFile(join(repo, "src", "a.ts"), lines);
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "large implementation");
+    const agents = new FakeAgents();
+    agents.candidates = false;
+    const dependencies = { commands: new NodeCommandRunner(), agents };
+    const result = await runManagedReview({
+      cwd: repo,
+      target: { kind: "current-diff" },
+      requestedPhase: "auto",
+      effort: "normal",
+      planPath: plan,
+      maxReviewWorkUnits: 1,
+      workLimitPolicy: "partial",
+    }, dependencies);
+
+    expect(result.status).toBe("incomplete");
+    expect(result.coverage?.state).toBe("incomplete");
+    expect(result.reviewedSnapshotHash).toBe(result.coverage?.snapshotHash);
+    expect(result.coverage?.budget?.maxWeight).toBe(1);
+    expect(result.coverage?.workLimitPolicy).toBe("partial");
+    expect(result.ledger?.completedPasses).toBe(0);
+    expect(result.ledger?.lastAttempt?.failures.length).toBeGreaterThan(0);
+    expect(result.ledger?.lastAttempt?.usage.length).toBeGreaterThan(0);
+    expect(result.report).toContain("**Coverage:** incomplete");
+    const status = await getReviewStatus(repo, { commands: dependencies.commands }, { sessionId: result.sessionId! });
+    expect(status?.coverage.state).toBe("incomplete");
+    expect(formatStatusReport(status)).toContain("Coverage budget");
+    await expect(recordReviewDispositions({ cwd: repo, sessionId: result.sessionId!, reviewedSnapshotHash: result.reviewedSnapshotHash!, dispositions: [] }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
+  });
+
+  it("does not authorize a legacy unknown, stale-snapshot, or policy-mismatched coverage record", async () => {
+    const { repo, plan } = await fixture();
+    const dependencies = { commands: new NodeCommandRunner(), agents: new FakeAgents() };
+    const initial = await runManagedReview({ cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "normal", planPath: plan }, dependencies);
+    const ledgerPath = join(repo, ".git", "pi-code-review", `${initial.sessionId}.json`);
+    const original = JSON.parse(await readFile(ledgerPath, "utf8")) as Record<string, unknown>;
+
+    const legacyRecord: Record<string, unknown> = {
+      ...original,
+      phase: "approved",
+      decision: "approve",
+      completedPasses: 1,
+      awaitingAdjudication: false,
+    };
+    delete legacyRecord.coverage;
+    delete legacyRecord.coverageValidation;
+    delete legacyRecord.lastAttempt;
+    await writeFile(ledgerPath, `${JSON.stringify(legacyRecord)}\n`);
+    const legacyStatus = await getReviewStatus(repo, { commands: dependencies.commands }, { sessionId: initial.sessionId! });
+    expect(legacyStatus?.coverage.state).toBe("unknown");
+    expect(legacyStatus?.decision).toBe("incomplete");
+    await expect(recordReviewDispositions({ cwd: repo, sessionId: initial.sessionId!, reviewedSnapshotHash: initial.reviewedSnapshotHash!, dispositions: [] }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
+
+    const policyRecord = { ...original, coverage: { ...(initial.ledger?.coverage ?? {}), policy: "obsolete-review-policy" } };
+    await writeFile(ledgerPath, `${JSON.stringify(policyRecord)}\n`);
+    await expect(recordReviewDispositions({ cwd: repo, sessionId: initial.sessionId!, reviewedSnapshotHash: initial.reviewedSnapshotHash!, dispositions: [] }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
+
+    const staleRecord = { ...original, coverage: { ...(initial.ledger?.coverage ?? {}), snapshotHash: "stale-snapshot" } };
+    await writeFile(ledgerPath, `${JSON.stringify(staleRecord)}\n`);
+    await expect(recordReviewDispositions({ cwd: repo, sessionId: initial.sessionId!, reviewedSnapshotHash: initial.reviewedSnapshotHash!, dispositions: [] }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
+  });
+
+  it("replaces partial coverage on a larger-budget rerun and permits matching full coverage", async () => {
+    const { repo, plan } = await fixture();
+    const lines = Array.from({ length: 5_000 }, (_, index) => `export const value${index} = ${index};`).join("\n") + "\n";
+    await writeFile(join(repo, "src", "a.ts"), lines);
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "large implementation for rerun");
+    const agents = new FakeAgents();
+    agents.candidates = false;
+    const dependencies = { commands: new NodeCommandRunner(), agents };
+    const partial = await runManagedReview({ cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "normal", planPath: plan, maxReviewWorkUnits: 1, workLimitPolicy: "partial" }, dependencies);
+    expect(partial.coverage?.state).toBe("incomplete");
+    const full = await runManagedReview({ cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "normal", planPath: plan, maxReviewWorkUnits: 128, workLimitPolicy: "partial" }, dependencies);
+    expect(full.coverage?.state).toBe("complete");
+    expect(full.coverage?.budget?.maxWeight).toBe(128);
+    expect(full.ledger?.completedPasses).toBe(1);
+    expect(full.decision).toBe("approve");
   });
 
   it("resolves a relative plan path from the review checkout", async () => {

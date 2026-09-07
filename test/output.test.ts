@@ -273,7 +273,7 @@ describe("review output", () => {
       budgetSpentWeight: 3,
     };
     const report = formatReviewReport(snapshot, "complete", "No issues found.", [], [], coverage);
-    expect(report).toContain("INCOMPLETE REVIEW — Covered 1/20 shards");
+    expect(report).toContain("INCOMPLETE REVIEW — Covered 0/20 shards");
     expect(report).toContain("role diff");
     expect(report).toContain("reason: review work limit leaves unit uncovered");
     expect(report).toContain("Budget: spent 3 · reserved 4 · max 8 weighted units");
@@ -281,6 +281,23 @@ describe("review output", () => {
     expect(report).not.toContain("No issues found");
     expect(report).not.toMatch(/\b(?:clean|pass|approved?)\b/iu);
     expect(report).not.toContain("shard-19");
+  });
+
+  it("does not trust legacy or stale full-shard success counts", () => {
+    const coverage: ReviewCoverage = {
+      snapshotHash: snapshot.snapshotHash, state: "complete",
+      plannedUnitIds: ["diff", "contextual"], plannedUnits: ["diff", "contextual"],
+      coveredUnitIds: ["diff"], coveredUnits: ["diff"], uncoveredUnitIds: [], uncoveredUnits: [],
+      uncoveredRanges: [], uncoveredCandidates: [], plannedShardIds: ["shard-0"],
+      coveredShardIds: ["shard-0"], coveredShardCount: 1,
+    };
+    for (const evidence of [coverage, { ...coverage, requiredShardUnitIds: { "shard-0": ["diff", "contextual"] } }]) {
+      const report = formatReviewReport(snapshot, "complete", "No issues found.", [], [], evidence);
+      expect(report).toContain("INCOMPLETE REVIEW — Covered 0/1 shards");
+      expect(report).not.toContain("No issues found");
+    }
+    const complete = { ...coverage, coveredUnitIds: ["diff", "contextual"], coveredUnits: ["diff", "contextual"], requiredShardUnitIds: { "shard-0": ["diff", "contextual"] } };
+    expect(formatReviewReport(snapshot, "complete", "Finished", [], [], complete)).not.toContain("INCOMPLETE REVIEW");
   });
 
   it("does not claim a clean review when a required stage failed", () => {

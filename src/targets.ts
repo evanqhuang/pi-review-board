@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { runChecked } from "./commands.js";
+import { parseUnifiedDiff } from "./diff-shards.js";
 import { normalizeReviewPath } from "./output.js";
 import type {
   CommandResult,
@@ -37,6 +38,38 @@ function throwIfCanceled(result: CommandResult, operation: string): void {
 function asPaths(files: RawPullRequest["files"]): readonly string[] {
   if (!Array.isArray(files)) return [];
   return [...new Set(files.map((file) => asString(file?.path)).filter(Boolean))].sort();
+}
+
+function normalizedPathSet(paths: readonly string[]): readonly string[] {
+  return [...new Set(paths.map((path) => normalizeReviewPath(path)).filter(Boolean))].sort();
+}
+
+function effectiveDiffPaths(diff: string): readonly string[] {
+  const parsed = parseUnifiedDiff(diff);
+  if (parsed.malformed) {
+    throw new Error("Pull request diff is malformed or unsupported; retry the review.");
+  }
+  const paths = new Set<string>();
+  for (const file of parsed.files) {
+    // Combined diffs can hide changes from other parents behind one path, so
+    // they cannot be checked against the one-dimensional PR file scope.
+    if (file.combined) {
+      throw new Error("Pull request diff uses an unsupported combined format; retry the review.");
+    }
+    // Binary diffs and metadata-only renames/deletions are intentionally
+    // accepted, but every other unsupported parser result fails closed.
+    if (!file.supported && !file.binary && file.unsupportedReason !== "metadata-only diff has no hunks") {
+      throw new Error("Pull request diff contains an unsupported file format; retry the review.");
+    }
+    if (file.oldPath === null && file.newPath === null) {
+      throw new Error("Pull request diff contains a file without a usable path; retry the review.");
+    }
+    // PR file metadata names the destination of a rename, or the old path for a deletion.
+    const normalized = normalizeReviewPath(file.newPath ?? file.oldPath!);
+    if (!normalized) throw new Error("Pull request diff contains an empty file path; retry the review.");
+    paths.add(normalized);
+  }
+  return [...paths].sort();
 }
 
 function repositoryFromPullRequestUrl(value: string): string {
@@ -230,6 +263,16 @@ export async function captureReviewSnapshot(target: ReviewTarget, cwd: string, c
   if (target.kind === "pull-request") {
     const pullRequest = await readPullRequest(target, cwd, commands, signal);
     const diff = await runChecked(commands, "gh", ["pr", "diff", String(pullRequest.number), "--repo", pullRequest.repository], cwd, signal);
+    const diffPaths = effectiveDiffPaths(diff);
+    if (JSON.stringify(diffPaths) !== JSON.stringify(normalizedPathSet(pullRequest.changedPaths))) {
+      throw new Error("Pull request diff changed-path scope does not match captured metadata; retry the review.");
+    }
+    const afterDiff = await readPullRequest(target, cwd, commands, signal);
+    if (afterDiff.repository !== pullRequest.repository || afterDiff.number !== pullRequest.number
+      || afterDiff.baseSha !== pullRequest.baseSha || afterDiff.headSha !== pullRequest.headSha
+      || JSON.stringify(afterDiff.changedPaths) !== JSON.stringify(pullRequest.changedPaths)) {
+      throw new Error("Pull request revision or changed-path scope changed while capturing its diff; retry the review.");
+    }
     const paths = pullRequest.changedPaths;
     return {
       target: { ...target, metadata: pullRequest },

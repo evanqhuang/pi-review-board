@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hashDiffSnapshot, parseUnifiedDiff, shardDiff } from "../src/diff-shards.js";
+import { candidateDiffExcerpt, hashDiffSnapshot, parseUnifiedDiff, shardDiff } from "../src/diff-shards.js";
 
 const simpleDiff = [
   "diff --git a/src/a.ts b/src/a.ts",
@@ -117,6 +117,64 @@ describe("deterministic unified diff parsing and sharding", () => {
     expect(ranges.flatMap((range) => range.newLineNumbers).sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
     expect(shards.every((shard) => shard.supported && shard.byteLength <= 140)).toBe(true);
     expect(shards.map((shard) => shard.payload).join("\n")).not.toContain("+add-2\n ");
+  });
+
+  it("uses a resolved payload ceiling above the standalone default", () => {
+    const diff = [
+      "diff --git a/large.txt b/large.txt", "--- a/large.txt", "+++ b/large.txt",
+      "@@ -0,0 +1 @@", `+${"x".repeat(45 * 1024)}`,
+    ].join("\n");
+    expect(shardDiff(diff, "resolved").some((shard) => !shard.supported)).toBe(true);
+    const shards = shardDiff(diff, "resolved", { maxBytes: 60 * 1024 });
+    expect(shards).toHaveLength(1);
+    expect(shards[0]?.supported).toBe(true);
+    expect(shards[0]?.payload).toContain("x".repeat(45 * 1024));
+  });
+
+  it("fits serialized prompts with escaping and overhead without losing line ownership", () => {
+    const lines = Array.from({ length: 90 }, (_, index) => `+row-${index}-${'é"\\'.repeat(8)}`);
+    const diff = ["diff --git a/q b/q", "--- a/q", "+++ b/q", `@@ -0,0 +1,${lines.length} @@`, ...lines].join("\n");
+    const promptBytes = (payload: string): number => Buffer.byteLength(JSON.stringify({ guidance: "rules".repeat(30), diff: payload }), "utf8");
+    const options = { maxBytes: 2000, fitsPrompt: (shard: { payload: string }) => promptBytes(shard.payload) <= 900 };
+    const shards = shardDiff(diff, "escaped", options);
+    expect(shards).toEqual(shardDiff(diff, "escaped", options));
+    expect(shards.length).toBeGreaterThan(1);
+    expect(shards.every((shard) => shard.supported && promptBytes(shard.payload) <= 900)).toBe(true);
+    expect(shards.flatMap((shard) => shard.ranges.flatMap((range) => range.newLineNumbers))).toEqual(Array.from({ length: 90 }, (_, index) => index + 1));
+    const replayed = shards.map((shard) => shard.payload).join("\n");
+    for (const line of lines) expect(replayed.split("\n").filter((value) => value === line)).toHaveLength(1);
+  });
+
+  it("retains unsupported coverage when guidance alone cannot fit", () => {
+    const shards = shardDiff(simpleDiff, "overhead", { maxBytes: 64 * 1024, fitsPrompt: () => false });
+    expect(shards).toHaveLength(1);
+    expect(shards[0]?.supported).toBe(false);
+    expect(shards[0]?.unsupportedReason).toContain("prompt budget");
+    expect(shards[0]?.payload).toContain("+return a + b;");
+    expect(shards[0]?.ranges.flatMap((range) => range.newLineNumbers)).toEqual([1, 2, 3]);
+  });
+
+  it("merges candidate windows and preserves exact old/new source ranges", () => {
+    const excerpt = candidateDiffExcerpt(simpleDiff, "excerpt", [{ file: "src/a.ts", line: 2 }, { file: "src/a.ts", line: 3 }], 0);
+    const parsed = parseUnifiedDiff(excerpt);
+    expect(parsed.files).toHaveLength(1);
+    expect(parsed.files[0]?.supported).toBe(true);
+    expect(parsed.files[0]?.hunks).toHaveLength(1);
+    expect(parsed.files[0]?.hunks[0]?.lines.map((line) => [line.kind, line.oldLine, line.newLine])).toEqual([
+      ["deletion", 2, undefined], ["addition", undefined, 2], ["addition", undefined, 3],
+    ]);
+    expect(excerpt).not.toContain("const a = 1");
+    expect(() => candidateDiffExcerpt(simpleDiff, "excerpt", [{ file: "missing.ts", line: 2 }], 0)).toThrow("no matching source line");
+  });
+
+  it("preserves deletion coordinates and no-newline excerpt metadata", () => {
+    const diff = ["diff --git a/a b/a", "--- a/a", "+++ b/a", "@@ -8 +8 @@", "-old", "\\ No newline at end of file", "+new", "\\ No newline at end of file"].join("\n");
+    const excerpt = candidateDiffExcerpt(diff, "markers", [{ file: "a", line: 8 }], 0);
+    const lines = parseUnifiedDiff(excerpt).files[0]?.hunks[0]?.lines;
+    expect(lines?.map((line) => [line.kind, line.oldLine, line.newLine, line.noNewlineMarker])).toEqual([
+      ["deletion", 8, undefined, "\\ No newline at end of file"],
+      ["addition", undefined, 8, "\\ No newline at end of file"],
+    ]);
   });
 
   it("does not truncate a UTF-8 line that cannot fit", () => {

@@ -383,15 +383,19 @@ function coverageDetailGroups(coverage: ReviewCoverage): CoverageDetailGroup[] {
 }
 
 function coverageShardCount(coverage: ReviewCoverage, kind: "planned" | "covered"): number {
-  const count = kind === "planned"
-    ? coverage.plannedShardCount ?? coverage.plannedShardIds?.length ?? coverage.plannedShards?.length
-    : coverage.coveredShardCount ?? coverage.coveredShardIds?.length ?? coverage.coveredShards?.length;
-  return count ?? 0;
+  const shards = coverage.plannedShardIds ?? coverage.plannedShards ?? [];
+  if (kind === "planned") return coverage.plannedShardCount ?? shards.length;
+  return shards.filter((id) => {
+    const required = coverage.requiredShardUnitIds?.[id];
+    return required !== undefined && required.length > 0 && required.every((unitId) => coverage.plannedUnitIds.includes(unitId)
+      && coverage.coveredUnitIds.includes(unitId) && !coverage.uncoveredUnitIds.includes(unitId));
+  }).length;
 }
 
 function coverageIsIncomplete(coverage: ReviewCoverage | undefined): boolean {
   if (coverage === undefined) return false;
   return coverage.state !== "complete"
+    || coverageShardCount(coverage, "covered") < coverageShardCount(coverage, "planned")
     || coverage.uncoveredUnitIds.length > 0
     || coverage.uncoveredRanges.length > 0
     || (coverage.uncoveredRangeEvidence?.length ?? 0) > 0
@@ -466,7 +470,9 @@ export function formatReviewReport(
       ? "Review incomplete"
       : status === "complete"
         ? "No issues found"
-        : "No verified findings";
+        : /^Review could not start\b/u.test(cleanSummary)
+          ? "Review did not start"
+          : "No verified findings";
   const lines = [`### Code review`, "", target];
   if (incompleteCoverage && coverage !== undefined) {
     lines.push("", `INCOMPLETE REVIEW — Covered ${coverageShardCount(coverage, "covered")}/${coverageShardCount(coverage, "planned")} shards`);

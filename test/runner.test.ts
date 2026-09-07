@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_INPUT_BUDGET_BYTES } from "../src/input-budget.js";
 import { REVIEWER_RESULT_TOOLS } from "../src/reviewer-protocol.js";
+import { reviewerControlReserveBytes } from "../src/reviewer-control.js";
 import { buildReviewAgentArgs, PiReviewAgentRunner, ReviewerRunError, reviewAgentConfiguration, reviewerOutputLimits } from "../src/runner.js";
 import { validateFinder } from "../src/prompts.js";
 import type { AgentInvocation, ReviewerProgressEvent } from "../src/types.js";
@@ -58,11 +59,19 @@ function messageUpdate(input: number, output: number, context: number, delta = "
 }
 
 function toolEnd(toolName: string, details: unknown, isError = false): object {
+  const normalizedDetails = toolName === REVIEWER_RESULT_TOOLS.finder
+    && details !== null
+    && typeof details === "object"
+    && !Array.isArray(details)
+    && Object.prototype.hasOwnProperty.call(details, "candidates")
+    && !Object.prototype.hasOwnProperty.call(details, "coverageComplete")
+    ? { ...(details as Record<string, unknown>), coverageComplete: true }
+    : details;
   return {
     type: "tool_execution_end",
     toolCallId: "tool-call-id",
     toolName,
-    result: isError ? { content: [{ type: "text", text: "schema rejected sensitive details" }] } : { content: [{ type: "text", text: "generic result" }], details },
+    result: isError ? { content: [{ type: "text", text: "schema rejected sensitive details" }] } : { content: [{ type: "text", text: "generic result" }], details: normalizedDetails },
     isError,
   };
 }
@@ -128,7 +137,7 @@ process.stdin.on("end", () => {
         { ...invocation(directory), prompt: "x".repeat(1_500_000), inputBudgetBytes: 2_000_000 },
         validateFinder,
       );
-      expect(result.data).toEqual({ candidates: [] });
+      expect(result.data).toEqual({ candidates: [], coverageComplete: true });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -163,7 +172,7 @@ process.stdin.on("end", () => {
       ).catch((value: unknown) => value);
       expect(error).toBeInstanceOf(ReviewerRunError);
       expect((error as ReviewerRunError).kind).toBe("input-limit");
-      expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
+      await expect(readFile(join(directory, "attempt-count"), "utf8")).rejects.toThrow();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -220,7 +229,9 @@ process.stdin.on("end", () => {
         validateFinder,
       ).catch((value: unknown) => value);
       expect(error).toBeInstanceOf(ReviewerRunError);
-      expect((error as ReviewerRunError).kind).toBe("input-limit");
+      expect((error as ReviewerRunError).kind).toBe("retry-budget");
+      expect((error as ReviewerRunError).message).toContain("retry was denied by the retry budget");
+      expect((error as ReviewerRunError).diagnostics.retryDenial).toBe("scheduler-admission-denied");
       expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -240,6 +251,54 @@ process.stdin.on("end", () => {
     }
   });
 
+  it("does not count cumulative streaming snapshots against protocol retry eligibility", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-semantic-stream-") );
+    const repeatedSnapshots = Array.from({ length: 160 }, () => messageUpdate(1, 1, 2, "repeated transport snapshot ".repeat(80)));
+    const executable = await countScript(directory, [turnStart(), ...repeatedSnapshots, messageEnd(1, 1, 2, "short completed content")], [turnStart(), toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] })]);
+    try {
+      const result = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder);
+      expect(result.data).toEqual({ candidates: [], coverageComplete: true });
+      expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("2");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("counts completed reasoning and tool-call content for protocol retry eligibility", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-semantic-content-"));
+    const assistant = messageEnd(1, 1, 2) as { type: string; message: Record<string, unknown> };
+    assistant.message.content = [{ type: "thinking", thinking: "reasoning ".repeat(8 * 1024) }, {
+      type: "toolCall",
+      id: "call-1",
+      name: "read",
+      arguments: { path: "x".repeat(8 * 1024) },
+    }];
+    const executable = await countScript(directory, [turnStart(), assistant], [turnStart(), toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] })]);
+    try {
+      const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(ReviewerRunError);
+      expect((error as ReviewerRunError).kind).toBe("missing-result");
+      expect((error as ReviewerRunError).diagnostics.semanticBytes).toBeGreaterThan(reviewerOutputLimits.protocolRetryBytes);
+      expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("counts malformed expected result details before deciding whether recovery is safe", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-semantic-details-"));
+    const executable = await countScript(directory, [turnStart(), toolEnd(REVIEWER_RESULT_TOOLS.finder, "malformed details ".repeat(8 * 1024))], [turnStart(), toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] })]);
+    try {
+      const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(ReviewerRunError);
+      expect((error as ReviewerRunError).kind).toBe("malformed-result");
+      expect((error as ReviewerRunError).diagnostics.semanticBytes).toBeGreaterThan(reviewerOutputLimits.protocolRetryBytes);
+      expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("does not retry a long protocol miss", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-long-miss-"));
     const executable = await countScript(directory, [turnStart(), messageEnd(1, 1, 2, "x".repeat(64 * 1024 + 1))], [turnStart(), toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [candidate] })]);
@@ -247,6 +306,7 @@ process.stdin.on("end", () => {
       const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
       expect(error).toBeInstanceOf(ReviewerRunError);
       expect((error as ReviewerRunError).kind).toBe("missing-result");
+      expect((error as ReviewerRunError).diagnostics.semanticBytes).toBeGreaterThan(reviewerOutputLimits.protocolRetryBytes);
       expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
     } finally {
       await rm(directory, { recursive: true, force: true });

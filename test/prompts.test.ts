@@ -52,9 +52,15 @@ const snapshot: ReviewSnapshot = {
   snapshotHash: "hash",
 };
 
+function reviewPayload(prompt: string): Record<string, any> {
+  return JSON.parse(prompt.split("<review-input>\n")[1]!.split("\n</review-input>")[0]!) as Record<string, any>;
+}
+
 describe("bounded role prompt and result contracts", () => {
   it("requires a semantic root-cause key, changed line, suspicion, and context flag", () => {
-    expect(() => validateFinder({ candidates: [{
+    expect(() => validateFinder({ candidates: [] })).toThrow("coverageComplete");
+    expect(() => validateFinder({ coverageComplete: false, candidates: [] })).toThrow("incompleteReason");
+    expect(() => validateFinder({ coverageComplete: true, candidates: [{
       id: "candidate-1",
       file: "src/cache.ts",
       line: 12,
@@ -65,7 +71,7 @@ describe("bounded role prompt and result contracts", () => {
       severity: "high",
       needsContext: false,
     }] })).toThrow("rootCauseKey");
-    expect(() => validateFinder({ candidates: [{
+    expect(() => validateFinder({ coverageComplete: true, candidates: [{
       id: "candidate-1",
       rootCauseKey: "cache:cold-refresh-skipped",
       file: "src/cache.ts",
@@ -77,7 +83,7 @@ describe("bounded role prompt and result contracts", () => {
       severity: "low",
       needsContext: false,
     }] })).toThrow("severity");
-    expect(validateFinder({ candidates: [{
+    expect(validateFinder({ coverageComplete: true, candidates: [{
       id: "candidate-1",
       rootCauseKey: "cache:cold-refresh-skipped",
       file: "src/cache.ts",
@@ -89,6 +95,37 @@ describe("bounded role prompt and result contracts", () => {
       severity: "high",
       needsContext: true,
     }] }).candidates[0]?.needsContext).toBe(true);
+    const incomplete = validateFinder({
+      coverageComplete: false,
+      incompleteReason: "The bounded evidence omitted direct consumers.",
+      candidates: [{
+        id: "candidate-1",
+        rootCauseKey: "cache:cold-refresh-skipped",
+        file: "src/cache.ts",
+        line: 12,
+        summary: "Skips cache refresh",
+        failureScenario: "A cold cache returns stale data",
+        evidence: "The changed branch returns before refresh",
+        category: "correctness",
+        severity: "high",
+        needsContext: false,
+      }],
+    });
+    expect(incomplete.coverageComplete).toBe(false);
+    expect(incomplete.candidates).toHaveLength(1);
+  });
+
+  it("labels bounded validator excerpts without dropping the candidate line", () => {
+    const additions = Array.from({ length: 300 }, (_, index) => `+changed-${index}-${"x".repeat(300)}`);
+    const diff = ["diff --git a/src/cache.ts b/src/cache.ts", "--- a/src/cache.ts", "+++ b/src/cache.ts", "@@ -0,0 +1,300 @@", ...additions].join("\n");
+    const prompt = buildValidatorPrompt(firstCandidate, { ...snapshot, diff }, [], "", { inputBudgetBytes: 10_000 });
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(10_000);
+    const payload = JSON.parse(prompt.split("<review-input>\n")[1]!.split("\n</review-input>")[0]!);
+    expect(payload.candidate).toEqual(firstCandidate);
+    expect(payload.evidenceScope).toContain("not the full original changed hunk");
+    expect(payload.exactChangedHunk).toContain(additions[11]);
+    expect(payload.exactChangedHunk).not.toContain(additions[299]);
+    expect(prompt).toContain("Return PLAUSIBLE rather than CONFIRMED");
   });
 
   it("uses one-candidate validation instead of a batch contract", () => {
@@ -140,6 +177,85 @@ describe("bounded role prompt and result contracts", () => {
       expect(prompt).toContain("followUpConstraints");
       expect(prompt).toContain("nearest");
     }
+  });
+
+  it("carries full review scope through shard and validator evidence", () => {
+    const scopedSnapshot: ReviewSnapshot = {
+      ...snapshot,
+      changedPaths: ["src/cache.ts"],
+      reviewChangedPaths: ["docs/consumer.md", "src/cache.ts", "docs/consumer.md"],
+    };
+    const contextual = buildContextualBugPrompt(scopedSnapshot);
+    const contextualPayload = reviewPayload(contextual);
+    expect(contextualPayload.reviewScope).toEqual({
+      fullReviewChangedPaths: ["docs/consumer.md", "src/cache.ts"],
+      evidenceChangedPaths: ["src/cache.ts"],
+      scopeComplete: true,
+      sourceRevision: "local working-tree context",
+    });
+    const validator = buildValidatorPrompt(firstCandidate, {
+      ...scopedSnapshot,
+      diff: [
+        "diff --git a/src/cache.ts b/src/cache.ts",
+        "--- a/src/cache.ts",
+        "+++ b/src/cache.ts",
+        "@@ -0,0 +1,300 @@",
+        ...Array.from({ length: 300 }, (_, index) => `+changed-${index}-${"x".repeat(100)}`),
+      ].join("\n"),
+    }, [], "", { inputBudgetBytes: 8_000 });
+    const validatorPayload = reviewPayload(validator);
+    expect(validatorPayload.evidenceScope).toContain("not the full original changed hunk");
+    expect(validatorPayload.reviewScope.fullReviewChangedPaths).toEqual(["docs/consumer.md", "src/cache.ts"]);
+    expect(validatorPayload.reviewScope.evidenceChangedPaths).toEqual(["src/cache.ts"]);
+  });
+
+  it("keeps complete scope when optional guidance summary is compacted", () => {
+    const prompt = buildGuidancePrompt({
+      ...snapshot,
+      changedPaths: ["src/cache.ts"],
+      reviewChangedPaths: ["docs/consumer.md", "src/cache.ts"],
+    }, [], "summary-😀".repeat(5000), 4_000);
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(4_000);
+    const payload = reviewPayload(prompt);
+    expect(payload.reviewScope.scopeComplete).toBe(true);
+    expect(payload.reviewScope.fullReviewChangedPaths).toEqual(["docs/consumer.md", "src/cache.ts"]);
+    expect(payload.summary).toBe("[omitted optional summary to fit input budget]");
+  });
+
+  it("uses an explicit unknown scope instead of permitting global absence claims", () => {
+    const manifest = Array.from({ length: 400 }, (_, index) => `docs/generated/consumer-${index.toString().padStart(4, "0")}.md`);
+    const prompt = buildContextualBugPrompt({
+      ...snapshot,
+      changedPaths: ["src/cache.ts"],
+      reviewChangedPaths: manifest,
+    }, [], "", 4_000);
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(4_000);
+    const payload = reviewPayload(prompt);
+    expect(payload.reviewScope).toEqual({
+      fullReviewChangedPaths: null,
+      evidenceChangedPaths: ["src/cache.ts"],
+      scopeComplete: false,
+      sourceRevision: "local working-tree context",
+    });
+    expect(prompt).toContain("Do not make global absence claims");
+    expect(prompt).not.toContain("global absence claims are permitted");
+  });
+
+  it("uses the pinned source root only for guidance applicability and relative paths", () => {
+    const prompt = buildGuidancePrompt({
+      ...snapshot,
+      cwd: "/original/repository",
+      sourceCwd: "/tmp/pinned-review-tree",
+      changedPaths: ["src/cache.ts"],
+    }, [{
+      path: "src/cache.ts",
+      guidance: [{ path: "/tmp/pinned-review-tree/AGENTS.md", content: "pinned cache rule" }],
+    }]);
+    const payload = reviewPayload(prompt);
+    expect(payload.guidance.files).toEqual([{ path: "AGENTS.md", content: "pinned cache rule" }]);
+    expect(payload.guidance.pathToFiles).toEqual([{ path: "src/cache.ts", files: ["AGENTS.md"] }]);
+    expect(prompt).not.toContain("/tmp/pinned-review-tree");
+    expect(payload.reviewScope.sourceRevision).toBe("local working-tree context");
   });
 
   it("scopes nested guidance to its covered changed file while repeating root guidance", () => {

@@ -192,16 +192,30 @@ function cleanCoverage(coverage: ReviewCoverage | undefined, fallbackSnapshotHas
   const planned = cleanIds(coverage.plannedUnitIds);
   const covered = cleanIds(coverage.coveredUnitIds);
   const uncovered = cleanIds(coverage.uncoveredUnitIds);
+  const rangeEvidencePresent = coverage.uncoveredRanges.length > 0 || (coverage.uncoveredRangeEvidence?.length ?? 0) > 0;
+  const allRangeEvidence = [...coverage.uncoveredRanges, ...(coverage.uncoveredRangeEvidence ?? [])];
   const evidenceTruncated = coverage.plannedUnitIds.length > MAX_PERSISTED_COVERAGE_ITEMS
     || coverage.coveredUnitIds.length > MAX_PERSISTED_COVERAGE_ITEMS
     || coverage.uncoveredUnitIds.length > MAX_PERSISTED_COVERAGE_ITEMS
+    || coverage.uncoveredRanges.length > MAX_PERSISTED_COVERAGE_RANGES
+    || (coverage.uncoveredRangeEvidence?.length ?? 0) > MAX_PERSISTED_COVERAGE_RANGES
     || coverage.uncoveredCandidates.length > MAX_PERSISTED_COVERAGE_CANDIDATES
     || (coverage.unvalidatedCandidates?.length ?? 0) > MAX_PERSISTED_COVERAGE_CANDIDATES;
   const attempted = coverage.attemptedUnitIds === undefined ? undefined : cleanIds(coverage.attemptedUnitIds);
   const plannedShards = coverage.plannedShardIds === undefined && coverage.plannedShards === undefined ? undefined : cleanIds(coverage.plannedShardIds ?? coverage.plannedShards);
-  const coveredShards = coverage.coveredShardIds === undefined && coverage.coveredShards === undefined ? undefined : cleanIds(coverage.coveredShardIds ?? coverage.coveredShards);
-  const uncoveredShards = coverage.uncoveredShardIds === undefined && coverage.uncoveredShards === undefined ? undefined : cleanIds(coverage.uncoveredShardIds ?? coverage.uncoveredShards);
-  const ranges = coverage.uncoveredRanges.slice(0, MAX_PERSISTED_COVERAGE_RANGES).map((range) => ({
+  const requiredShardUnitIds = plannedShards === undefined ? undefined : Object.fromEntries(plannedShards.map((id) => [
+    id, cleanIds(coverage.requiredShardUnitIds?.[id] ?? []),
+  ]));
+  const rangeShardIds = new Set(allRangeEvidence.flatMap((range) => range.shardId === undefined ? [] : [range.shardId]));
+  const coveredShards = plannedShards?.filter((id) => {
+    const required = requiredShardUnitIds![id]!;
+    return required.length > 0 && required.every((unitId) => planned.includes(unitId) && covered.includes(unitId) && !uncovered.includes(unitId))
+      && !rangeShardIds.has(id);
+  });
+  const uncoveredShards = plannedShards?.filter((id) => !coveredShards!.includes(id));
+  const incompleteShardScope = (uncoveredShards?.length ?? 0) > 0;
+  const sourceRanges = coverage.uncoveredRanges.length > 0 ? coverage.uncoveredRanges : coverage.uncoveredRangeEvidence ?? [];
+  const ranges = sourceRanges.slice(0, MAX_PERSISTED_COVERAGE_RANGES).map((range) => ({
     ...(range.unitId ? { unitId: text(range.unitId, 300) } : {}),
     ...(range.shardId ? { shardId: text(range.shardId, 300) } : {}),
     ...(range.role ? { role: text(range.role, 100) } : {}),
@@ -210,8 +224,9 @@ function cleanCoverage(coverage: ReviewCoverage | undefined, fallbackSnapshotHas
     ...(range.newRange ? { newRange: range.newRange } : {}),
     reason: text(range.reason),
   }));
-  const candidates = coverage.uncoveredCandidates.slice(0, MAX_PERSISTED_COVERAGE_CANDIDATES).map(cleanCoverageCandidate);
-  const unvalidated = (coverage.unvalidatedCandidates ?? candidates).slice(0, MAX_PERSISTED_COVERAGE_CANDIDATES).map(cleanCoverageCandidate);
+  const sourceCandidates = coverage.uncoveredCandidates.length > 0 ? coverage.uncoveredCandidates : coverage.unvalidatedCandidates ?? [];
+  const candidates = sourceCandidates.slice(0, MAX_PERSISTED_COVERAGE_CANDIDATES).map(cleanCoverageCandidate);
+  const unvalidated = (coverage.unvalidatedCandidates ?? sourceCandidates).slice(0, MAX_PERSISTED_COVERAGE_CANDIDATES).map(cleanCoverageCandidate);
   const attempts = coverage.attempts
     ? Object.fromEntries(Object.entries(coverage.attempts).slice(0, MAX_PERSISTED_COVERAGE_ITEMS).map(([id, count]) => [text(id, 300), Number.isSafeInteger(count) && count >= 0 ? count : 0]))
     : undefined;
@@ -227,7 +242,8 @@ function cleanCoverage(coverage: ReviewCoverage | undefined, fallbackSnapshotHas
         spentWeight: budgetValues[2] as number,
       }
     : undefined;
-  const state: ReviewCoverage["state"] = evidenceTruncated
+  const state: ReviewCoverage["state"] = evidenceTruncated || incompleteShardScope || rangeEvidencePresent
+    || candidates.length > 0 || unvalidated.length > 0
     ? "incomplete"
     : COVERAGE_STATES.has(coverage.state) ? coverage.state : "unknown";
   return {
@@ -251,6 +267,7 @@ function cleanCoverage(coverage: ReviewCoverage | undefined, fallbackSnapshotHas
     uncoveredRangeEvidence: ranges,
     uncoveredCandidates: candidates,
     unvalidatedCandidates: unvalidated,
+    ...(requiredShardUnitIds === undefined ? {} : { requiredShardUnitIds }),
     ...(plannedShards === undefined ? {} : { plannedShardIds: plannedShards, plannedShards, plannedShardCount: plannedShards.length }),
     ...(coveredShards === undefined ? {} : { coveredShardIds: coveredShards, coveredShards, coveredShardCount: coveredShards.length }),
     ...(uncoveredShards === undefined ? {} : { uncoveredShardIds: uncoveredShards, uncoveredShards, uncoveredShardCount: uncoveredShards.length }),
@@ -290,6 +307,17 @@ function coverageIssues(
   if (coverage.plannedUnitIds.length === 0) issues.push("coverage contains no planned work units");
   if (coverage.uncoveredUnitIds.length > 0 || coverage.uncoveredUnits.length > 0
     || coverage.plannedUnitIds.some((id) => !coverage.coveredUnitIds.includes(id))) issues.push("coverage has uncovered work units");
+  if (coverage.uncoveredRanges.length > 0 || (coverage.uncoveredRangeEvidence?.length ?? 0) > 0) {
+    issues.push("coverage has uncovered range evidence");
+  }
+  for (const shardId of coverage.plannedShardIds ?? []) {
+    const required = coverage.requiredShardUnitIds?.[shardId];
+    if (!required?.length || required.some((unitId) => !coverage.plannedUnitIds.includes(unitId)
+      || !coverage.coveredUnitIds.includes(unitId) || coverage.uncoveredUnitIds.includes(unitId))) {
+      issues.push("coverage lacks complete required-role evidence for a shard");
+      break;
+    }
+  }
   if (coverage.uncoveredCandidates.length > 0) issues.push("coverage has uncovered candidates");
   if ((coverage.unvalidatedCandidates?.length ?? 0) > 0) issues.push("coverage has unvalidated candidates");
   return [...new Set(issues)];
@@ -334,7 +362,8 @@ function cleanFailures(failures: readonly { readonly stage: string; readonly mes
 }
 
 function currentCoverage(ledger: Ledger): ReviewCoverage {
-  return ledger.coverage ?? unknownCoverage(ledger.lastReviewedSnapshotHash ?? "", "coverage was not recorded by this legacy ledger");
+  return ledger.coverage ? cleanCoverage(ledger.coverage, ledger.lastReviewedSnapshotHash ?? "", "")
+    : unknownCoverage(ledger.lastReviewedSnapshotHash ?? "", "coverage was not recorded by this legacy ledger");
 }
 
 function ledgerCoverageIssues(ledger: Ledger): string[] {

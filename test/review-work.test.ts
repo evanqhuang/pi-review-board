@@ -16,7 +16,7 @@ const snapshot = {
 
 describe("deterministic review work and coverage", () => {
   it("exposes bounded role weights and plans against an immutable snapshot", () => {
-    expect(DEFAULT_MAX_REVIEW_WORK_UNITS).toBe(32);
+    expect(DEFAULT_MAX_REVIEW_WORK_UNITS).toBe(128);
     expect(MAX_REVIEW_WORK_UNITS).toBe(128);
     expect(REVIEW_WORK_UNIT_WEIGHTS).toEqual({ summary: 1, diff: 1, guidance: 1, contextual: 2, integration: 2, validator: 1 });
     const first = planReviewWork(snapshot, { roles: ["summary", "diff", "validator"], maxReviewWorkUnits: 8 });
@@ -96,7 +96,7 @@ describe("deterministic review work and coverage", () => {
     expect(updated.coverage.policyVersion).toBe(1);
     expect(updated.coverage.mode).toBe("single");
     expect(updated.coverage.plannedShardCount).toBe(1);
-    expect(updated.coverage.coveredShardCount).toBe(1);
+    expect(updated.coverage.coveredShardCount).toBe(0);
     expect(updated.coverage.budget).toEqual({ maxWeight: 8, reservedWeight: 2, spentWeight: 1 });
     expect(updated.coverage.attemptedUnitIds).toEqual([diffUnit.id]);
     expect(updated.coverage.attempts?.[diffUnit.id]).toBe(1);
@@ -104,9 +104,37 @@ describe("deterministic review work and coverage", () => {
     expect(updated.coverage.uncoveredRangeEvidence).toContainEqual({ unitId: summaryUnit.id, reason: "summary omitted" });
     expect(updated.coverage.state).toBe("incomplete");
     expect(updated.coverage.uncoveredUnits).toContain(summaryUnit.id);
-    const complete = applyReviewWorkCoverage(updated, { coveredUnitIds: [summaryUnit.id], attemptedUnitIds: [summaryUnit.id] });
-    expect(complete.coverage.state).toBe("complete");
-    expect(complete.coverage.budget?.spentWeight).toBe(2);
+    const stillIncomplete = applyReviewWorkCoverage(updated, { coveredUnitIds: [summaryUnit.id], attemptedUnitIds: [summaryUnit.id] });
+    expect(stillIncomplete.coverage.state).toBe("incomplete");
+    expect(stillIncomplete.coverage.budget?.spentWeight).toBe(2);
+  });
+
+  it("counts all required roles rather than seven successful diff shards", () => {
+    const diff = Array.from({ length: 8 }, (_, index) => snapshot.diff.replaceAll("a.ts", `file-${index}.ts`)).join("\n");
+    const source = { snapshotHash: "eight-shards", diff };
+    const shards = planReviewWork(source, { maxShardBytes: 100 }).shards;
+    const plan = planReviewWork(source, { shards, manifest: shards.flatMap((shard) => [
+      { role: "guidance" as const, shardIds: [shard.id] }, { role: "contextual" as const, shardIds: [shard.id] },
+    ]) });
+    expect(plan.shards).toHaveLength(8);
+    const failed = plan.units.filter((unit) => {
+      const index = plan.shards.findIndex((shard) => unit.shardIds.includes(shard.id));
+      return unit.role === "diff" && index === 0 || unit.role === "guidance" && index === 5
+        || unit.role === "contextual" && [0, 1, 3, 5].includes(index);
+    }).map((unit) => unit.id);
+    expect(failed).toHaveLength(6);
+    const updated = applyReviewWorkCoverage(plan, {
+      coveredUnitIds: plan.units.filter((unit) => !failed.includes(unit.id)).map((unit) => unit.id),
+      uncoveredUnitIds: failed,
+    });
+    expect(updated.units.filter((unit) => unit.role === "diff" && unit.status === "covered")).toHaveLength(7);
+    expect(updated.coverage.coveredShardCount).toBe(4);
+    expect(updated.coverage.uncoveredShardCount).toBe(4);
+    expect(updated.coverage.state).toBe("incomplete");
+    for (const id of updated.coverage.coveredShardIds!) {
+      expect(updated.coverage.requiredShardUnitIds![id]).toHaveLength(3);
+      expect(updated.coverage.requiredShardUnitIds![id]!.every((unitId) => updated.coverage.coveredUnitIds.includes(unitId))).toBe(true);
+    }
   });
 
   it("keeps rejected and unsupported preflight plans incomplete", () => {
@@ -152,7 +180,38 @@ describe("deterministic review work and coverage", () => {
     expect(updated.coverage.coveredUnits).toContain(diffUnit.id);
     expect(updated.coverage.uncoveredCandidates).toEqual([candidate]);
     expect(plan.units.find((unit) => unit.id === diffUnit.id)?.attempts).toBe(0);
-    const complete = updateReviewCoverage(updated.coverage, { coveredUnitIds: [plan.units.find((unit) => unit.role === "summary")?.id ?? ""] });
-    expect(complete.state).toBe("complete");
+    const stillIncomplete = updateReviewCoverage(updated.coverage, { coveredUnitIds: [plan.units.find((unit) => unit.role === "summary")?.id ?? ""] });
+    expect(stillIncomplete.state).toBe("incomplete");
+  });
+
+  it("does not authorize all-covered work while range or candidate evidence remains", () => {
+    const plan = planReviewWork(snapshot, { maxReviewWorkUnits: 8 });
+    const unit = plan.units[0];
+    expect(unit).toBeDefined();
+    if (unit === undefined) return;
+    const shardId = unit.shardIds[0];
+    expect(shardId).toBeDefined();
+    if (shardId === undefined) return;
+    const range = { unitId: unit.id, shardId, reason: "range remains unreviewed" };
+    const allCovered = plan.units.map((candidate) => candidate.id);
+    const withRanges = applyReviewWorkCoverage(plan, { coveredUnitIds: allCovered, uncoveredRanges: [range] });
+    expect(withRanges.coverage.state).toBe("incomplete");
+    expect(withRanges.coverage.coveredUnitIds).toEqual(allCovered);
+    expect(withRanges.coverage.coveredShardCount).toBe(0);
+    expect(withRanges.coverage.uncoveredShardIds).toContain(shardId);
+
+    const withRangeAlias = applyReviewWorkCoverage(plan, { coveredUnitIds: allCovered, uncoveredRanges: [], uncoveredRangeEvidence: [range] });
+    expect(withRangeAlias.coverage.state).toBe("incomplete");
+    expect(withRangeAlias.coverage.uncoveredShardCount).toBe(1);
+
+    const withCandidate = applyReviewWorkCoverage(plan, {
+      coveredUnitIds: allCovered,
+      uncoveredCandidates: [{ id: "candidate-1", unitId: unit.id, reason: "candidate remains unvalidated" }],
+    });
+    expect(withCandidate.coverage.state).toBe("incomplete");
+
+    const standalone = updateReviewCoverage(plan.coverage, { coveredUnitIds: allCovered, uncoveredRangeEvidence: [range] });
+    expect(standalone.state).toBe("incomplete");
+    expect(standalone.coveredShardCount).toBe(0);
   });
 });

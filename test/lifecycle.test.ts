@@ -62,12 +62,13 @@ class FakeAgents implements ReviewAgentRunner {
       const candidateId = /"id":"([^"]+)"/u.exec(invocation.prompt)?.[1] ?? "missing";
       value = { candidateId, confidence: 95, verification: "The changed line deterministically returns the wrong value", disposition: "CONFIRMED" };
     } else value = this.candidates ? {
+      coverageComplete: true,
       candidates: [{
         id: "candidate-1", rootCauseKey: "exports:wrong-value", file: "src/a.ts", line: 1,
         summary: this.candidateSummary, failureScenario: "Importing the module returns the wrong value",
         evidence: "The changed line sets the incorrect constant", category: this.invalidCategory ? "" : "correctness", severity: "high", needsContext: false,
       }],
-    } : { candidates: [] };
+    } : { candidates: [], coverageComplete: true };
     return Promise.resolve({ data: validate(value), usage: { role: invocation.role, turns: 1, inputTokens: 1, outputTokens: 1, contextTokens: 2 } });
   }
 }
@@ -158,6 +159,14 @@ describe("managed review lifecycle", () => {
     expect(legacyStatus?.decision).toBe("incomplete");
     await expect(recordReviewDispositions({ cwd: repo, sessionId: initial.sessionId!, reviewedSnapshotHash: initial.reviewedSnapshotHash!, dispositions: [] }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
 
+    const legacyScope = { ...(initial.ledger?.coverage ?? {}) };
+    delete legacyScope.requiredShardUnitIds;
+    await writeFile(ledgerPath, `${JSON.stringify({ ...original, coverage: legacyScope })}\n`);
+    const legacyScopeStatus = await getReviewStatus(repo, { commands: dependencies.commands }, { sessionId: initial.sessionId! });
+    expect(legacyScopeStatus?.coverage.state).toBe("incomplete");
+    expect(legacyScopeStatus?.coverage.coveredShardCount).toBe(0);
+    await expect(recordReviewDispositions({ cwd: repo, sessionId: initial.sessionId!, reviewedSnapshotHash: initial.reviewedSnapshotHash!, dispositions: [] }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
+
     const policyRecord = { ...original, coverage: { ...(initial.ledger?.coverage ?? {}), policy: "obsolete-review-policy" } };
     await writeFile(ledgerPath, `${JSON.stringify(policyRecord)}\n`);
     await expect(recordReviewDispositions({ cwd: repo, sessionId: initial.sessionId!, reviewedSnapshotHash: initial.reviewedSnapshotHash!, dispositions: [] }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
@@ -165,6 +174,41 @@ describe("managed review lifecycle", () => {
     const staleRecord = { ...original, coverage: { ...(initial.ledger?.coverage ?? {}), snapshotHash: "stale-snapshot" } };
     await writeFile(ledgerPath, `${JSON.stringify(staleRecord)}\n`);
     await expect(recordReviewDispositions({ cwd: repo, sessionId: initial.sessionId!, reviewedSnapshotHash: initial.reviewedSnapshotHash!, dispositions: [] }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
+  });
+
+  it("rejects persisted approval when stale complete coverage contains range evidence", async () => {
+    const { repo, plan } = await fixture();
+    const agents = new FakeAgents();
+    agents.candidates = false;
+    const dependencies = { commands: new NodeCommandRunner(), agents };
+    const approved = await runManagedReview({ cwd: repo, target: { kind: "current-diff" }, requestedPhase: "auto", effort: "normal", planPath: plan }, dependencies);
+    expect(approved.decision).toBe("approve");
+    const ledgerPath = join(repo, ".git", "pi-code-review", `${approved.sessionId}.json`);
+    const original = JSON.parse(await readFile(ledgerPath, "utf8")) as Record<string, unknown>;
+    const originalCoverage = { ...(original.coverage as Record<string, unknown>) };
+    const range = { unitId: approved.coverage?.plannedUnitIds[0], reason: "persisted range evidence" };
+
+    for (const field of ["uncoveredRanges", "uncoveredRangeEvidence"] as const) {
+      await writeFile(ledgerPath, `${JSON.stringify({
+        ...original,
+        coverage: {
+          ...originalCoverage,
+          state: "complete",
+          uncoveredRanges: field === "uncoveredRanges" ? [range] : [],
+          uncoveredRangeEvidence: field === "uncoveredRangeEvidence" ? [range] : [],
+        },
+      })}\n`);
+      const status = await getReviewStatus(repo, { commands: dependencies.commands }, { sessionId: approved.sessionId! });
+      expect(status?.coverage.state).toBe("incomplete");
+      expect(status?.coverageValidation.issues).toContain("coverage has uncovered range evidence");
+      expect(status?.decision).toBe("incomplete");
+      await expect(recordReviewDispositions({
+        cwd: repo,
+        sessionId: approved.sessionId!,
+        reviewedSnapshotHash: approved.reviewedSnapshotHash!,
+        dispositions: [],
+      }, dependencies)).rejects.toThrow("coverage cannot authorize approval");
+    }
   });
 
   it("replaces partial coverage on a larger-budget rerun and permits matching full coverage", async () => {

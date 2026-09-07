@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { roleInvocation, runCodeReview } from "../src/pipeline.js";
 import { MAX_DIFF_SHARD_BYTES } from "../src/diff-shards.js";
+import { reviewerControlReserveBytes } from "../src/reviewer-control.js";
+import { ReviewerRunError } from "../src/runner.js";
+import { REVIEWER_RESULT_TOOLS, REVIEWER_RETRY_SUFFIX } from "../src/reviewer-protocol.js";
 import { DEFAULT_INPUT_BUDGET_BYTES, DEFAULT_RESERVED_TOKENS } from "../src/input-budget.js";
 import type { ReviewRoleConfig } from "../src/routing.js";
 import type { AgentInvocation, AgentResult, AgentUsage, CommandResult, CommandRunner, PullRequestMetadata, ReviewAgentRunner, ReviewerProgressEvent, ReviewProgressEvent, ReviewSnapshot } from "../src/types.js";
@@ -139,6 +142,7 @@ class RecordingAgents implements ReviewAgentRunner {
   public summaryText = "A bounded change summary";
   public verdict: { disposition: "CONFIRMED" | "PLAUSIBLE" | "REFUTED"; confidence: number } = { disposition: "CONFIRMED", confidence: 95 };
   public failRoles = new Set<string>();
+  public incompleteRoles = new Set<string>();
   public retryRoles = new Set<string>();
   public maxActiveValidators = 0;
   private activeValidators = 0;
@@ -169,7 +173,8 @@ class RecordingAgents implements ReviewAgentRunner {
         severity: "high",
         needsContext: this.candidateNeedsContext && invocation.role === "diff-only-bug",
       }));
-      value = { candidates };
+      value = { candidates, coverageComplete: !this.incompleteRoles.has(invocation.role),
+        ...(this.incompleteRoles.has(invocation.role) ? { incompleteReason: "Assigned context remains unchecked." } : {}) };
     }
     const data = validate(value);
     const retried = this.retryRoles.has(invocation.role);
@@ -212,7 +217,13 @@ class RetryAdmissionAgents extends RecordingAgents {
 }
 
 function dependencies(agents: RecordingAgents, commands = new NoopCommands()) {
-  return { commands, agents };
+  return { commands, agents, prepareSourceView: async (source: ReviewSnapshot) => {
+    if (source.target.kind !== "pull-request") return { root: source.cwd, dispose: async () => {} };
+    const root = await mkdtemp(join(tmpdir(), "review-publication-source-"));
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/a.ts"), "context\nexport const value = 2;\n");
+    return { root, dispose: async () => { await rm(root, { recursive: true, force: true }); } };
+  } };
 }
 
 describe("runCodeReview deterministic topology", () => {
@@ -241,7 +252,7 @@ describe("runCodeReview deterministic topology", () => {
       inputBudgetBytes: 12_345,
       reservedTokens: 7_000,
       contextBudget: 64_000,
-      prompt: "prompt-12345",
+      prompt: `prompt-${12_345 - reviewerControlReserveBytes(REVIEWER_RESULT_TOOLS.finder) - Buffer.byteLength(`\n\n${REVIEWER_RETRY_SUFFIX}`)}`,
     });
   });
 
@@ -277,6 +288,130 @@ describe("runCodeReview deterministic topology", () => {
     expect(agents.calls.filter((call) => call.role === "summary")).toHaveLength(0);
     expect(agents.calls.filter((call) => call.role === "diff-only-bug").length).toBeGreaterThan(1);
     expect(agents.calls.filter((call) => call.role === "validator")).toHaveLength(0);
+  });
+
+  it("reviews a 71-file diff with guidance under the default work budget", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-review-scale-"));
+    try {
+      await writeFile(join(cwd, "AGENTS.md"), "Preserve validation and public contracts.\n");
+      const paths = Array.from({ length: 71 }, (_, index) => `src/auth/part-${index}.ts`);
+      const diff = paths.map((path, index) => fileDiff(path, Array.from({ length: 45 }, (_, line) => `change-${index}-${line}-${"x".repeat(90)}`))).join("");
+      const options = { cwd, target, comment: false, effort: "normal" as const, snapshot: { ...snapshot(diff, paths), cwd } };
+      const agents = new ControlledAgents();
+      agents.candidateCount = 0;
+      const deps = { ...dependencies(agents), resolveModelContextWindow: () => 64_000 };
+      const result = await runCodeReview(options, deps);
+      expect(result.status).toBe("complete");
+      expect(result.coverage).toMatchObject({ mode: "sharded", state: "complete", budgetMaxWeight: 128 });
+      expect(result.coverage?.budget?.spentWeight).toBeGreaterThan(32);
+      expect(agents.maxActiveReviewers).toBeLessThanOrEqual(4);
+      expect(agents.calls.some((call) => call.role === "guidance-a")).toBe(true);
+      expect(agents.calls.every((call) => Buffer.byteLength(call.prompt, "utf8") <= call.inputBudgetBytes!)).toBe(true);
+      const reviewedDiff = agents.calls.filter((call) => call.role === "diff-only-bug").map((call) => JSON.parse(call.prompt.split("<review-input>\n")[1]!.split("\n</review-input>")[0]!).diff as string).join("\n");
+      for (let file = 0; file < 71; file += 1) {
+        for (let line = 0; line < 45; line += 1) expect(reviewedDiff).toContain(`+change-${file}-${line}-${"x".repeat(90)}`);
+      }
+      const rejectedAgents = new RecordingAgents();
+      const rejected = await runCodeReview({ ...options, maxReviewWorkUnits: 32 }, { ...dependencies(rejectedAgents), resolveModelContextWindow: () => 64_000 });
+      expect(rejected.status).toBe("incomplete");
+      expect(rejectedAgents.calls).toHaveLength(0);
+      expect(rejected.report).toContain("Review did not start");
+      expect(rejected.report).toContain("weighted units required");
+      expect(rejected.report).toContain("limit 32");
+      expect(rejected.report).toContain("INCOMPLETE REVIEW");
+      expect(rejected.report).not.toContain("No verified findings");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a 45 KiB indivisible line supported when its resolved prompt fits", async () => {
+    const agents = new RecordingAgents();
+    agents.candidateCount = 0;
+    const largeLine = "x".repeat(45 * 1024);
+    const diff = fileDiff("src/a.ts", [largeLine]) + largeDiff("src/b.ts", 1000);
+    const result = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", snapshot: snapshot(diff, ["src/a.ts", "src/b.ts"]) }, dependencies(agents));
+    expect(result.status).toBe("complete");
+    expect(result.coverage?.mode).toBe("sharded");
+    expect(agents.calls.some((call) => call.role === "diff-only-bug" && call.prompt.includes(largeLine))).toBe(true);
+    expect(agents.calls.every((call) => Buffer.byteLength(call.prompt, "utf8") <= call.inputBudgetBytes!)).toBe(true);
+  });
+
+  it("fails before launch when required guidance cannot fit even without diff content", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-review-oversized-guidance-"));
+    try {
+      await writeFile(join(cwd, "AGENTS.md"), "Preserve validation.\n".repeat(1000));
+      const agents = new RecordingAgents();
+      agents.candidateCount = 0;
+      const result = await runCodeReview({ cwd, target, comment: false, effort: "normal", snapshot: { ...snapshot(normalDiff, ["src/auth.ts"]), cwd } }, { ...dependencies(agents), resolveModelContextWindow: () => 48_000 });
+      expect(result.status).toBe("incomplete");
+      expect(agents.calls).toHaveLength(0);
+      expect(result.coverage?.uncoveredUnitIds.length).toBeGreaterThan(0);
+      expect(result.report).toContain("prompt budget");
+      expect(result.report).toContain("Review did not start");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("sizes shards from resolved windows and applicable guidance overhead", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-review-prompt-size-"));
+    try {
+      const paths = ["src/auth/a.ts", "src/auth/b.ts"];
+      const diff = paths.map((path, index) => largeDiff(path, index * 1000)).join("");
+      const run = async (window: number) => {
+        const agents = new RecordingAgents();
+        agents.candidateCount = 0;
+        const result = await runCodeReview({ cwd, target, comment: false, effort: "normal", snapshot: { ...snapshot(diff, paths), cwd } }, { ...dependencies(agents), resolveModelContextWindow: () => window });
+        expect(result.status).toBe("complete");
+        expect(agents.calls.every((call) => Buffer.byteLength(call.prompt, "utf8") <= call.inputBudgetBytes!)).toBe(true);
+        return agents.calls.filter((call) => call.role === "diff-only-bug");
+      };
+      const wide = await run(100_000);
+      const narrow = await run(48_000);
+      expect(narrow.length).toBeGreaterThan(wide.length);
+      await writeFile(join(cwd, "AGENTS.md"), "Preserve validation.\n".repeat(350));
+      const withGuidance = await run(48_000);
+      expect(withGuidance.length).toBeGreaterThan(narrow.length);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each([tinyDiff, largeDiff("src/a.ts", 0) + largeDiff("src/b.ts", 1000) + largeDiff("src/c.ts", 2000)])("retains valid candidates without declaring unfinished discovery covered", async (diff) => {
+    const agents = new RecordingAgents();
+    agents.incompleteRoles.add("diff-only-bug");
+    const source = { ...snapshot(diff), snapshotHash: createHash("sha256").update(diff).digest("hex") };
+    const result = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", snapshot: source }, dependencies(agents));
+    expect(result.status).toBe("incomplete");
+    expect(result.failures.some((failure) => failure.message.includes("Assigned context remains unchecked"))).toBe(true);
+    expect(result.coverage?.coveredShardCount).toBe(0);
+    expect(result.coverage?.uncoveredUnitIds.length).toBeGreaterThan(0);
+    expect(agents.calls.some((call) => call.role === "validator")).toBe(true);
+    expect(result.findings.length).toBeGreaterThan(0);
+  });
+
+  it("fits candidate follow-up prompts after discovery fills its shard budget", async () => {
+    const agents = new RecordingAgents();
+    agents.candidateNeedsContext = true;
+    const diff = fileDiff("src/a.ts", Array.from({ length: 500 }, (_, index) => `change-${index}-${"x".repeat(300)}`));
+    const source = { ...snapshot(diff), snapshotHash: createHash("sha256").update(diff).digest("hex") };
+    const result = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", snapshot: source }, dependencies(agents));
+    expect(result.status, JSON.stringify(result.failures)).toBe("complete");
+    expect(agents.calls.find((call) => call.role === "contextual-bug")?.prompt).toContain("Candidate-focused excerpts");
+    expect(agents.calls.some((call) => call.role === "validator")).toBe(true);
+    expect(agents.calls.every((call) => Buffer.byteLength(call.prompt, "utf8") <= call.inputBudgetBytes!)).toBe(true);
+  });
+
+  it("validates known candidates before spending the last units on a follow-up", async () => {
+    const agents = new RecordingAgents();
+    agents.candidateNeedsContext = true;
+    const result = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", maxReviewWorkUnits: 4, snapshot: snapshot(smallDiff, ["src/a.ts", "src/b.ts"]) }, dependencies(agents));
+    expect(result.status).toBe("incomplete");
+    expect(agents.calls.filter((call) => call.role === "contextual-bug")).toHaveLength(0);
+    expect(agents.calls.filter((call) => call.role === "validator")).toHaveLength(2);
+    expect(result.coverage?.budget?.spentWeight).toBeLessThanOrEqual(4);
+    expect(result.failures.some((failure) => failure.message.includes("contextual-bug"))).toBe(true);
   });
 
   it("uses a stable diff-first subset under a partial sharded work limit", async () => {
@@ -647,9 +782,26 @@ describe("runCodeReview deterministic topology", () => {
     expect(lowConfidence.findings).toEqual([]);
   });
 
+  it("reports bounded reviewer counters without exposing diagnostic content", async () => {
+    const recording = new RecordingAgents();
+    const agents: ReviewAgentRunner = { run: async (invocation, validate) => {
+      if (invocation.role === "diff-only-bug") throw new ReviewerRunError(invocation.role, "missing-result",
+        { role: invocation.role, turns: 4, inputTokens: 1, outputTokens: 1, contextTokens: 2 }, false,
+        { attempt: 2, turns: 4, maxTurns: 4, resultCount: 0, finalizationEntered: true,
+          semanticBytes: 21, stdoutBytes: 300, stderrBytes: 0, retryDenial: "PRIVATE_TOOL_CONTENT" });
+      return recording.run(invocation, validate);
+    } };
+    const result = await runCodeReview({ cwd: "/repo", target, snapshot: snapshot(normalDiff, ["src/auth.ts"]), comment: false, effort: "normal" },
+      { ...dependencies(recording), agents });
+    expect(result.status).toBe("incomplete");
+    expect(result.report).toContain("turns=4/4; results=0; finalization=true; retry=denied");
+    expect(result.report).toContain("semanticBytes=21; stdoutBytes=300; stderrBytes=0");
+    expect(result.report).not.toContain("PRIVATE_TOOL_CONTENT");
+  });
+
   it("keeps pull-request reviews report-only unless publication is explicit", async () => {
     const commands = new PullRequestCommands();
-    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: false, effort: "normal", snapshot: pullRequestSnapshot() }, { commands, agents: new RecordingAgents() });
+    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: false, effort: "normal", snapshot: pullRequestSnapshot() }, dependencies(new RecordingAgents(), commands));
 
     expect(result.status).toBe("complete");
     expect(result.commented).toBe(false);
@@ -659,7 +811,7 @@ describe("runCodeReview deterministic topology", () => {
 
   it("publishes a pull-request report only for an explicit comment request", async () => {
     const commands = new PullRequestCommands();
-    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: true, effort: "normal", snapshot: pullRequestSnapshot() }, { commands, agents: new RecordingAgents() });
+    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: true, effort: "normal", snapshot: pullRequestSnapshot() }, dependencies(new RecordingAgents(), commands));
 
     expect(result.status).toBe("complete");
     expect(result.commented).toBe(true);
@@ -701,7 +853,7 @@ describe("runCodeReview deterministic topology", () => {
   it("does not publish a duplicate when a current-reviewer comment appears during review", async () => {
     const commands = new PullRequestCommands();
     commands.existingReviewOnPublish = true;
-    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: true, effort: "normal", snapshot: pullRequestSnapshot() }, { commands, agents: new RecordingAgents() });
+    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: true, effort: "normal", snapshot: pullRequestSnapshot() }, dependencies(new RecordingAgents(), commands));
 
     expect(result.status).toBe("incomplete");
     expect(result.commented).toBe(false);
@@ -712,7 +864,7 @@ describe("runCodeReview deterministic topology", () => {
   it("recaptures the pull request immediately before publication", async () => {
     const commands = new PullRequestCommands();
     commands.changeBeforePublish = true;
-    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: true, effort: "normal", snapshot: pullRequestSnapshot() }, { commands, agents: new RecordingAgents() });
+    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: true, effort: "normal", snapshot: pullRequestSnapshot() }, dependencies(new RecordingAgents(), commands));
 
     expect(result.status).toBe("incomplete");
     expect(result.commented).toBe(false);
@@ -726,7 +878,7 @@ describe("runCodeReview deterministic topology", () => {
   ] as const)("returns incomplete for %s publication outcomes", async (_label, mode, message) => {
     const commands = new PullRequestCommands();
     commands[mode] = true;
-    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: true, effort: "normal", snapshot: pullRequestSnapshot() }, { commands, agents: new RecordingAgents() });
+    const result = await runCodeReview({ cwd: "/repo", target: pullRequestTarget, comment: true, effort: "normal", snapshot: pullRequestSnapshot() }, dependencies(new RecordingAgents(), commands));
     expect(result.status).toBe("incomplete");
     expect(result.commented).toBe("unknown");
     expect(result.failures.some((failure) => failure.stage === "comment" && failure.message.includes(message))).toBe(true);

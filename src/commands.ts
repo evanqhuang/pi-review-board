@@ -17,11 +17,12 @@ export class NodeCommandRunner implements CommandRunner {
   public run(
     command: string,
     args: readonly string[],
-    options: { cwd: string; signal?: AbortSignal | undefined },
+    options: { cwd: string; signal?: AbortSignal | undefined; env?: Readonly<Record<string, string>> },
   ): Promise<CommandResult> {
     return new Promise((resolve, reject) => {
       const child = spawn(command, [...args], {
         cwd: options.cwd,
+        env: { ...process.env, ...options.env },
         shell: false,
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],

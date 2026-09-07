@@ -18,6 +18,7 @@ class FakeCommands implements CommandRunner {
 
 const ok = (stdout = ""): CommandResult => ({ stdout, stderr: "", exitCode: 0 });
 const fail = (stderr = "not found"): CommandResult => ({ stdout: "", stderr, exitCode: 1 });
+const fileDiff = (path: string): string => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+new`;
 
 describe("review targets", () => {
   it("resolves pull requests, paths, and branches without shell interpolation", async () => {
@@ -115,7 +116,7 @@ describe("review targets", () => {
           comments,
         }));
       }
-      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return ok("diff");
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return ok(fileDiff("src/a.ts"));
       if (command === "gh" && args[0] === "api" && args[1] === "user") return identityAvailable ? ok("reviewer\n") : fail("temporary auth failure");
       return fail();
     });
@@ -128,6 +129,98 @@ describe("review targets", () => {
 
     headSha = "new-head-sha";
     expect(await hasSnapshotDrift(snapshot, commands)).toBe(true);
+  });
+
+  it.each(["headRefOid", "baseRefOid", "files"])("rejects %s drift between metadata and diff capture", async (field) => {
+    let changed = false;
+    const before = { number: 7, url: "https://github.com/acme/repo/pull/7", baseRefOid: "base-a", headRefOid: "head-a", files: [{ path: "src/a.ts" }] };
+    const after = { ...before, [field]: field === "files" ? [{ path: "src/b.ts" }] : "revision-b" };
+    const commands = new FakeCommands((command, args) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(JSON.stringify(changed ? after : before));
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") { changed = true; return ok(fileDiff("src/a.ts")); }
+      if (command === "gh" && args[0] === "api") return ok("reviewer");
+      return fail();
+    });
+    await expect(captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands)).rejects.toThrow("changed while capturing its diff");
+  });
+
+  it("rejects a stable metadata scope when the captured diff names different paths", async () => {
+    const payload = JSON.stringify({
+      number: 7,
+      url: "https://github.com/acme/repo/pull/7",
+      baseRefOid: "base-a",
+      headRefOid: "head-a",
+      files: [{ path: "src/a.ts" }],
+    });
+    const commands = new FakeCommands((command, args) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(payload);
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return ok(fileDiff("src/b.ts"));
+      if (command === "gh" && args[0] === "api") return ok("reviewer");
+      return fail();
+    });
+    await expect(captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands)).rejects.toThrow(/diff changed-path scope/u);
+  });
+
+  it("rejects malformed diff text instead of accepting metadata-only scope", async () => {
+    const payload = JSON.stringify({
+      number: 7,
+      url: "https://github.com/acme/repo/pull/7",
+      baseRefOid: "base-a",
+      headRefOid: "head-a",
+      files: [{ path: "src/a.ts" }],
+    });
+    const commands = new FakeCommands((command, args) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(payload);
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return ok("diff");
+      if (command === "gh" && args[0] === "api") return ok("reviewer");
+      return fail();
+    });
+    await expect(captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands)).rejects.toThrow(/malformed or unsupported/u);
+  });
+
+  it("accepts the parser's effective paths for empty, rename, deletion, binary, and quoted diffs", async () => {
+    const fixtures = [
+      { files: [], diff: "" },
+      {
+        files: [{ path: "new-name.ts" }],
+        diff: "diff --git a/old-name.ts b/new-name.ts\nsimilarity index 100%\nrename from old-name.ts\nrename to new-name.ts",
+      },
+      {
+        files: [{ path: "removed.ts" }],
+        diff: "diff --git a/removed.ts b/removed.ts\ndeleted file mode 100644\n--- a/removed.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-removed",
+      },
+      {
+        files: [{ path: "image.bin" }],
+        diff: "diff --git a/image.bin b/image.bin\nindex 1111111..2222222 100644\nBinary files a/image.bin and b/image.bin differ",
+      },
+      {
+        files: [{ path: "docs/naïve file.txt" }],
+        diff: String.raw`diff --git "a/docs/na\303\257ve file.txt" "b/docs/na\303\257ve file.txt"
+--- "a/docs/na\303\257ve file.txt"
++++ "b/docs/na\303\257ve file.txt"
+@@ -1 +1 @@
+-old
++new`,
+      },
+    ] as const;
+
+    for (const fixture of fixtures) {
+      const payload = JSON.stringify({
+        number: 7,
+        url: "https://github.com/acme/repo/pull/7",
+        baseRefOid: "base-a",
+        headRefOid: "head-a",
+        files: fixture.files,
+      });
+      const commands = new FakeCommands((command, args) => {
+        if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(payload);
+        if (command === "gh" && args[0] === "pr" && args[1] === "diff") return ok(fixture.diff);
+        if (command === "gh" && args[0] === "api") return ok("reviewer");
+        return fail();
+      });
+      const expectedPaths = fixture.files.map((file) => file.path).sort();
+      await expect(captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands)).resolves.toMatchObject({ changedPaths: expectedPaths });
+    }
   });
 
   it("only treats the current reviewer's prior comment as already reviewed", () => {
@@ -167,7 +260,7 @@ describe("review targets", () => {
     });
     const commands = new FakeCommands((command, args) => {
       if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(payload);
-      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return ok("diff");
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return ok(fileDiff("src/a.ts"));
       return fail();
     });
     const snapshot = await captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands);

@@ -115,7 +115,7 @@ export type ReviewWorkManifest =
 
 export const REVIEW_WORK_POLICY_VERSION = 1;
 export const REVIEW_WORK_POLICY = "bounded-sharded-review";
-export const DEFAULT_MAX_REVIEW_WORK_UNITS = 32;
+export const DEFAULT_MAX_REVIEW_WORK_UNITS = 128;
 export const MAX_REVIEW_WORK_UNITS = 128;
 export const DEFAULT_WORK_LIMIT_POLICY: WorkLimitPolicy = "reject";
 
@@ -169,7 +169,12 @@ export interface ReviewOptions {
 
 export interface ReviewSnapshot {
   readonly target: ReviewTarget;
+  /** Original repository identity; never replaced with a temporary source root. */
   readonly cwd: string;
+  /** Invocation-local source root pinned to the captured revision for PR reviews. */
+  readonly sourceCwd?: string;
+  /** Complete review scope, retained when changedPaths describes a local excerpt. */
+  readonly reviewChangedPaths?: readonly string[];
   readonly changedPaths: readonly string[];
   readonly diff: string;
   readonly snapshotHash: string;
@@ -321,6 +326,7 @@ export type ReviewerFailureKind =
   | "turn-limit"
   | "context-limit"
   | "input-limit"
+  | "retry-budget"
   | "result-tool-error"
   | "provider"
   | "length"
@@ -431,13 +437,19 @@ export interface CommandResult {
 }
 
 export interface CommandRunner {
-  run(command: string, args: readonly string[], options: { cwd: string; signal?: AbortSignal | undefined }): Promise<CommandResult>;
+  run(command: string, args: readonly string[], options: { cwd: string; signal?: AbortSignal | undefined; env?: Readonly<Record<string, string>> }): Promise<CommandResult>;
 }
 
 export interface ReviewDependencies {
   readonly commands: CommandRunner;
   readonly agents: ReviewAgentRunner;
   readonly reviewerModel?: string;
+  /** Override the source-view boundary for deterministic tests or embedded runners. */
+  readonly prepareSourceView?: (snapshot: ReviewSnapshot, signal?: AbortSignal) => Promise<{
+    readonly root: string;
+    readonly revision?: string;
+    dispose(): Promise<void>;
+  }>;
   /** Resolve a provider model's context window without inferring unknown model identities. */
   readonly resolveModelContextWindow?: (model: string) => number | undefined;
   readonly onProgress?: (event: ReviewProgressEvent) => void;
@@ -602,6 +614,8 @@ export interface ReviewCoverage {
   readonly uncoveredCandidates: readonly ReviewCoverageCandidate[];
   /** Candidates that have not yet received a validation disposition. */
   readonly unvalidatedCandidates?: readonly ReviewCoverageCandidate[];
+  /** All obligations whose success is required for each shard's full completion. */
+  readonly requiredShardUnitIds?: Readonly<Record<string, readonly string[]>>;
   readonly plannedShardIds?: readonly string[];
   readonly coveredShardIds?: readonly string[];
   readonly uncoveredShardIds?: readonly string[];

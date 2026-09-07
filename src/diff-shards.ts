@@ -9,7 +9,7 @@ import type {
   ParsedDiffFile,
 } from "./types.js";
 
-/** Hard upper bound for a target serialized diff shard payload. */
+/** Default payload target for callers without a resolved prompt budget. */
 export const MAX_DIFF_SHARD_BYTES = 40 * 1024;
 export const MAX_SERIALIZED_DIFF_PAYLOAD_BYTES = MAX_DIFF_SHARD_BYTES;
 export const DEFAULT_MAX_DIFF_SHARD_BYTES = MAX_DIFF_SHARD_BYTES;
@@ -20,8 +20,10 @@ export interface DiffParseOptions {
 }
 
 export interface DiffShardingOptions extends DiffParseOptions {
-  /** A smaller test or provider target is allowed; larger values are capped. */
+  /** Resolved payload ceiling; defaults to 40 KiB for standalone callers. */
   readonly maxBytes?: number;
+  /** Check complete serialized role prompts, including guidance and metadata. */
+  readonly fitsPrompt?: (shard: DiffShard) => boolean;
   readonly maxShardBytes?: number;
   readonly maxPayloadBytes?: number;
 }
@@ -575,7 +577,7 @@ function hunkPiece(
   return createPiece(snapshotHash, file, text, [range], pieceId(snapshotHash, file, hunk.index, start, end), supported, reason);
 }
 
-function splitSupportedFile(snapshotHash: string, file: ParsedDiffFile, maxBytes: number): readonly Piece[] {
+function splitSupportedFile(snapshotHash: string, file: ParsedDiffFile, maxBytes: number, fits: (piece: Piece) => boolean): readonly Piece[] {
   const baseLines = file.headerLines;
   const baseText = joinedLines(baseLines);
   if (Buffer.byteLength(payloadWithTerminalLine([baseText]), "utf8") > maxBytes) {
@@ -584,12 +586,12 @@ function splitSupportedFile(snapshotHash: string, file: ParsedDiffFile, maxBytes
   const pieces: Piece[] = [];
   for (const hunk of file.hunks) {
     const complete = hunkPiece(snapshotHash, file, hunk, 0, hunk.lines.length, baseLines, true);
-    if (complete.byteLength <= maxBytes) {
+    if (fits(complete)) {
       pieces.push(complete);
       continue;
     }
     const headerOnly = hunkPiece(snapshotHash, file, hunk, 0, 0, baseLines, true);
-    if (headerOnly.byteLength > maxBytes) {
+    if (!fits(headerOnly)) {
       pieces.push(hunkPiece(
         snapshotHash,
         file,
@@ -598,23 +600,30 @@ function splitSupportedFile(snapshotHash: string, file: ParsedDiffFile, maxBytes
         hunk.lines.length,
         baseLines,
         false,
-        `indivisible hunk metadata exceeds ${maxBytes} UTF-8 bytes`,
+        `indivisible hunk metadata exceeds the ${maxBytes}-byte payload or required prompt budget`,
       ));
       continue;
     }
     let start = 0;
     while (start < hunk.lines.length) {
-      let end = start + 1;
+      let low = start + 1;
+      let high = hunk.lines.length;
       let best: Piece | undefined;
-      while (end <= hunk.lines.length) {
+      let bestEnd = start;
+      while (low <= high) {
+        const end = Math.floor((low + high) / 2);
         const candidate = hunkPiece(snapshotHash, file, hunk, start, end, baseLines, true);
-        if (candidate.byteLength > maxBytes) break;
-        best = candidate;
-        end += 1;
+        if (fits(candidate)) {
+          best = candidate;
+          bestEnd = end;
+          low = end + 1;
+        } else {
+          high = end - 1;
+        }
       }
       if (best !== undefined) {
         pieces.push(best);
-        start = end - 1;
+        start = bestEnd;
       } else {
         const oversized = hunkPiece(
           snapshotHash,
@@ -624,7 +633,7 @@ function splitSupportedFile(snapshotHash: string, file: ParsedDiffFile, maxBytes
           start + 1,
           baseLines,
           false,
-          `indivisible diff line exceeds ${maxBytes} UTF-8 bytes; line was not truncated`,
+          `indivisible diff line exceeds the ${maxBytes}-byte payload or required prompt budget; line was not truncated`,
         );
         pieces.push(oversized);
         start += 1;
@@ -634,10 +643,47 @@ function splitSupportedFile(snapshotHash: string, file: ParsedDiffFile, maxBytes
   return freezeArray(pieces);
 }
 
-function piecesForFile(snapshotHash: string, file: ParsedDiffFile, maxBytes: number): readonly Piece[] {
+/** Candidate-only follow-up evidence; this never replaces discovery coverage. */
+export function candidateDiffExcerpt(
+  diff: string,
+  snapshotHash: string,
+  candidates: readonly { readonly file: string; readonly line: number }[],
+  contextLines: number,
+): string {
+  if (!Number.isSafeInteger(contextLines) || contextLines < 0) throw new RangeError("candidate context lines must be a nonnegative safe integer");
+  const parsed = parseUnifiedDiff(diff, snapshotHash);
+  const pieces: Piece[] = [];
+  const matched = new Set<number>();
+  for (const file of parsed.files) {
+    for (const hunk of file.hunks) {
+      const windows: Array<{ start: number; end: number }> = [];
+      candidates.forEach((candidate, index) => {
+        if (![file.fileIdentity, file.oldPath, file.newPath].includes(candidate.file)) return;
+        hunk.lines.forEach((line, lineIndex) => {
+          if (line.oldLine !== candidate.line && line.newLine !== candidate.line) return;
+          matched.add(index);
+          windows.push({ start: Math.max(0, lineIndex - contextLines), end: Math.min(hunk.lines.length, lineIndex + contextLines + 1) });
+        });
+      });
+      const merged: Array<{ start: number; end: number }> = [];
+      for (const window of windows.sort((left, right) => left.start - right.start)) {
+        const previous = merged.at(-1);
+        if (previous && window.start <= previous.end) previous.end = Math.max(previous.end, window.end);
+        else merged.push({ ...window });
+      }
+      for (const window of merged) pieces.push(hunkPiece(snapshotHash, file, hunk, window.start, window.end, file.headerLines, true));
+    }
+  }
+  if (matched.size !== candidates.length) throw new Error("candidate follow-up has no matching source line in its shard");
+  return payloadWithTerminalLine(pieces.map((piece) => piece.text));
+}
+
+function piecesForFile(snapshotHash: string, file: ParsedDiffFile, maxBytes: number, fits: (piece: Piece) => boolean): readonly Piece[] {
   const complete = fullPiece(snapshotHash, file);
-  if (!file.supported || complete.byteLength <= maxBytes) return freezeArray([complete]);
-  return splitSupportedFile(snapshotHash, file, maxBytes);
+  if (!file.supported || fits(complete)) return freezeArray([complete]);
+  // Metadata-only changes cannot be split into hunks.
+  if (file.hunks.length === 0) return freezeArray([createPiece(snapshotHash, file, file.raw, allRanges(file), complete.id, false, "file metadata exceeds the required prompt budget")]);
+  return splitSupportedFile(snapshotHash, file, maxBytes, fits);
 }
 
 function shardId(snapshotHash: string, ordinal: number, pieces: readonly Piece[]): string {
@@ -678,7 +724,7 @@ function makeShard(snapshotHash: string, ordinal: number, maxBytes: number, piec
 function targetBytes(options: DiffShardingOptions): number {
   const requested = options.maxBytes ?? options.maxShardBytes ?? options.maxPayloadBytes ?? MAX_DIFF_SHARD_BYTES;
   if (!Number.isSafeInteger(requested) || requested <= 0) throw new RangeError("max diff shard bytes must be a positive safe integer");
-  return Math.min(requested, MAX_DIFF_SHARD_BYTES);
+  return requested;
 }
 
 /**
@@ -703,7 +749,13 @@ export function shardDiff(
     };
   const parsed = parseUnifiedDiff(diff, options);
   const maxBytes = targetBytes(options);
-  const pieces = parsed.files.flatMap((file) => piecesForFile(parsed.snapshotHash, file, maxBytes));
+  // Reserve the longest ordinal representation while measuring candidate
+  // prompts. Final shard IDs can only use fewer bytes.
+  const fits = (pieces: readonly Piece[]): boolean => {
+    const shard = makeShard(parsed.snapshotHash, Number.MAX_SAFE_INTEGER, maxBytes, pieces);
+    return shard.byteLength <= maxBytes && (options.fitsPrompt?.(shard) ?? true);
+  };
+  const pieces = parsed.files.flatMap((file) => piecesForFile(parsed.snapshotHash, file, maxBytes, (piece) => fits([piece])));
   const shards: DiffShard[] = [];
   let current: Piece[] = [];
   const flush = (): void => {
@@ -720,8 +772,7 @@ export function shardDiff(
       continue;
     }
     const candidate = [...current, piece];
-    const candidatePayload = payloadWithTerminalLine(candidate.map((entry) => entry.text));
-    if (current.length > 0 && Buffer.byteLength(candidatePayload, "utf8") > maxBytes) {
+    if (current.length > 0 && !fits(candidate)) {
       flush();
     }
     current.push(piece);

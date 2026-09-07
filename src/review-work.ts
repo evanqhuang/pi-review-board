@@ -370,18 +370,23 @@ function coverageFromUnits(snapshotHash: string, units: readonly ReviewWorkUnit[
   if (extras.reason !== undefined) reasons.push(extras.reason);
   const diffUnits = units.filter((unit) => unit.role === "diff");
   const plannedShardIds = unique(extras.plannedShardIds ?? diffUnits.flatMap((unit) => unit.shardIds));
-  const coveredShardSet = new Set(diffUnits.filter((unit) => unit.status === "covered").flatMap((unit) => unit.shardIds));
-  const uncoveredShardSet = new Set(diffUnits.filter((unit) => unit.status === "uncovered").flatMap((unit) => unit.shardIds));
-  const coveredShardIds = freezeArray(plannedShardIds.filter((id) => coveredShardSet.has(id)));
-  const uncoveredShardIds = freezeArray(plannedShardIds.filter((id) => uncoveredShardSet.has(id)));
+  const requiredShardUnitIds = freezeObject(Object.fromEntries(plannedShardIds.map((shardId) => [
+    shardId, freezeArray(units.filter((unit) => unit.shardIds.includes(shardId)).map((unit) => unit.id)),
+  ])));
+  const coveredSet = new Set(covered);
+  const coveredShardIds = freezeArray(plannedShardIds.filter((id) => {
+    const required = requiredShardUnitIds[id]!;
+    return required.length > 0 && required.every((unitId) => coveredSet.has(unitId));
+  }));
+  const uncoveredShardIds = freezeArray(plannedShardIds.filter((id) => !coveredShardIds.includes(id)));
   const attemptedUnitIds = freezeArray(units.filter((unit) => unit.attempts > 0).map((unit) => unit.id));
   const attempts = Object.fromEntries(units.map((unit) => [unit.id, unit.attempts]));
-  let state: ReviewCoverage["state"] = "unknown";
-  if (extras.forceIncomplete || uncovered.length > 0) state = "incomplete";
-  else if (units.length > 0 && covered.length === units.length) state = "complete";
   const reason = unique(reasons)[0];
   const uncoveredCandidates = uniqueCandidates(extras.uncoveredCandidates ?? units.flatMap((unit) => unit.candidates));
   const rangeEvidence = freezeArray([...ranges, ...(extras.uncoveredRanges ?? [])]);
+  let state: ReviewCoverage["state"] = "unknown";
+  if (extras.forceIncomplete || uncovered.length > 0 || rangeEvidence.length > 0 || uncoveredCandidates.length > 0) state = "incomplete";
+  else if (units.length > 0 && covered.length === units.length) state = "complete";
   const spentWeight = extras.budgetSpentWeight ?? units.reduce((sum, unit) => sum + unit.weight * unit.attempts, 0);
   const reservedWeight = extras.budgetReservedWeight ?? 0;
   const maxWeight = extras.budgetMaxWeight ?? 0;
@@ -407,6 +412,7 @@ function coverageFromUnits(snapshotHash: string, units: readonly ReviewWorkUnit[
     uncoveredRangeEvidence: rangeEvidence,
     uncoveredCandidates,
     unvalidatedCandidates: uncoveredCandidates,
+    requiredShardUnitIds,
     plannedShardIds,
     coveredShardIds,
     uncoveredShardIds,
@@ -570,14 +576,13 @@ function updateSets(coverage: ReviewCoverage, update: ReviewCoverageUpdate): Rev
   const plannedIds = freezeArray(coverage.plannedUnitIds);
   const coveredIds = freezeArray(plannedIds.filter((id) => covered.has(id)));
   const uncoveredIds = freezeArray(plannedIds.filter((id) => uncovered.has(id)));
-  let state: ReviewCoverage["state"] = "unknown";
-  if (uncoveredIds.length > 0) state = "incomplete";
-  else if (plannedIds.length > 0 && coveredIds.length === plannedIds.length) state = "complete";
   const reason = update.reason ?? coverage.reason;
-  const rangeEvidence = freezeArray([
+  const rangeEvidence = freezeArray([...new Map([
     ...coverage.uncoveredRanges,
-    ...(update.uncoveredRanges ?? update.uncoveredRangeEvidence ?? []),
-  ]);
+    ...(coverage.uncoveredRangeEvidence ?? []),
+    ...(update.uncoveredRanges ?? []),
+    ...(update.uncoveredRangeEvidence ?? []),
+  ].map((range) => [JSON.stringify(range), range])).values()]);
   const attemptedUnitIds = unique([...(coverage.attemptedUnitIds ?? []), ...attemptedIds]);
   const attempts = freezeObject({
     ...(coverage.attempts ?? {}),
@@ -585,8 +590,23 @@ function updateSets(coverage: ReviewCoverage, update: ReviewCoverageUpdate): Rev
   });
   const candidates = uniqueCandidates([
     ...coverage.uncoveredCandidates,
-    ...(update.uncoveredCandidates ?? update.unvalidatedCandidates ?? []),
+    ...(coverage.unvalidatedCandidates ?? []),
+    ...(update.uncoveredCandidates ?? []),
+    ...(update.unvalidatedCandidates ?? []),
   ]);
+  const rangeShardIds = new Set(rangeEvidence.flatMap((range) => range.shardId === undefined ? [] : [range.shardId]));
+  const plannedShardIds = coverage.plannedShardIds ?? coverage.plannedShards;
+  const coveredShardIds = plannedShardIds === undefined ? undefined : freezeArray(plannedShardIds.filter((shardId) => {
+    const required = coverage.requiredShardUnitIds?.[shardId];
+    const complete = required === undefined
+      ? (coverage.coveredShardIds ?? coverage.coveredShards ?? []).includes(shardId)
+      : required.length > 0 && required.every((unitId) => planned.has(unitId) && covered.has(unitId) && !uncovered.has(unitId));
+    return complete && !rangeShardIds.has(shardId);
+  }));
+  const uncoveredShardIds = plannedShardIds === undefined ? undefined : freezeArray(plannedShardIds.filter((shardId) => !coveredShardIds!.includes(shardId)));
+  let state: ReviewCoverage["state"] = "unknown";
+  if (uncoveredIds.length > 0 || rangeEvidence.length > 0 || candidates.length > 0) state = "incomplete";
+  else if (plannedIds.length > 0 && coveredIds.length === plannedIds.length) state = "complete";
   return freezeObject({
     ...coverage,
     state,
@@ -603,6 +623,17 @@ function updateSets(coverage: ReviewCoverage, update: ReviewCoverageUpdate): Rev
     uncoveredRangeEvidence: rangeEvidence,
     uncoveredCandidates: candidates,
     unvalidatedCandidates: candidates,
+    ...(plannedShardIds === undefined ? {} : {
+      plannedShardIds,
+      plannedShards: plannedShardIds,
+      plannedShardCount: plannedShardIds.length,
+      coveredShardIds: coveredShardIds!,
+      coveredShards: coveredShardIds!,
+      coveredShardCount: coveredShardIds!.length,
+      uncoveredShardIds: uncoveredShardIds!,
+      uncoveredShards: uncoveredShardIds!,
+      uncoveredShardCount: uncoveredShardIds!.length,
+    }),
   });
 }
 

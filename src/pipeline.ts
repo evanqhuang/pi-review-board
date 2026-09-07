@@ -1,10 +1,11 @@
 import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { guidanceCoversPath, guidanceForPath, discoverApplicableGuidance, type GuidanceFile } from "./guidance.js";
-import { parseUnifiedDiff, shardDiff } from "./diff-shards.js";
+import { candidateDiffExcerpt, parseUnifiedDiff, shardDiff } from "./diff-shards.js";
 import { applyReviewWorkCoverage, planReviewWork } from "./review-work.js";
 import { scheduleReviewWork, type ReviewScheduleOutcome, type ReviewScheduleTask, type ReviewTaskExecution } from "./review-scheduler.js";
-import { REVIEWER_RESULT_TOOLS } from "./reviewer-protocol.js";
+import { REVIEWER_RESULT_TOOLS, REVIEWER_RETRY_SUFFIX } from "./reviewer-protocol.js";
+import { reviewerControlReserveBytes } from "./reviewer-control.js";
 import {
   buildContextualBugPrompt,
   buildDiffOnlyBugPrompt,
@@ -39,7 +40,9 @@ import {
   isLikelyAutomatedPullRequest,
 } from "./targets.js";
 import { ReviewerRunError } from "./runner.js";
+import { prepareReviewSourceView } from "./source-view.js";
 import { assertInputBudget, InputLimitError, resolveInputBudget } from "./input-budget.js";
+import { MAX_REVIEW_WORK_UNITS } from "./types.js";
 import type {
   AgentInvocation,
   AgentResult,
@@ -68,6 +71,25 @@ const MAX_VALIDATOR_SOURCE_LINES = VALIDATOR_SOURCE_WINDOW * 2 + 1;
 const MAX_VALIDATOR_SOURCE_BYTES = 16 * 1024;
 const MAX_VALIDATOR_SOURCE_READ_BYTES = 256 * 1024;
 
+/** Protect completion work without taking capacity from admitted discovery. */
+function validationReserve(plan: ReviewWorkPlan): number {
+  const required = plan.units.filter((unit) => unit.status === "planned").reduce((sum, unit) => sum + unit.weight, 0);
+  // Split spare capacity between retries/follow-ups and validation. The reserve
+  // covers up to two validation attempts for each reportable finding.
+  return Math.min(MAX_FINDINGS * 2, Math.floor(Math.max(0, plan.maxReviewWorkUnits - required) / 2));
+}
+
+function rejectedWorkMessage(plan: ReviewWorkPlan): string {
+  const required = plan.units.filter((unit) => unit.shardIds.every((id) => plan.shards.find((shard) => shard.id === id)?.supported))
+    .reduce((sum, unit) => sum + unit.weight, 0);
+  const reasons = [...new Set(plan.units.filter((unit) => unit.status === "uncovered").map((unit) => unit.reason).filter(Boolean))];
+  const budgetRejected = reasons.some((reason) => reason?.startsWith("review work limit rejected plan:"));
+  if (budgetRejected) {
+    return `Review did not start: ${required} weighted units required for ${plan.units.length} discovery tasks; limit ${plan.maxReviewWorkUnits}. Validation and retries need additional headroom. ${required < MAX_REVIEW_WORK_UNITS ? `Increase --max-work-units (up to ${MAX_REVIEW_WORK_UNITS}).` : "Reduce the review scope or required discovery work."}`;
+  }
+  return `Review did not start: required work is unsupported. ${reasons.join("; ")}`.slice(0, 500);
+}
+
 function progress(dependencies: ReviewDependencies, stage: ReviewStage, message: string): void {
   dependencies.onProgress?.({ type: "stage", stage, message });
 }
@@ -77,7 +99,13 @@ function usageFromError(error: unknown): AgentResult<unknown>["usage"] | undefin
 }
 
 function errorMessage(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error)).trim().slice(0, 500);
+  const message = (error instanceof Error ? error.message : String(error)).trim().slice(0, 500);
+  if (!(error instanceof ReviewerRunError)) return message;
+  const diagnostics = error.diagnostics;
+  const count = (value: number): string => Number.isSafeInteger(value) && value >= 0 ? String(value) : "unknown";
+  const retry = diagnostics.retryDenial === "scheduler-admission-denied" || diagnostics.retryDenial === "canceled"
+    ? diagnostics.retryDenial : diagnostics.retryDenial === undefined ? "none" : "denied";
+  return `${message} [attempt=${count(diagnostics.attempt)}; turns=${count(diagnostics.turns)}/${count(diagnostics.maxTurns)}; results=${count(diagnostics.resultCount)}; finalization=${diagnostics.finalizationEntered === true}; retry=${retry}; semanticBytes=${count(diagnostics.semanticBytes)}; stdoutBytes=${count(diagnostics.stdoutBytes)}; stderrBytes=${count(diagnostics.stderrBytes)}]`.slice(0, 500);
 }
 
 function isPromptBudgetFailure(error: unknown): error is InputLimitError {
@@ -126,6 +154,21 @@ async function runScheduledAgent<T>(
   }
 }
 
+async function runScheduledFinder(
+  dependencies: ReviewDependencies,
+  invocation: AgentInvocation,
+  validate: (value: unknown) => FinderOutput,
+  context: Parameters<typeof runScheduledAgent>[3],
+): Promise<ReviewTaskExecution<FinderOutput>> {
+  const execution = await runScheduledAgent(dependencies, invocation, validate, context);
+  if (!execution.value || execution.covered === false) return execution;
+  return {
+    ...execution,
+    covered: execution.value.coverageComplete === true,
+    ...(execution.value.coverageComplete ? {} : { reason: execution.value.incompleteReason ?? "Reviewer did not complete assigned discovery." }),
+  };
+}
+
 function resultWithoutSnapshot(status: ReviewResult["status"], message: string, options: ReviewOptions): ReviewResult {
   return {
     effort: options.effort,
@@ -157,7 +200,7 @@ function completedResult(
     summary,
     findings,
     failures,
-    report: formatReviewReport(snapshot, status, summary, findings, failures),
+    report: formatReviewReport(snapshot, status, summary, findings, failures, coverage),
     commented,
     usage,
     ...(coverage === undefined ? {} : { coverage }),
@@ -181,6 +224,14 @@ function candidateWithFinder(
   };
 }
 
+function snapshotValidatorSource(snapshot: ReviewSnapshot, candidate: ReviewCandidate): string | undefined {
+  const pinned = snapshot.target.kind === "pull-request" || snapshot.pullRequest !== undefined;
+  const deleted = pinned && parseUnifiedDiff(snapshot.diff).files.some((file) =>
+    !file.malformed && file.oldPath === candidate.file && file.newPath === null);
+  if (deleted) return "File intentionally deleted at the captured revision; the supplied diff contains the prior source evidence.";
+  return collectValidatorSource(snapshot.sourceCwd ?? snapshot.cwd, candidate, { required: pinned });
+}
+
 function stageFailure(stage: StageFailure["stage"], error: unknown): StageFailure {
   return { stage, message: errorMessage(error) };
 }
@@ -198,19 +249,24 @@ function isWithinRoot(root: string, candidate: string): boolean {
 export function collectValidatorSource(
   cwd: string,
   candidate: Pick<ReviewCandidate, "file" | "line">,
+  options: { required?: boolean } = {},
 ): string | undefined {
-  if (!Number.isInteger(candidate.line) || candidate.line < 1) return undefined;
+  const unavailable = (): undefined => {
+    if (options.required) throw new Error("Captured revision source could not be read within the validator source boundary");
+    return undefined;
+  };
+  if (!Number.isInteger(candidate.line) || candidate.line < 1) return unavailable();
   const root = resolve(cwd);
   const requested = resolve(root, candidate.file);
-  if (!isWithinRoot(root, requested)) return undefined;
+  if (!isWithinRoot(root, requested)) return unavailable();
 
   let sourcePath: string;
   try {
     const realRoot = realpathSync(root);
     sourcePath = realpathSync(requested);
-    if (!isWithinRoot(realRoot, sourcePath) || !statSync(sourcePath).isFile()) return undefined;
+    if (!isWithinRoot(realRoot, sourcePath) || !statSync(sourcePath).isFile()) return unavailable();
   } catch {
-    return undefined;
+    return unavailable();
   }
 
   let descriptor: number | undefined;
@@ -222,7 +278,7 @@ export function collectValidatorSource(
     const lines = text.split(/\r?\n/u);
     // Do not use an unterminated partial line as source for the candidate.
     if (candidate.line > lines.length || (bytesRead === buffer.length && !text.endsWith("\n") && candidate.line === lines.length)) {
-      return undefined;
+      return unavailable();
     }
     const start = Math.max(0, candidate.line - 1 - VALIDATOR_SOURCE_WINDOW);
     const end = Math.min(lines.length, candidate.line - 1 + VALIDATOR_SOURCE_WINDOW + 1);
@@ -242,9 +298,7 @@ export function collectValidatorSource(
       rendered.push(line);
       renderedBytes += separatorBytes + lineBytes;
     }
-    return rendered.length > 0 ? rendered.join("\n") : undefined;
-  } catch {
-    return undefined;
+    return rendered.length > 0 ? rendered.join("\n") : unavailable();
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
@@ -318,12 +372,17 @@ export function roleInvocation(
     rolePlan.inputBudgetBytes,
     rolePlan.reservedTokens,
   );
+  const resultTool = resultToolFor(role);
+  const promptBudget = budget.inputBudgetBytes - reviewerControlReserveBytes(resultTool)
+    - Buffer.byteLength(`\n\n${REVIEWER_RETRY_SUFFIX}`, "utf8");
+  const prompt = buildPrompt(promptBudget);
+  assertInputBudget(prompt, promptBudget);
   return {
     role,
-    prompt: buildPrompt(budget.inputBudgetBytes),
+    prompt,
     cwd,
     tools: rolePlan.tools,
-    resultTool: resultToolFor(role),
+    resultTool,
     model,
     thinking: rolePlan.modelRoute.thinking,
     maxTurns: rolePlan.maxTurns,
@@ -459,7 +518,8 @@ function shardedManifestContext(snapshotHash: string, shardId: string, paths: re
     "Deterministic sharded review manifest; no summary reviewer was run.",
     `Snapshot: ${snapshotHash}`,
     `Shard: ${shardId}`,
-    `Changed paths: ${paths.join(", ")}`,
+    `Evidence paths in this shard only: ${paths.join(", ")}`,
+    "This is not the full review manifest. Use the separate reviewScope; local omissions do not establish globally unchanged files.",
     ...(options === undefined ? [] : [phaseContext(options), contractContext(options.contract), openFindingContext(options)]),
   ].filter(Boolean).join("\n");
 }
@@ -488,13 +548,22 @@ function coverageWithUnvalidated(
 
 function mergeCoverage(left: ReviewCoverage, right: ReviewCoverage, spentWeight: number): ReviewCoverage {
   const planned = [...new Set([...left.plannedUnitIds, ...right.plannedUnitIds])];
-  const covered = planned.filter((id) => left.coveredUnitIds.includes(id) || right.coveredUnitIds.includes(id));
-  const uncovered = planned.filter((id) => !covered.includes(id) && (left.uncoveredUnitIds.includes(id) || right.uncoveredUnitIds.includes(id)));
+  // A synthetic dependency in a later wave must not erase an earlier failure.
+  const failed = new Set([...left.uncoveredUnitIds, ...right.uncoveredUnitIds]);
+  const covered = planned.filter((id) => !failed.has(id) && (left.coveredUnitIds.includes(id) || right.coveredUnitIds.includes(id)));
+  const uncovered = planned.filter((id) => !covered.includes(id));
   const ranges = [...left.uncoveredRanges, ...right.uncoveredRanges];
   const plannedShards = [...new Set([...(left.plannedShardIds ?? []), ...(right.plannedShardIds ?? [])])];
-  const coveredShards = [...new Set([...(left.coveredShardIds ?? []), ...(right.coveredShardIds ?? [])])];
+  const requiredShardUnitIds = Object.freeze(Object.fromEntries(plannedShards.map((id) => {
+    const sides = [left, right].filter((side) => side.plannedShardIds?.includes(id));
+    // Legacy records cannot establish full required-role scope from old counts.
+    const known = sides.every((side) => side.requiredShardUnitIds?.[id]?.length);
+    return [id, Object.freeze(known ? [...new Set(sides.flatMap((side) => side.requiredShardUnitIds![id]!))] : [])];
+  })));
+  const coveredShards = plannedShards.filter((id) => requiredShardUnitIds[id]!.length > 0
+    && requiredShardUnitIds[id]!.every((unitId) => covered.includes(unitId)));
   const uncoveredShards = plannedShards.filter((id) => !coveredShards.includes(id));
-  const state = uncovered.length > 0 || left.state !== "complete" || right.state !== "complete" ? "incomplete" : "complete";
+  const state = uncovered.length > 0 || uncoveredShards.length > 0 || left.state !== "complete" || right.state !== "complete" ? "incomplete" : "complete";
   const maxWeight = left.budget?.maxWeight ?? left.maxWeight ?? right.budget?.maxWeight ?? right.maxWeight ?? 0;
   const attemptedUnitIds = [...new Set([...(left.attemptedUnitIds ?? []), ...(right.attemptedUnitIds ?? [])])];
   const attempts = { ...(left.attempts ?? {}), ...(right.attempts ?? {}) };
@@ -511,6 +580,7 @@ function mergeCoverage(left: ReviewCoverage, right: ReviewCoverage, spentWeight:
     uncoveredUnits: Object.freeze(uncovered),
     uncoveredRanges: Object.freeze(ranges),
     uncoveredRangeEvidence: Object.freeze(ranges),
+    requiredShardUnitIds,
     plannedShardIds: Object.freeze(plannedShards),
     coveredShardIds: Object.freeze(coveredShards),
     uncoveredShardIds: Object.freeze(uncoveredShards),
@@ -621,11 +691,10 @@ function roleForWorkUnit(unit: ReviewWorkUnit): Exclude<ReviewRole, "summary" | 
   }
 }
 
-function riskyShardIds(
+function shardRiskPredicate(
   snapshot: ReviewSnapshot,
-  shards: readonly { readonly id: string; readonly fileIdentities: readonly string[]; readonly payload: string }[],
   analysis: { readonly highRiskPaths: readonly string[]; readonly publicContractPaths: readonly string[]; readonly publicContractMarkers: readonly string[]; readonly binary: boolean; readonly renamed: boolean; readonly copied: boolean; readonly risk: boolean },
-): ReadonlySet<string> {
+): (shard: Pick<DiffShard, "fileIdentities" | "payload">) => boolean {
   const parsed = parseUnifiedDiff(snapshot.diff, snapshot.snapshotHash);
   const riskyFiles = new Set<string>([...analysis.highRiskPaths, ...analysis.publicContractPaths]);
   for (const file of parsed.files) {
@@ -639,9 +708,9 @@ function riskyShardIds(
     return payload.toLowerCase().includes(marker.toLowerCase());
   });
   const structuralRisk = analysis.binary || analysis.renamed || analysis.copied;
-  return new Set(shards.filter((shard) => structuralRisk
+  return (shard) => structuralRisk
     || shard.fileIdentities.some((path) => riskyFiles.has(path))
-    || markerRisk(shard.payload)).map((shard) => shard.id));
+    || markerRisk(shard.payload);
 }
 
 function unitSnapshot(snapshot: ReviewSnapshot, shards: ReadonlyMap<string, { readonly payload: string; readonly fileIdentities: readonly string[] }>, unit: ReviewWorkUnit): ReviewSnapshot {
@@ -676,6 +745,38 @@ function candidateFragmentSnapshot(
   return { ...snapshot, diff, changedPaths: [file.fileIdentity] };
 }
 
+function candidateFollowUpPrompt(
+  role: "contextual-bug" | "integration",
+  snapshot: ReviewSnapshot,
+  guidance: readonly GuidanceFile[],
+  context: string,
+  candidates: readonly ReviewCandidate[],
+  inputBudgetBytes: number,
+): string {
+  const suffix = `\nCandidate suspicions (inspect only these; do not recurse):\n${JSON.stringify(candidates)}`;
+  assertInputBudget(suffix, inputBudgetBytes);
+  const baseBudget = inputBudgetBytes - Buffer.byteLength(suffix, "utf8");
+  let lastError: unknown;
+  for (const contextLines of [undefined, 20, 5, 0]) {
+    const selected = contextLines === undefined ? snapshot : {
+      ...snapshot,
+      diff: candidateDiffExcerpt(snapshot.diff, snapshot.snapshotHash, candidates, contextLines),
+      changedPaths: [...new Set(candidates.map((candidate) => candidate.file))],
+    };
+    const selectedContext = contextLines === undefined ? context : `${context}\nCandidate-focused excerpts only; discovery covered the remaining changes. Use read/grep for additional source context.`;
+    try {
+      const base = rolePrompt(role, selected, guidance, workUnitGuidance(snapshot.sourceCwd ?? snapshot.cwd, guidance, selected), selectedContext, baseBudget);
+      const prompt = base + suffix;
+      assertInputBudget(prompt, inputBudgetBytes);
+      return prompt;
+    } catch (error) {
+      if (!isPromptBudgetFailure(error)) throw error;
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
 function workUnitStage(unit: ReviewWorkUnit): ReviewStage {
   if (unit.role === "summary") return "summary";
   return unit.role === "guidance" ? "guidance" : "finders";
@@ -705,22 +806,65 @@ async function runShardedReview(
   guidanceFailures: readonly StageFailure[],
   initialFailures: readonly StageFailure[] = [],
 ): Promise<ReviewResult> {
-  const shards = shardDiff(snapshot.diff, snapshot.snapshotHash);
+  const explicitManifest: ReviewWorkManifest | undefined = options.manifest ?? options.reviewWorkManifest ?? options.reviewWorkObligations;
+  const isRisky = shardRiskPredicate(snapshot, route.analysis);
+  const rolesForShard = (shard: DiffShard): ReviewRole[] => {
+    const hasGuidance = shard.fileIdentities.some((path) => guidanceForPath(snapshot.sourceCwd ?? snapshot.cwd, guidance, path).length > 0);
+    const risky = isRisky(shard);
+    return [
+      "diff-only-bug",
+      ...(hasGuidance ? ["guidance-a" as const] : []),
+      ...(hasGuidance && risky ? ["guidance-b" as const] : []),
+      ...(risky ? ["contextual-bug" as const] : []),
+      ...(route.route === "deep" && risky ? ["integration" as const] : []),
+    ];
+  };
+  let shards: readonly DiffShard[];
+  try {
+    // Explicit manifests may refer to standalone shard IDs; retain that layout.
+    if (explicitManifest !== undefined) {
+      shards = shardDiff(snapshot.diff, snapshot.snapshotHash);
+    } else {
+      const budgets = new Map<ReviewRole, number>();
+      const budgetFor = (role: ReviewRole): number => {
+        const cached = budgets.get(role);
+        if (cached !== undefined) return cached;
+        let budget = 0;
+        roleInvocation(role, route.plan.roles[role], (inputBudgetBytes) => { budget = inputBudgetBytes; return ""; }, snapshot.sourceCwd ?? snapshot.cwd, dependencies);
+        budgets.set(role, budget);
+        return budget;
+      };
+      shards = shardDiff(snapshot.diff, snapshot.snapshotHash, {
+        maxBytes: budgetFor("diff-only-bug"),
+        fitsPrompt: (shard) => {
+          const selected = shardSnapshot(snapshot, shard);
+          const context = shardedManifestContext(snapshot.snapshotHash, shard.id, selected.changedPaths, options);
+          const scoped = shardGuidance(snapshot.sourceCwd ?? snapshot.cwd, guidance, selected.changedPaths);
+          for (const role of rolesForShard(shard)) {
+            try {
+              rolePrompt(role, selected, guidance, scoped, context, budgetFor(role));
+            } catch (error) {
+              if (isPromptBudgetFailure(error)) return false;
+              throw error;
+            }
+          }
+          return true;
+        },
+      });
+    }
+  } catch (error) {
+    return completedResult(snapshot, options, "incomplete", "Review could not start because prompt-aware sharding failed.", [], [stageFailure("eligibility", error), ...initialFailures, ...guidanceFailures], [], false);
+  }
   const shardMap = new Map(shards.map((shard) => [shard.id, shard]));
-  const riskIds = riskyShardIds(snapshot, shards, route.analysis);
   const obligations: Array<{ readonly role: ReviewRole; readonly shardIds: readonly string[]; readonly trigger?: "always" | "risk" | "candidate" }> = [];
   for (const shard of shards) {
-    const paths = shard.fileIdentities;
-    const applicableGuidance = paths.some((path) => guidanceForPath(snapshot.cwd, guidance, path).length > 0);
-    const risky = riskIds.has(shard.id);
-    if (shard.supported) obligations.push({ role: "diff-only-bug", shardIds: [shard.id], trigger: "always" });
-    if (applicableGuidance) obligations.push({ role: "guidance-a", shardIds: [shard.id], trigger: "always" });
-    if (applicableGuidance && risky) obligations.push({ role: "guidance-b", shardIds: [shard.id], trigger: "risk" });
-    if (risky) obligations.push({ role: "contextual-bug", shardIds: [shard.id], trigger: "risk" });
-    if (route.route === "deep" && risky) obligations.push({ role: "integration", shardIds: [shard.id], trigger: "risk" });
+    for (const role of rolesForShard(shard)) {
+      if (role === "diff-only-bug" && !shard.supported) continue;
+      const trigger = role === "diff-only-bug" || role === "guidance-a" ? "always" : "risk";
+      obligations.push({ role, shardIds: [shard.id], trigger });
+    }
   }
 
-  const explicitManifest: ReviewWorkManifest | undefined = options.manifest ?? options.reviewWorkManifest ?? options.reviewWorkObligations;
   let plan: ReviewWorkPlan;
   try {
     plan = planReviewWork(snapshot, {
@@ -753,12 +897,12 @@ async function runShardedReview(
     try {
       const selected = unitSnapshot(snapshot, shardMap, unit);
       const context = shardedManifestContext(snapshot.snapshotHash, selectedShards[0]?.id ?? unit.id, selected.changedPaths, options);
-      const unitGuidance = selectedShards.flatMap((shard) => shardGuidance(snapshot.cwd, guidance, shard.fileIdentities));
+      const unitGuidance = selectedShards.flatMap((shard) => shardGuidance(snapshot.sourceCwd ?? snapshot.cwd, guidance, shard.fileIdentities));
       preflight.set(unit.id, roleInvocation(
         role,
         route.plan.roles[role],
         (inputBudgetBytes) => rolePrompt(role, selected, guidance, unitGuidance, context, inputBudgetBytes),
-        snapshot.cwd,
+        snapshot.sourceCwd ?? snapshot.cwd,
         dependencies,
       ));
     } catch (error) {
@@ -786,10 +930,11 @@ async function runShardedReview(
       const unit = plan.units.find((candidate) => candidate.id === unitId);
       if (unit) failures.push({ stage: workUnitStage(unit), message: `${roleForWorkUnit(unit) ?? unit.role}: ${reason}`.slice(0, 500) });
     }
-    if (plannedUncovered.length > 0) failures.push({ stage: "finders", message: `Required sharded work was rejected or unsupported (${plannedUncovered.length} unit${plannedUncovered.length === 1 ? "" : "s"}).` });
+    if (plannedUncovered.length > 0) failures.push({ stage: "finders", message: rejectedWorkMessage(plan) });
     return completedResult(snapshot, options, "incomplete", "Review could not start because required sharded coverage was unavailable.", [], failures, [], false, rejected.coverage);
   }
 
+  const completionReserve = validationReserve(plan);
   const selectedUnits = plan.units.filter((unit) => plan.selectedUnitIds.includes(unit.id) && unit.status === "planned" && !preflightFailures.has(unit.id));
   const initialUncoveredIds = plan.units.filter((unit) => unit.status === "uncovered" || preflightFailures.has(unit.id)).map((unit) => unit.id);
   const reasonByUnit: Record<string, string> = {};
@@ -804,20 +949,13 @@ async function runShardedReview(
     return [{
       id: unit.id,
       weight: unit.weight,
-      run: async (context) => {
-        const result = await runAgent(dependencies, {
-          ...invocation,
-          onAttemptStart: context.markAttemptStarted,
-          retryAdmission: context.retryAdmission,
-        }, finderValidator(role), context.signal);
-        return result;
-      },
+      run: async (context) => runScheduledFinder(dependencies, invocation, finderValidator(role), context),
     }];
   });
   let primaryOutcome: ReviewScheduleOutcome<FinderOutput> | undefined;
   progress(dependencies, "finders", `Running ${selectedUnits.map((unit) => roleForWorkUnit(unit) ?? unit.role).join(", ")} in parallel`);
   if (tasks.length > 0) {
-    primaryOutcome = await scheduleReviewWork(tasks, { capacity: plan.maxReviewWorkUnits, maxConcurrency: 4, ...(signal === undefined ? {} : { signal }) });
+    primaryOutcome = await scheduleReviewWork(tasks, { capacity: plan.maxReviewWorkUnits - completionReserve, maxConcurrency: 4, ...(signal === undefined ? {} : { signal }) });
   }
   const primaryCovered = primaryOutcome?.coveredUnitIds ?? [];
   const primaryUncovered = [...initialUncoveredIds, ...(primaryOutcome?.uncoveredUnitIds ?? [])];
@@ -844,7 +982,7 @@ async function runShardedReview(
   let aggregateCoverage = coveredPlan.coverage;
   const sourceByCandidate = new Map<string, ShardedCandidateSource>();
   const collectFinderCandidates = (outcome: ReviewScheduleOutcome<FinderOutput> | undefined): ReviewCandidate[] => (outcome?.results ?? []).flatMap((result) => {
-    if (result.status !== "covered" || result.value === undefined) return [];
+    if (result.value === undefined) return [];
     const unit = plan.units.find((candidate) => candidate.id === result.id);
     const role = unit === undefined ? undefined : roleForWorkUnit(unit);
     if (unit === undefined || role === undefined) return [];
@@ -873,12 +1011,13 @@ async function runShardedReview(
       byShard.set(source.shardId, group);
     }
     if (byShard.size === 0) return;
-    const remaining = plan.maxReviewWorkUnits - (aggregateCoverage.budget?.spentWeight ?? primaryOutcome?.spentWeight ?? 0);
+    const unspent = plan.maxReviewWorkUnits - (aggregateCoverage.budget?.spentWeight ?? primaryOutcome?.spentWeight ?? 0);
+    const remaining = Math.max(0, unspent - Math.min(unspent, Math.max(completionReserve, candidates.length)));
     const candidateShards = [...byShard.keys()].map((id) => shardMap.get(id)!).filter(Boolean);
     const candidatePlan = planReviewWork(snapshot, {
       shards: candidateShards,
       manifest: [...byShard.keys()].map((shardId) => ({ role, shardIds: [shardId], trigger: "candidate" as const })),
-      maxReviewWorkUnits: Math.max(1, Math.min(128, remaining + candidateShards.length)),
+      maxReviewWorkUnits: Math.max(1, Math.min(MAX_REVIEW_WORK_UNITS, remaining + candidateShards.length)),
       workLimitPolicy: "partial",
     });
     const syntheticDiffIds = candidatePlan.units.filter((unit) => unit.role === "diff").map((unit) => unit.id);
@@ -899,26 +1038,14 @@ async function runShardedReview(
         const invocation = roleInvocation(
           role,
           route.plan.roles[role],
-          (inputBudgetBytes) => {
-            const base = rolePrompt(role, focused, guidance, workUnitGuidance(snapshot.cwd, guidance, focused), context, inputBudgetBytes);
-            const prompt = `${base}\nCandidate suspicions (inspect only these; do not recurse):\n${JSON.stringify(group)}`;
-            assertInputBudget(prompt, inputBudgetBytes);
-            return prompt;
-          },
-          snapshot.cwd,
+          (inputBudgetBytes) => candidateFollowUpPrompt(role, focused, guidance, context, group, inputBudgetBytes),
+          snapshot.sourceCwd ?? snapshot.cwd,
           dependencies,
         );
         candidateTasks.push({
           id: unit.id,
           weight: unit.weight,
-          run: async (taskContext) => {
-            const result = await runAgent(dependencies, {
-              ...invocation,
-              onAttemptStart: taskContext.markAttemptStarted,
-              retryAdmission: taskContext.retryAdmission,
-            }, finderValidator(role), taskContext.signal);
-            return result;
-          },
+          run: async (taskContext) => runScheduledFinder(dependencies, invocation, finderValidator(role), taskContext),
         });
       } catch (error) {
         candidatePromptFailures.set(unit.id, errorMessage(error));
@@ -951,7 +1078,7 @@ async function runShardedReview(
       if (unit.status === "uncovered" && unit.role !== "diff") failures.push({ stage: role === "contextual-bug" ? "finders" : "finders", message: `${role}: ${unit.reason ?? "candidate follow-up was not covered"}`.slice(0, 500) });
     }
     for (const result of outcome?.results ?? []) {
-      if (result.status !== "covered" || result.value === undefined) continue;
+      if (result.value === undefined) continue;
       const unit = candidatePrepared.units.find((candidate) => candidate.id === result.id);
       const shardId = unit?.shardIds[0];
       if (!unit || !shardId) continue;
@@ -995,16 +1122,16 @@ async function runShardedReview(
     }
     try {
       const ownerSnapshot = candidateFragmentSnapshot(snapshot, owner.shard, candidate);
-      const candidateGuidance = guidanceForPath(snapshot.cwd, guidance, candidate.file);
+      const candidateGuidance = guidanceForPath(snapshot.sourceCwd ?? snapshot.cwd, guidance, candidate.file);
       const invocation = roleInvocation(
         "validator",
         route.plan.roles.validator,
         (inputBudgetBytes) => buildValidatorPrompt(candidate, ownerSnapshot, candidateGuidance, shardedManifestContext(snapshot.snapshotHash, owner.shard.id, ownerSnapshot.changedPaths, options), {
           passLabel: "primary",
-          source: collectValidatorSource(snapshot.cwd, candidate),
+          source: snapshotValidatorSource(snapshot, candidate),
           inputBudgetBytes,
         }),
-        snapshot.cwd,
+        snapshot.sourceCwd ?? snapshot.cwd,
         dependencies,
       );
       validatorByTask.set(candidate.id, candidate);
@@ -1074,8 +1201,6 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
   } catch (error) {
     return resultWithoutSnapshot("incomplete", errorMessage(error), options);
   }
-  const reviewCwd = snapshot.cwd;
-
   if (snapshot.changedPaths.length === 0 || snapshot.diff.trim().length === 0) {
     return completedResult(snapshot, options, "ineligible", "No changed files were found in the requested target.", [], [], [], false);
   }
@@ -1094,6 +1219,39 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
     }
   }
 
+  let sourceView: Awaited<ReturnType<typeof prepareReviewSourceView>>;
+  try {
+    sourceView = await (dependencies.prepareSourceView
+      ? dependencies.prepareSourceView(snapshot, signal)
+      : prepareReviewSourceView(snapshot, dependencies.commands, signal));
+  } catch (error) {
+    return completedResult(snapshot, options, "incomplete", "Review could not start because snapshot-pinned source evidence is unavailable.", [], [stageFailure("eligibility", error), ...failures], usage, false);
+  }
+  let result: ReviewResult;
+  try {
+    result = await runPreparedReview({ ...snapshot, sourceCwd: sourceView.root,
+      reviewChangedPaths: snapshot.reviewChangedPaths ?? snapshot.changedPaths }, options, dependencies, signal, failures, usage);
+  } catch (error) {
+    result = completedResult(snapshot, options, "incomplete", "Review execution did not complete.", [], [...failures, stageFailure("finders", error)], usage, false);
+  }
+  try {
+    await sourceView.dispose();
+  } catch (error) {
+    return completedResult(snapshot, options, "incomplete", result.summary, result.findings,
+      [...result.failures, stageFailure("revalidation", error)], result.usage, result.commented, result.coverage);
+  }
+  return result;
+}
+
+async function runPreparedReview(
+  snapshot: ReviewSnapshot,
+  options: ReviewOptions,
+  dependencies: ReviewDependencies,
+  signal: AbortSignal | undefined,
+  failures: StageFailure[],
+  usage: AgentResult<unknown>["usage"][],
+): Promise<ReviewResult> {
+  const reviewCwd = snapshot.sourceCwd ?? snapshot.cwd;
   // Configuration and classification happen once, after immutable snapshot
   // eligibility. A malformed root config is never silently downgraded.
   let routing;
@@ -1185,7 +1343,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
       reasonByUnit,
       reason: "required fitting work was not admitted within the configured work limit",
     });
-    const rejectFailures: StageFailure[] = [...failures, ...guidanceFailures];
+    const rejectFailures: StageFailure[] = [...failures, ...guidanceFailures, { stage: "finders", message: rejectedWorkMessage(workPlan) }];
     for (const unit of workPlan.units) {
       rejectFailures.push({
         stage: workUnitStage(unit),
@@ -1195,6 +1353,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
     return completedResult(snapshot, options, "incomplete", "Review could not start because required fitting coverage was unavailable.", [], rejectFailures, usage, false, rejected.coverage);
   }
 
+  const completionReserve = validationReserve(workPlan);
   let summary = "";
   let summaryOutcome: ReviewScheduleOutcome<SummaryOutput> | undefined;
   const summaryUnit = workPlan.units.find((unit) => unit.role === "summary");
@@ -1209,7 +1368,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
         id: summaryUnit.id,
         weight: summaryUnit.weight,
         run: async (context) => runScheduledAgent(dependencies, summaryInvocation, validateSummary, context),
-      }], { capacity: workPlan.maxReviewWorkUnits, maxConcurrency: 1, ...(signal === undefined ? {} : { signal }) });
+      }], { capacity: workPlan.maxReviewWorkUnits - completionReserve - workPlan.units.filter((unit) => unit.status === "planned" && unit.role !== "summary").reduce((sum, unit) => sum + unit.weight, 0), maxConcurrency: 1, ...(signal === undefined ? {} : { signal }) });
       const result = summaryOutcome.results[0];
       if (result?.usage) usage.push(result.usage);
       if (result?.status === "covered" && result.value !== undefined) summary = result.value.summary;
@@ -1273,11 +1432,11 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
     return [{
       id: unit.id,
       weight: unit.weight,
-      run: async (context) => runScheduledAgent(dependencies, invocation, finderValidator(role), context),
+      run: async (context) => runScheduledFinder(dependencies, invocation, finderValidator(role), context),
     }];
   });
   progress(dependencies, "finders", `Running ${primaryRoles.join(", ")} in parallel`);
-  const primaryCapacity = Math.max(0, workPlan.maxReviewWorkUnits - (summaryOutcome?.spentWeight ?? 0));
+  const primaryCapacity = Math.max(0, workPlan.maxReviewWorkUnits - completionReserve - (summaryOutcome?.spentWeight ?? 0));
   let primaryOutcome: ReviewScheduleOutcome<FinderOutput> | undefined;
   if (primaryTasks.length > 0 && primaryCapacity > 0) {
     primaryOutcome = await scheduleReviewWork(primaryTasks, { capacity: primaryCapacity, maxConcurrency: 4, ...(signal === undefined ? {} : { signal }) });
@@ -1353,7 +1512,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
   const primaryCandidates = deduplicateCandidates(
     filterCandidatesToChangedLines(
       (primaryOutcome?.results ?? []).flatMap((result) => {
-        if (result.status !== "covered" || result.value === undefined) return [];
+        if (result.value === undefined) return [];
         const unit = workPlan.units.find((candidate) => candidate.id === result.id);
         const role = unit === undefined ? undefined : unitAgentRole(unit);
         if (role === undefined || role === "summary" || role === "validator") return [];
@@ -1375,14 +1534,15 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
   if (route === "small") {
     const escalationCandidates = primaryCandidates.filter((candidate) => candidate.needsContext).slice(0, 1);
     if (escalationCandidates.length > 0) {
-      const remaining = Math.max(0, workPlan.maxReviewWorkUnits - spentWeight);
+      const unspent = Math.max(0, workPlan.maxReviewWorkUnits - spentWeight);
+      const remaining = Math.max(0, unspent - Math.min(unspent, Math.max(completionReserve, candidates.length)));
       const candidatePlan = planReviewWork(snapshot, {
         shards: [fittingShard],
         manifest: [
           { role: "diff-only-bug" },
           { role: "contextual-bug", trigger: "candidate" },
         ],
-        maxReviewWorkUnits: Math.max(1, Math.min(128, remaining + 1)),
+        maxReviewWorkUnits: Math.max(1, Math.min(MAX_REVIEW_WORK_UNITS, remaining + 1)),
         workLimitPolicy: workPlan.workLimitPolicy,
       });
       const syntheticDiffIds = candidatePlan.units.filter((unit) => unit.role === "diff").map((unit) => unit.id);
@@ -1397,22 +1557,14 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
           const invocation = roleInvocation(
             "contextual-bug",
             plan.roles["contextual-bug"],
-            (inputBudgetBytes) => {
-              const prompt = [
-                buildContextualBugPrompt(escalationSnapshot, escalationGuidance, promptContext, inputBudgetBytes),
-                "Contextual escalation candidates (inspect only these concrete suspicions):",
-                JSON.stringify({ candidates: escalationCandidates, relevantChangedPaths: escalationSnapshot.changedPaths }),
-              ].join("\n");
-              assertInputBudget(prompt, inputBudgetBytes);
-              return prompt;
-            },
+            (inputBudgetBytes) => candidateFollowUpPrompt("contextual-bug", escalationSnapshot, escalationGuidance, promptContext, escalationCandidates, inputBudgetBytes),
             reviewCwd,
             dependencies,
           );
           candidateTasks.push({
             id: contextualUnit.id,
             weight: contextualUnit.weight,
-            run: async (context) => runScheduledAgent(dependencies, invocation, validateContextualBug, context),
+            run: async (context) => runScheduledFinder(dependencies, invocation, validateContextualBug, context),
           });
         } catch (error) {
           candidatePromptFailures.set(contextualUnit.id, errorMessage(error));
@@ -1424,7 +1576,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
         usageFromOutcome(candidateOutcome);
       }
       const candidateUncovered = [
-        ...candidatePlan.units.filter((unit) => unit.status === "uncovered").map((unit) => unit.id),
+        ...candidatePlan.units.filter((unit) => unit.status === "uncovered" && !syntheticDiffIds.includes(unit.id)).map((unit) => unit.id),
         ...candidatePromptFailures.keys(),
         ...(candidateTasks.length > 0 && candidateOutcome === undefined ? candidateTasks.map((task) => task.id) : []),
         ...(candidateOutcome?.uncoveredUnitIds ?? []),
@@ -1450,7 +1602,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
         for (const candidate of escalationCandidates) unvalidated.push(unvalidatedCandidate(candidate, reason));
       }
       for (const result of candidateOutcome?.results ?? []) {
-        if (result.status !== "covered" || result.value === undefined) continue;
+        if (result.value === undefined) continue;
         for (const [index, candidate] of result.value.candidates.slice(0, plan.roles["contextual-bug"].candidateCap).entries()) {
           candidates.push(candidateWithFinder(candidate, "contextual-bug", index));
         }
@@ -1470,7 +1622,7 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
         plan.roles.validator,
         (inputBudgetBytes) => buildValidatorPrompt(candidate, snapshot, candidateGuidance, promptContext, {
           passLabel: "primary",
-          source: collectValidatorSource(reviewCwd, candidate),
+          source: snapshotValidatorSource(snapshot, candidate),
           inputBudgetBytes,
         }),
         reviewCwd,

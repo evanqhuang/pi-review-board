@@ -2,6 +2,7 @@ import type { PullRequestMetadata, ReviewCandidate, ReviewSnapshot } from "./typ
 import { formatGuidance, guidanceCoversPath, type GuidanceFile } from "./guidance.js";
 import { DEFAULT_INPUT_BUDGET_BYTES, InputLimitError, assertInputBudget } from "./input-budget.js";
 import { REVIEWER_RESULT_TOOLS } from "./reviewer-protocol.js";
+import { candidateDiffExcerpt } from "./diff-shards.js";
 
 export interface EligibilityOutput {
   readonly proceed: boolean;
@@ -28,6 +29,8 @@ export interface FinderCandidate {
 
 export interface FinderOutput {
   readonly candidates: readonly FinderCandidate[];
+  readonly coverageComplete: boolean;
+  readonly incompleteReason?: string;
 }
 
 export type VerificationDisposition = "CONFIRMED" | "PLAUSIBLE" | "REFUTED";
@@ -72,6 +75,9 @@ export function validateSummary(value: unknown): SummaryOutput {
 
 export function validateFinder(value: unknown): FinderOutput {
   const raw = object(value);
+  if (typeof raw.coverageComplete !== "boolean") throw new Error("Finder response must declare boolean coverageComplete");
+  const incompleteReason = raw.incompleteReason === undefined ? undefined : string(raw.incompleteReason, "incompleteReason");
+  if (!raw.coverageComplete && !incompleteReason) throw new Error("Incomplete discovery must include incompleteReason");
   if (!Array.isArray(raw.candidates)) throw new Error("Finder response must contain candidates array");
   if (raw.candidates.length > 8) throw new Error("Finder response contains too many candidates");
   const candidates = raw.candidates.map((candidate, index) => {
@@ -96,7 +102,7 @@ export function validateFinder(value: unknown): FinderOutput {
       needsContext: item.needsContext,
     } satisfies FinderCandidate;
   });
-  return { candidates };
+  return { candidates, coverageComplete: raw.coverageComplete, ...(incompleteReason === undefined ? {} : { incompleteReason }) };
 }
 
 /** Validate one candidate verdict, optionally enforcing its correlation ID. */
@@ -168,11 +174,59 @@ function reviewInput(payload: unknown): string {
   return ["<review-input>", serialized, "</review-input>"].join("\n");
 }
 
+interface ReviewScopePayload {
+  readonly fullReviewChangedPaths: readonly string[] | null;
+  readonly evidenceChangedPaths: readonly string[];
+  readonly scopeComplete: boolean;
+  readonly sourceRevision: string;
+}
+
+const REVIEW_SCOPE_INSTRUCTIONS = [
+  "Treat the required reviewScope object as authoritative.",
+  "evidenceChangedPaths is local shard or excerpt evidence, not the full PR scope.",
+  "The absence of a consumer, documentation file, or other path from local evidence cannot prove that it is unchanged.",
+].join("\n");
+const UNKNOWN_REVIEW_SCOPE_INSTRUCTIONS = "reviewScope.scopeComplete is false because the full review manifest was omitted to fit the input budget. Do not make global absence claims or claim that a consumer, documentation file, or other path is absent or unchanged.";
+
+function sourceRevision(snapshot: ReviewSnapshot): string {
+  const metadata = pullRequest(snapshot);
+  if (snapshot.pullRequest !== undefined || snapshot.target.kind === "pull-request") {
+    return snapshot.headSha || metadata?.headSha || "pull-request headSha unavailable";
+  }
+  return "local working-tree context";
+}
+
+function reviewScope(snapshot: ReviewSnapshot, scopeComplete: boolean): ReviewScopePayload {
+  return {
+    fullReviewChangedPaths: scopeComplete
+      ? uniqueSorted(snapshot.reviewChangedPaths ?? snapshot.changedPaths)
+      : null,
+    evidenceChangedPaths: [...snapshot.changedPaths],
+    scopeComplete,
+    sourceRevision: sourceRevision(snapshot),
+  };
+}
+
+/** Add the mandatory scope contract, trying every complete variant before an unknown-scope fallback. */
+function withReviewScope(
+  snapshot: ReviewSnapshot,
+  payloads: readonly Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const completeScope = reviewScope(snapshot, true);
+  const unknownScope = reviewScope(snapshot, false);
+  return [
+    ...payloads.map((payload) => ({ ...payload, reviewScope: completeScope })),
+    ...payloads.map((payload) => ({ ...payload, reviewScope: unknownScope })),
+  ];
+}
+
 function finderResultInstructions(): string {
   return [
     `Call ${REVIEWER_RESULT_TOOLS.finder} exactly once as the final action.`,
     "Return candidates: [] when no introduced high-signal defect is concretely established.",
     "Every candidate must identify a concrete changed file and positive changed line, a suspicion, rootCauseKey, failureScenario, evidence, category, severity (critical, high, or medium), and needsContext.",
+    "Declare coverageComplete truthfully. If the review or required investigation is incomplete, set coverageComplete:false with a non-empty incompleteReason and preserve every valid candidate.",
+    "Never equate an exhausted or bounded investigation with a clean candidates: [] result; an empty result is not proof that the uncovered scope is clean.",
     "needsContext is only an escalation request for the nearest follow-up context; it is never reportable by itself. Guidance candidates should normally set needsContext to false.",
   ].join("\n");
 }
@@ -182,7 +236,10 @@ function summaryResultInstructions(): string {
 }
 
 function validatorResultInstructions(): string {
-  return `Call ${REVIEWER_RESULT_TOOLS.verifier} exactly once as the final action with candidateId, disposition (CONFIRMED, PLAUSIBLE, or REFUTED), confidence from 0 to 100, and verification.`;
+  return [
+    `Call ${REVIEWER_RESULT_TOOLS.verifier} exactly once as the final action with candidateId, disposition (CONFIRMED, PLAUSIBLE, or REFUTED), confidence from 0 to 100, and verification.`,
+    "Do not return CONFIRMED for an absence-based claim when reviewScope.scopeComplete is false or when the claim is contradicted by fullReviewChangedPaths; local evidence absence cannot prove absence.",
+  ].join("\n");
 }
 
 function rolePrompt(role: string, focus: string, payload: unknown): string {
@@ -191,9 +248,15 @@ function rolePrompt(role: string, focus: string, payload: unknown): string {
     : role.startsWith("validator")
       ? validatorResultInstructions()
       : finderResultInstructions();
+  const scope = typeof payload === "object" && payload !== null && !Array.isArray(payload)
+    ? (payload as { readonly reviewScope?: unknown }).reviewScope : undefined;
+  const scopeComplete = scope !== null && typeof scope === "object"
+    ? (scope as { readonly scopeComplete?: unknown }).scopeComplete : undefined;
   return [
     `You are the bounded ${role} reviewer. ${focus}`,
     BOUNDED_WORKER_INSTRUCTIONS,
+    REVIEW_SCOPE_INSTRUCTIONS,
+    ...(scopeComplete === false ? [UNKNOWN_REVIEW_SCOPE_INSTRUCTIONS] : []),
     resultInstructions,
     reviewInput(payload),
   ].join("\n");
@@ -295,18 +358,19 @@ function relativeGuidancePath(path: string, cwd: string): string {
 }
 
 function scopedGuidance(snapshot: ReviewSnapshot, files: readonly GuidanceFile[]): GuidanceScope[] {
+  const sourceRoot = snapshot.sourceCwd ?? snapshot.cwd;
   return uniqueSorted(snapshot.changedPaths).map((path) => ({
     path,
     guidance: files.filter((file) => guidanceCoversPath(
-      snapshot.cwd,
-      file.path.startsWith("/") ? file.path : `${snapshot.cwd}/${file.path}`,
+      sourceRoot,
+      file.path.startsWith("/") ? file.path : `${sourceRoot}/${file.path}`,
       path,
     )),
   }));
 }
 
 function guidanceForRole(snapshot: ReviewSnapshot, files: readonly GuidanceFile[]): GuidancePayload {
-  return guidancePayload(scopedGuidance(snapshot, files), snapshot.cwd);
+  return guidancePayload(scopedGuidance(snapshot, files), snapshot.sourceCwd ?? snapshot.cwd);
 }
 
 function eligibilityPrompt(pullRequest: PullRequestMetadata): string {
@@ -373,7 +437,7 @@ export function buildSummaryPrompt(
   return boundedRolePrompt(
     "summary",
     "Summarize only the supplied change for the other bounded reviewers.",
-    payloads,
+    withReviewScope(snapshot, payloads),
     inputBudgetBytes,
   );
 }
@@ -398,7 +462,7 @@ export function buildGuidancePrompt(
 ): string {
   const changedFiles = [...guidanceByPath]
     .sort((left, right) => left.path.localeCompare(right.path));
-  const guidance = guidancePayload(changedFiles, snapshot.cwd);
+  const guidance = guidancePayload(changedFiles, snapshot.sourceCwd ?? snapshot.cwd);
   const payloads: Record<string, unknown>[] = [];
   const diffs = diffVariants(snapshot.diff);
   const summaries = guidanceSummaryVariants(snapshot, summary);
@@ -416,7 +480,7 @@ export function buildGuidancePrompt(
   return boundedRolePrompt(
     "guidance",
     "Check only the changed code against the applicable repository guidance. Do not invent guidance or report a rule that does not apply to a changed line.",
-    payloads,
+    withReviewScope(snapshot, payloads),
     inputBudgetBytes,
   );
 }
@@ -472,7 +536,7 @@ export function buildDiffOnlyBugPrompt(
   return boundedRolePrompt(
     "diff-only bug",
     "Reason from the diff alone. Do not assume unseen context, callers, repository conventions, or intended behavior; do not request context for a vague concern.",
-    payloads,
+    withReviewScope(snapshot, payloads),
     inputBudgetBytes,
   );
 }
@@ -504,7 +568,7 @@ function finderPayloads(
     payloads.push({ ...base(diffs[1] ?? diffs[0]!, false), summary: OMITTED_SUMMARY });
   }
   if (diffs[1] !== undefined && summaryValue) payloads.push({ ...base(diffs[0]!, false), summary: OMITTED_SUMMARY });
-  return payloads;
+  return withReviewScope(snapshot, payloads);
 }
 
 export function buildContextualBugPrompt(
@@ -692,7 +756,7 @@ export function buildValidatorPrompt(
 ): string {
   const selected = candidateHunk(snapshot.diff, candidate);
   const exactVariants = diffVariants(selected.hunk);
-  const relevantGuidance = formatGuidance(deduplicateGuidance(guidance), snapshot.cwd);
+  const relevantGuidance = formatGuidance(deduplicateGuidance(guidance), snapshot.sourceCwd ?? snapshot.cwd);
   const context = selected.nearby;
   const source = options.source?.trim() || selected.nearby;
   const trimmedSummary = summary.trim();
@@ -728,12 +792,41 @@ export function buildValidatorPrompt(
   if (exactVariants[1] !== undefined) {
     for (const optional of optionalFields.slice(1)) payloads.push(makePayload(exactVariants[0]!, optional));
   }
-  return boundedRolePrompt(
+  const fit = (choices: readonly Record<string, unknown>[]): string => boundedRolePrompt(
     `validator (${options.passLabel ?? "primary"} pass)`,
-    "Validate only this candidate. Check the exact changed hunk, nearby diff context, and bounded nearby source supplied below; use relevant guidance and the optional summary only to establish this candidate's stated failure scenario.",
-    payloads,
+    "Validate only this candidate. Check the exact changed hunk, nearby diff context, and bounded nearby source supplied below; use relevant guidance and the optional summary only to establish this candidate's stated failure scenario. When evidenceScope labels an excerpt, do not assume omitted changes are absent. Return PLAUSIBLE rather than CONFIRMED if the supplied evidence is insufficient.",
+    choices,
     options.inputBudgetBytes ?? DEFAULT_INPUT_BUDGET_BYTES,
   );
+  let lastError: InputLimitError;
+  try {
+    return fit(withReviewScope(snapshot, payloads));
+  } catch (error) {
+    if (!(error instanceof InputLimitError)) throw error;
+    lastError = error;
+  }
+  // Candidate verification is narrower than mandatory discovery. Preserve
+  // exact source ranges and label any reduced evidence explicitly.
+  for (const contextLines of [20, 5, 0]) {
+    let excerpt: string;
+    try {
+      excerpt = candidateDiffExcerpt(snapshot.diff, snapshot.snapshotHash, [candidate], contextLines);
+    } catch {
+      throw lastError;
+    }
+    const exact = candidateHunk(excerpt, candidate).hunk;
+    const excerptPayloads = optionalFields.map((optional) => ({
+      ...makePayload(exact, optional),
+      evidenceScope: "Candidate-focused excerpt; not the full original changed hunk. Missing context cannot establish a confirmed finding.",
+    }));
+    try {
+      return fit(withReviewScope(snapshot, excerptPayloads));
+    } catch (error) {
+      if (!(error instanceof InputLimitError)) throw error;
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 /** The protocol name remains verifier while the role is a candidate validator. */

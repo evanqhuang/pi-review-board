@@ -5,6 +5,10 @@ import {
   REVIEWER_RESULT_PROTOCOL_VERSION,
   REVIEWER_RESULT_TOOLS,
 } from "../src/reviewer-protocol.js";
+import {
+  createReviewerFinalizationController,
+  reviewerFinalizationControlFromEnv,
+} from "../src/reviewer-control.js";
 
 const MAX_TEXT_LENGTH = 8_000;
 const MAX_CANDIDATES = 8;
@@ -40,9 +44,15 @@ const summarySchema = Type.Object({
 
 const finderSchema = Type.Object({
   candidates: Type.Array(candidateSchema, {
-    description: "Concrete introduced high-signal changed-line defects, or an empty array",
+    description: "Concrete introduced high-signal changed-line defects, or the valid candidates found so far",
     maxItems: MAX_CANDIDATES,
   }),
+  coverageComplete: Type.Boolean({
+    description: "Whether the assigned discovery was completed within the bounded run",
+  }),
+  incompleteReason: Type.Optional(nonEmptyText(
+    "Why the assigned discovery is incomplete; required when coverageComplete is false",
+  )),
 }, { additionalProperties: false });
 
 /** One verdict for one candidate; there is deliberately no batch field. */
@@ -94,6 +104,8 @@ const finderTool = defineTool({
   promptSnippet: "Submit final candidates with review_finder_result",
   promptGuidelines: [
     "Use review_finder_result exactly once as the final action, including candidates: [] when no introduced high-signal defect exists.",
+    "Set coverageComplete:true only when every assigned discovery obligation was completed.",
+    "When coverageComplete:false, retain all valid candidates already established and explain the unfinished obligation in incompleteReason; do not replace candidates with [] merely because time ended.",
     "Set needsContext only when the concrete changed-line suspicion needs nearest-context follow-up; it is never a finding by itself.",
     "Do not emit a replacement assistant JSON response after submitting the result.",
   ],
@@ -130,5 +142,22 @@ const verifierTool = defineTool({
 export const reviewerOutputTools = [summaryTool, finderTool, verifierTool] as const;
 
 export default function reviewerOutputExtension(pi: ExtensionAPI): void {
+  // Result tools remain available when this extension is used standalone. The
+  // bounded hooks are enabled only for a validated per-process invocation.
   for (const tool of reviewerOutputTools) pi.registerTool(tool);
+
+  const control = reviewerFinalizationControlFromEnv();
+  if (!control) return;
+
+  const controller = createReviewerFinalizationController(control, {
+    setActiveTools: (toolNames) => pi.setActiveTools([...toolNames]),
+  });
+  pi.on("session_start", () => {
+    controller.init(control);
+  });
+  pi.on("turn_start", () => controller.onTurnStart());
+  pi.on("turn_end", () => controller.onTurnEnd());
+  pi.on("context", (event) => ({
+    messages: controller.transformContext(event.messages),
+  }));
 }

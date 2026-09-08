@@ -286,8 +286,51 @@ describe("runCodeReview deterministic topology", () => {
     expect(result.coverage?.mode).toBe("sharded");
     expect(result.coverage?.state).toBe("complete");
     expect(agents.calls.filter((call) => call.role === "summary")).toHaveLength(0);
-    expect(agents.calls.filter((call) => call.role === "diff-only-bug").length).toBeGreaterThan(1);
+    const shardFinders = agents.calls.filter((call) => call.role === "diff-only-bug");
+    expect(shardFinders.length).toBeGreaterThan(1);
+    for (const finder of shardFinders) {
+      const payload = JSON.parse(finder.prompt.split("<review-input>\n")[1]!.split("\n</review-input>")[0]!) as {
+        changedPaths: string[];
+        reviewScope: { assignedScopeComplete: boolean; globalScopeComplete: boolean; evidenceChangedPaths: string[] };
+      };
+      expect(payload.reviewScope).toMatchObject({ assignedScopeComplete: true, globalScopeComplete: true });
+      expect(payload.reviewScope.evidenceChangedPaths).toEqual(payload.changedPaths);
+    }
     expect(agents.calls.filter((call) => call.role === "validator")).toHaveLength(0);
+  });
+
+  it("keeps assigned shard coverage complete when an oversized global manifest is omitted", async () => {
+    const agents = new RecordingAgents();
+    agents.candidateCount = 0;
+    const manifest = Array.from({ length: 5_000 }, (_, index) => `docs/generated/consumer-${index.toString().padStart(4, "0")}.md`);
+    const result = await runCodeReview({
+      cwd: "/repo",
+      target,
+      comment: false,
+      effort: "normal",
+      snapshot: { ...snapshot(tinyDiff), reviewChangedPaths: manifest },
+    }, dependencies(agents));
+
+    expect(result.status).toBe("complete");
+    expect(result.coverage?.state).toBe("complete");
+    const finder = agents.calls.find((call) => call.role === "diff-only-bug");
+    expect(finder).toBeDefined();
+    if (finder === undefined) return;
+    const payload = JSON.parse(finder.prompt.split("<review-input>\n")[1]!.split("\n</review-input>")[0]!) as {
+      reviewScope: {
+        assignedScopeComplete: boolean;
+        globalScopeComplete: boolean;
+        evidenceChangedPaths: string[];
+        fullReviewChangedPaths: string[] | null;
+      };
+    };
+    expect(payload.reviewScope).toMatchObject({
+      assignedScopeComplete: true,
+      globalScopeComplete: false,
+      evidenceChangedPaths: ["src/a.ts"],
+      fullReviewChangedPaths: null,
+    });
+    expect(Buffer.byteLength(finder.prompt, "utf8")).toBeLessThanOrEqual(finder.inputBudgetBytes!);
   });
 
   it("reviews a 71-file diff with guidance under the default work budget", async () => {

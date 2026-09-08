@@ -157,41 +157,31 @@ export function filterCandidatesToChangedLines(
   });
 }
 
-function normalizedCandidatePath(value: string): string {
-  // Filtering normally canonicalizes Git prefixes first. Do not strip a
-  // leading a/ or b/ here: those can be legitimate repository directories.
-  return normalizeReviewPath(value).trim();
-}
-
 function candidateKey(candidate: ReviewCandidate): string {
-  // A root cause can legitimately occur at multiple changed locations or have
-  // multiple failure modes. Only collapse an observation when all three
-  // identifying dimensions overlap.
-  return [
-    normalize(candidate.rootCauseKey),
-    `${normalizedCandidatePath(candidate.file)}:${candidate.line}`,
-    normalize(candidate.failureScenario),
-  ].join("|");
+  // rootCauseKey is the review protocol's explicit identity for one defect.
+  // Keep category as a conservative namespace: distinct findings in the same
+  // file, nearby lines, or with similar wording must not merge accidentally.
+  return [normalize(candidate.category), normalize(candidate.rootCauseKey)].join("|");
 }
 
 export function deduplicateCandidates(candidates: readonly ReviewCandidate[]): ReviewCandidate[] {
-  const byObservation = new Map<string, ReviewCandidate>();
+  const byIdentity = new Map<string, ReviewCandidate>();
   for (const candidate of candidates) {
     const key = candidateKey(candidate);
-    const existing = byObservation.get(key);
+    const existing = byIdentity.get(key);
     if (!existing) {
       // Map insertion order is the finder order and candidate IDs are supplied
       // by the caller, so retaining the first observation keeps both stable.
-      byObservation.set(key, candidate);
+      byIdentity.set(key, candidate);
       continue;
     }
     // needsContext is an escalation request, so losing it during a merge would
     // silently discard a request for the nearest follow-up context.
     if (existing.needsContext || candidate.needsContext) {
-      byObservation.set(key, { ...existing, needsContext: true });
+      byIdentity.set(key, { ...existing, needsContext: true });
     }
   }
-  return [...byObservation.values()];
+  return [...byIdentity.values()];
 }
 
 export interface FindingFilterOptions {

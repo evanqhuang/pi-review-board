@@ -169,6 +169,10 @@ describe("bounded role prompt and result contracts", () => {
     const diffPrompt = buildDiffOnlyBugPrompt(snapshot);
     expect(diffPrompt).toContain("Reason from the diff alone");
     expect(diffPrompt).toContain("Do not assume unseen context");
+    expect(diffPrompt).toContain("rootCauseKey is a semantic identity from affected component/mechanism plus triggering failure");
+    expect(diffPrompt).toContain("Same defect across locations: same key");
+    expect(diffPrompt).toContain("distinct failure mechanisms: distinct keys");
+    expect(diffPrompt).toContain("Dedup never equates different semantic keys");
     expect(diffPrompt).toContain("title");
     expect(diffPrompt).toContain("body");
 
@@ -190,7 +194,8 @@ describe("bounded role prompt and result contracts", () => {
     expect(contextualPayload.reviewScope).toEqual({
       fullReviewChangedPaths: ["docs/consumer.md", "src/cache.ts"],
       evidenceChangedPaths: ["src/cache.ts"],
-      scopeComplete: true,
+      assignedScopeComplete: true,
+      globalScopeComplete: true,
       sourceRevision: "local working-tree context",
     });
     const validator = buildValidatorPrompt(firstCandidate, {
@@ -205,6 +210,8 @@ describe("bounded role prompt and result contracts", () => {
     }, [], "", { inputBudgetBytes: 8_000 });
     const validatorPayload = reviewPayload(validator);
     expect(validatorPayload.evidenceScope).toContain("not the full original changed hunk");
+    expect(validatorPayload.reviewScope.assignedScopeComplete).toBe(false);
+    expect(validatorPayload.reviewScope.globalScopeComplete).toBe(true);
     expect(validatorPayload.reviewScope.fullReviewChangedPaths).toEqual(["docs/consumer.md", "src/cache.ts"]);
     expect(validatorPayload.reviewScope.evidenceChangedPaths).toEqual(["src/cache.ts"]);
   });
@@ -217,7 +224,8 @@ describe("bounded role prompt and result contracts", () => {
     }, [], "summary-😀".repeat(5000), 4_000);
     expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(4_000);
     const payload = reviewPayload(prompt);
-    expect(payload.reviewScope.scopeComplete).toBe(true);
+    expect(payload.reviewScope.assignedScopeComplete).toBe(true);
+    expect(payload.reviewScope.globalScopeComplete).toBe(true);
     expect(payload.reviewScope.fullReviewChangedPaths).toEqual(["docs/consumer.md", "src/cache.ts"]);
     expect(payload.summary).toBe("[omitted optional summary to fit input budget]");
   });
@@ -234,10 +242,13 @@ describe("bounded role prompt and result contracts", () => {
     expect(payload.reviewScope).toEqual({
       fullReviewChangedPaths: null,
       evidenceChangedPaths: ["src/cache.ts"],
-      scopeComplete: false,
+      assignedScopeComplete: true,
+      globalScopeComplete: false,
       sourceRevision: "local working-tree context",
     });
     expect(prompt).toContain("Do not make global absence claims");
+    expect(prompt).toContain("This does not make the assigned shard incomplete");
+    expect(prompt).not.toContain("reviewScope.scopeComplete");
     expect(prompt).not.toContain("global absence claims are permitted");
   });
 

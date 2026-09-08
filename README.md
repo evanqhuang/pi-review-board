@@ -59,7 +59,10 @@ The last allowed provider call receives only the expected result tool and an
 explicit finalization instruction. The turn allowance is unchanged; the parent
 still enforces the hard ceiling. Finder results must declare `coverageComplete`.
 An exhausted investigation can retain candidates, but cannot count as clean
-coverage merely by returning an empty list.
+coverage merely by returning an empty list. Candidate `category` + `rootCauseKey`
+values are stable semantic identities: the same identity is coalesced across
+changed locations and wording, while distinct identities remain separate even
+in the same file.
 
 A short missing or malformed result may receive one scheduler-admitted correction
 attempt. Retry eligibility counts semantic output rather than repeated transport
@@ -85,9 +88,12 @@ submodules, and ambiguous paths are rejected. Temporary trees are disposed after
 success, failure, or cancellation. Current-diff and explicit worktree reviews
 retain their existing working-tree evidence, including local modifications.
 
-Every review prompt distinguishes full changed-path scope from local shard or
-excerpt evidence. If the full manifest cannot fit, it is explicitly marked
-unknown and cannot justify global absence claims about consumers or documentation.
+Every review prompt distinguishes the evidence assigned to its unit from the
+full global changed-path scope. `assignedScopeComplete` governs finder coverage
+and remains true when a complete shard is supplied; `globalScopeComplete` only
+reports whether the full changed-path manifest is visible. If that manifest
+cannot fit, it is explicitly marked unknown and cannot justify global absence
+claims about consumers or documentation.
 
 A shard is covered only when every applicable required obligation is covered,
 including guidance, contextual work, and candidate follow-ups/validation. Later

@@ -518,8 +518,8 @@ function shardedManifestContext(snapshotHash: string, shardId: string, paths: re
     "Deterministic sharded review manifest; no summary reviewer was run.",
     `Snapshot: ${snapshotHash}`,
     `Shard: ${shardId}`,
-    `Evidence paths in this shard only: ${paths.join(", ")}`,
-    "This is not the full review manifest. Use the separate reviewScope; local omissions do not establish globally unchanged files.",
+    `Evidence paths assigned to this shard: ${paths.join(", ")}`,
+    "The assigned shard evidence is complete unless reviewScope.assignedScopeComplete says otherwise. This is not the full global review manifest; reviewScope.globalScopeComplete:false means local omissions do not establish globally unchanged files.",
     ...(options === undefined ? [] : [phaseContext(options), contractContext(options.contract), openFindingContext(options)]),
   ].filter(Boolean).join("\n");
 }

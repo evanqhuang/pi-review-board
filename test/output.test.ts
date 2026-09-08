@@ -28,7 +28,7 @@ function candidate(overrides: Partial<ReviewCandidate> = {}): ReviewCandidate {
 }
 
 describe("review output", () => {
-  it("deduplicates a root cause across wording and location while retaining distinct roots", () => {
+  it("deduplicates one explicit root cause across wording and locations while retaining distinct roots", () => {
     const first = candidate();
     const sameRootDifferentLocation = candidate({
       id: "finder:two:0",
@@ -44,11 +44,67 @@ describe("review output", () => {
       summary: "Uses an old cache value",
       failureScenario: "When the cache is cold, the result is wrong",
     });
-    const distinctScenario = candidate({ id: "finder:four:0", failureScenario: "A warm cache returns an invalid value" });
+    const distinctScenario = candidate({
+      id: "finder:four:0",
+      rootCauseKey: "cache:warm-invalid-value",
+      failureScenario: "A warm cache returns an invalid value",
+    });
     const distinct = candidate({ id: "finder:five:0", rootCauseKey: "errors:dropped-state", summary: "Drops error state" });
     const result = deduplicateCandidates([first, sameRootDifferentLocation, sameObservation, distinctScenario, distinct]);
-    expect(result.map((item) => item.id)).toEqual([first.id, sameRootDifferentLocation.id, distinctScenario.id, distinct.id]);
+    expect(result.map((item) => item.id)).toEqual([first.id, distinctScenario.id, distinct.id]);
     expect(result[0]?.needsContext).toBe(true);
+  });
+
+  it("keeps separate nearby failures in one file even when their wording overlaps", () => {
+    const migrationFilename = candidate({
+      rootCauseKey: "migration:stale-filename",
+      file: "src/migrate.ts",
+      line: 36,
+      summary: "Uses the old migration filename",
+      failureScenario: "A migration lookup fails after the file is renamed",
+    });
+    const sameMigrationFilename = candidate({
+      id: "finder:migration:45",
+      rootCauseKey: "migration:stale-filename",
+      file: "src/migrate.ts",
+      line: 45,
+      summary: "References the legacy migration name",
+      failureScenario: "The renamed migration cannot be found",
+    });
+    const sameMigrationFilenameAgain = candidate({
+      id: "finder:migration:48",
+      rootCauseKey: "migration:stale-filename",
+      file: "src/migrate.ts",
+      line: 48,
+      summary: "Points at a migration filename that no longer exists",
+      failureScenario: "Startup cannot load the renamed migration",
+    });
+    const differentFailureNearby = candidate({
+      id: "finder:migration:47",
+      rootCauseKey: "migration:invalid-order",
+      file: "src/migrate.ts",
+      line: 47,
+      summary: "Runs migrations in the wrong order",
+      failureScenario: "A dependent migration executes before its prerequisite",
+    });
+    const result = deduplicateCandidates([
+      migrationFilename,
+      sameMigrationFilename,
+      differentFailureNearby,
+      sameMigrationFilenameAgain,
+    ]);
+    expect(result.map((item) => item.id)).toEqual([migrationFilename.id, differentFailureNearby.id]);
+  });
+
+  it("preserves the category namespace for otherwise identical root identities", () => {
+    const correctness = candidate({ rootCauseKey: "shared:contract-break", category: "correctness" });
+    const integration = candidate({
+      id: "finder:integration:0",
+      rootCauseKey: "shared:contract-break",
+      category: "integration",
+      summary: "Breaks an integration boundary",
+    });
+    expect(deduplicateCandidates([correctness, integration])).toEqual([correctness, integration]);
   });
 
   it("accepts only changed locations and rejects verifier corrections outside them", () => {

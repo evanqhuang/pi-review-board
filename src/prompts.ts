@@ -177,16 +177,19 @@ function reviewInput(payload: unknown): string {
 interface ReviewScopePayload {
   readonly fullReviewChangedPaths: readonly string[] | null;
   readonly evidenceChangedPaths: readonly string[];
-  readonly scopeComplete: boolean;
+  /** Whether this invocation received all evidence assigned to its unit. */
+  readonly assignedScopeComplete: boolean;
+  /** Whether the complete changed-path manifest is visible to this invocation. */
+  readonly globalScopeComplete: boolean;
   readonly sourceRevision: string;
 }
 
 const REVIEW_SCOPE_INSTRUCTIONS = [
-  "Treat the required reviewScope object as authoritative.",
-  "evidenceChangedPaths is local shard or excerpt evidence, not the full PR scope.",
-  "The absence of a consumer, documentation file, or other path from local evidence cannot prove that it is unchanged.",
+  "reviewScope is authoritative: evidenceChangedPaths is this assigned shard or excerpt; assignedScopeComplete is independent of globalScopeComplete.",
+  "assignedScopeComplete:true means complete assigned evidence and report coverageComplete:true when done, even if globalScopeComplete:false; false means preserve candidates and report coverageComplete:false with missing/truncated evidence.",
+  "Local absence cannot prove an unchanged consumer, documentation file, or other path.",
 ].join("\n");
-const UNKNOWN_REVIEW_SCOPE_INSTRUCTIONS = "reviewScope.scopeComplete is false because the full review manifest was omitted to fit the input budget. Do not make global absence claims or claim that a consumer, documentation file, or other path is absent or unchanged.";
+const UNKNOWN_REVIEW_SCOPE_INSTRUCTIONS = "reviewScope.globalScopeComplete is false because the full review manifest was omitted to fit the input budget. This does not make the assigned shard incomplete. Do not make global absence claims or claim that a consumer, documentation file, or other path is absent or unchanged.";
 
 function sourceRevision(snapshot: ReviewSnapshot): string {
   const metadata = pullRequest(snapshot);
@@ -196,26 +199,28 @@ function sourceRevision(snapshot: ReviewSnapshot): string {
   return "local working-tree context";
 }
 
-function reviewScope(snapshot: ReviewSnapshot, scopeComplete: boolean): ReviewScopePayload {
+function reviewScope(snapshot: ReviewSnapshot, globalScopeComplete: boolean, assignedScopeComplete = true): ReviewScopePayload {
   return {
-    fullReviewChangedPaths: scopeComplete
+    fullReviewChangedPaths: globalScopeComplete
       ? uniqueSorted(snapshot.reviewChangedPaths ?? snapshot.changedPaths)
       : null,
     evidenceChangedPaths: [...snapshot.changedPaths],
-    scopeComplete,
+    assignedScopeComplete,
+    globalScopeComplete,
     sourceRevision: sourceRevision(snapshot),
   };
 }
 
-/** Add the mandatory scope contract, trying every complete variant before an unknown-scope fallback. */
+/** Add the mandatory scope contract, trying every complete variant before an unknown-manifest fallback. */
 function withReviewScope(
   snapshot: ReviewSnapshot,
   payloads: readonly Record<string, unknown>[],
+  assignedScopeComplete = true,
 ): Record<string, unknown>[] {
-  const completeScope = reviewScope(snapshot, true);
-  const unknownScope = reviewScope(snapshot, false);
+  const completeAssignedScope = reviewScope(snapshot, true, assignedScopeComplete);
+  const unknownScope = reviewScope(snapshot, false, assignedScopeComplete);
   return [
-    ...payloads.map((payload) => ({ ...payload, reviewScope: completeScope })),
+    ...payloads.map((payload) => ({ ...payload, reviewScope: completeAssignedScope })),
     ...payloads.map((payload) => ({ ...payload, reviewScope: unknownScope })),
   ];
 }
@@ -225,7 +230,8 @@ function finderResultInstructions(): string {
     `Call ${REVIEWER_RESULT_TOOLS.finder} exactly once as the final action.`,
     "Return candidates: [] when no introduced high-signal defect is concretely established.",
     "Every candidate must identify a concrete changed file and positive changed line, a suspicion, rootCauseKey, failureScenario, evidence, category, severity (critical, high, or medium), and needsContext.",
-    "Declare coverageComplete truthfully. If the review or required investigation is incomplete, set coverageComplete:false with a non-empty incompleteReason and preserve every valid candidate.",
+    "rootCauseKey is a semantic identity from affected component/mechanism plus triggering failure; exclude chosen line, reviewer identity, and paraphrased title. Same defect across locations: same key; distinct failure mechanisms: distinct keys. Dedup never equates different semantic keys.",
+    "Declare coverageComplete truthfully for the assigned scope. If assigned evidence or required investigation is incomplete, set coverageComplete:false with a non-empty incompleteReason and preserve every valid candidate. globalScopeComplete:false alone is not an incomplete assigned investigation.",
     "Never equate an exhausted or bounded investigation with a clean candidates: [] result; an empty result is not proof that the uncovered scope is clean.",
     "needsContext is only an escalation request for the nearest follow-up context; it is never reportable by itself. Guidance candidates should normally set needsContext to false.",
   ].join("\n");
@@ -238,7 +244,7 @@ function summaryResultInstructions(): string {
 function validatorResultInstructions(): string {
   return [
     `Call ${REVIEWER_RESULT_TOOLS.verifier} exactly once as the final action with candidateId, disposition (CONFIRMED, PLAUSIBLE, or REFUTED), confidence from 0 to 100, and verification.`,
-    "Do not return CONFIRMED for an absence-based claim when reviewScope.scopeComplete is false or when the claim is contradicted by fullReviewChangedPaths; local evidence absence cannot prove absence.",
+    "Do not return CONFIRMED for an absence-based claim when reviewScope.globalScopeComplete is false or when the claim is contradicted by fullReviewChangedPaths; local evidence absence cannot prove absence.",
   ].join("\n");
 }
 
@@ -250,13 +256,13 @@ function rolePrompt(role: string, focus: string, payload: unknown): string {
       : finderResultInstructions();
   const scope = typeof payload === "object" && payload !== null && !Array.isArray(payload)
     ? (payload as { readonly reviewScope?: unknown }).reviewScope : undefined;
-  const scopeComplete = scope !== null && typeof scope === "object"
-    ? (scope as { readonly scopeComplete?: unknown }).scopeComplete : undefined;
+  const globalScopeComplete = scope !== null && typeof scope === "object"
+    ? (scope as { readonly globalScopeComplete?: unknown }).globalScopeComplete : undefined;
   return [
     `You are the bounded ${role} reviewer. ${focus}`,
     BOUNDED_WORKER_INSTRUCTIONS,
     REVIEW_SCOPE_INSTRUCTIONS,
-    ...(scopeComplete === false ? [UNKNOWN_REVIEW_SCOPE_INSTRUCTIONS] : []),
+    ...(globalScopeComplete === false ? [UNKNOWN_REVIEW_SCOPE_INSTRUCTIONS] : []),
     resultInstructions,
     reviewInput(payload),
   ].join("\n");
@@ -820,7 +826,7 @@ export function buildValidatorPrompt(
       evidenceScope: "Candidate-focused excerpt; not the full original changed hunk. Missing context cannot establish a confirmed finding.",
     }));
     try {
-      return fit(withReviewScope(snapshot, excerptPayloads));
+      return fit(withReviewScope(snapshot, excerptPayloads, false));
     } catch (error) {
       if (!(error instanceof InputLimitError)) throw error;
       lastError = error;

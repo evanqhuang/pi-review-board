@@ -191,6 +191,32 @@ function plainResult(
   };
 }
 
+type ReviewConfiguration = Extract<ReviewProgressEvent, { type: "review-config" }>;
+
+function formatTokenCount(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
+}
+
+export function withReviewTelemetry(result: ReviewResult, configuration: ReviewConfiguration | undefined): ReviewResult {
+  if (!configuration) return result;
+  const models = [...new Set(configuration.reviewers.map((reviewer) => `${reviewer.model} (${reviewer.thinking})`))];
+  const totals = result.usage.reduce((total, usage) => ({
+    turns: total.turns + usage.turns,
+    input: total.input + usage.inputTokens,
+    output: total.output + usage.outputTokens,
+    peakContext: Math.max(total.peakContext, usage.contextTokens),
+  }), { turns: 0, input: 0, output: 0, peakContext: 0 });
+  const telemetry = [
+    "Review telemetry:",
+    `- Mode: ${configuration.effort} effort · ${configuration.route} route`,
+    `- Models: ${models.join(" · ")}`,
+    `- Usage: ${totals.turns} turns · ${formatTokenCount(totals.input)} input · ${formatTokenCount(totals.output)} output · ${formatTokenCount(totals.peakContext)} peak context`,
+  ].join("\n");
+  return { ...result, report: `${result.report}\n\n${telemetry}` };
+}
+
 export function validateReviewToolOptions(params: Pick<ReviewToolParams, "maxReviewWorkUnits" | "workLimitPolicy">): void {
   if (params.maxReviewWorkUnits !== undefined) validateMaxReviewWorkUnits(params.maxReviewWorkUnits);
   if (params.workLimitPolicy !== undefined) validateWorkLimitPolicy(params.workLimitPolicy);
@@ -312,7 +338,9 @@ async function executeReview(
   const cancellation = startReviewCancellation(activeReviews, ctx.signal);
   presenter.start();
   const signal = cancellation.signal;
+  let reviewConfiguration: ReviewConfiguration | undefined;
   const emitProgress = (event: ReviewProgressEvent): void => {
+    if (event.type === "review-config") reviewConfiguration = event;
     presenter.update(event);
     ctx.onUpdate?.({
       content: [{ type: "text", text: presenter.lines().join("\n") }],
@@ -403,16 +431,16 @@ async function executeReview(
         ...(params.maxReviewWorkUnits === undefined ? {} : { maxReviewWorkUnits: params.maxReviewWorkUnits }),
         ...(params.workLimitPolicy === undefined ? {} : { workLimitPolicy: params.workLimitPolicy }),
       };
-      return await runManagedReview(managedInput, dependencies, signal);
+      return withReviewTelemetry(await runManagedReview(managedInput, dependencies, signal), reviewConfiguration);
     }
-    return await runCodeReview({
+    return withReviewTelemetry(await runCodeReview({
       cwd,
       target,
       comment: params.comment === true,
       effort,
       ...(params.maxReviewWorkUnits === undefined ? {} : { maxReviewWorkUnits: params.maxReviewWorkUnits }),
       ...(params.workLimitPolicy === undefined ? {} : { workLimitPolicy: params.workLimitPolicy }),
-    }, dependencies, signal);
+    }, dependencies, signal), reviewConfiguration);
   } finally {
     cancellation.dispose();
     presenter.clear();

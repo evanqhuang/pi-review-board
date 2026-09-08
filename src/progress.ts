@@ -1,4 +1,5 @@
-import type { ReviewStage, ReviewerProgressEvent, ReviewProgressEvent, AgentUsage } from "./types.js";
+import type { ReviewEffort, ReviewThinking } from "./effort.js";
+import type { ReviewStage, ReviewerProgressEvent, ReviewProgressEvent, AgentUsage, ReviewRoute } from "./types.js";
 
 const STAGES: readonly ReviewStage[] = ["eligibility", "guidance", "summary", "finders", "verification", "revalidation", "comment"];
 const STAGE_LABELS: Readonly<Record<ReviewStage, string>> = {
@@ -28,6 +29,8 @@ interface ReviewerRow {
   readonly shardId?: string | undefined;
   readonly resultTool?: string | undefined;
   readonly attempt: number;
+  readonly model?: string | undefined;
+  readonly thinking?: ReviewThinking | undefined;
   readonly status: "starting" | "working" | "retrying" | "complete" | "failed";
   readonly activeTool?: string | undefined;
   readonly usage: AgentUsage;
@@ -77,13 +80,16 @@ function workerIdentity(row: ReviewerRow): string {
 }
 
 function isReviewerEvent(event: ReviewProgressEvent): event is ReviewerProgressEvent {
-  return event.type !== "stage";
+  return event.type !== "stage" && event.type !== "review-config";
 }
 
 export class ReviewProgressPresenter {
   private currentStage: ReviewStage | undefined;
   private readonly completedStages = new Set<ReviewStage>();
   private readonly reviewers = new Map<string, ReviewerRow>();
+  private effort: ReviewEffort | undefined;
+  private route: ReviewRoute | undefined;
+  private configuredReviewers: Extract<ReviewProgressEvent, { type: "review-config" }>["reviewers"] = [];
 
   public constructor(private readonly options: ReviewProgressPresenterOptions) {}
 
@@ -96,6 +102,10 @@ export class ReviewProgressPresenter {
     if (event.type === "stage") {
       if (this.currentStage && this.currentStage !== event.stage) this.completedStages.add(this.currentStage);
       this.currentStage = event.stage;
+    } else if (event.type === "review-config") {
+      this.effort = event.effort;
+      this.route = event.route;
+      this.configuredReviewers = event.reviewers;
     } else {
       this.updateReviewer(event);
     }
@@ -105,6 +115,17 @@ export class ReviewProgressPresenter {
   public lines(): string[] {
     const current = this.currentStage ? STAGE_LABELS[this.currentStage] : "Starting";
     const lines = [`Code review · ${current}`];
+    if (this.effort && this.route) lines.push(`Mode: ${this.effort} effort · ${this.route} route`);
+    const configurations = [...new Set(this.configuredReviewers.map((reviewer) => `${reviewer.model} · ${reviewer.thinking}`))];
+    if (configurations.length > 0) lines.push(`Models: ${configurations.join(" | ")}`);
+    const totalUsage = [...this.reviewers.values()].reduce((total, row) => ({
+      role: "total",
+      turns: total.turns + row.usage.turns,
+      inputTokens: total.inputTokens + row.usage.inputTokens,
+      outputTokens: total.outputTokens + row.usage.outputTokens,
+      contextTokens: Math.max(total.contextTokens, row.usage.contextTokens),
+    }), emptyUsage("total"));
+    if (this.reviewers.size > 0) lines.push(`Usage: ${formatUsage(totalUsage)} (peak ctx)`);
     lines.push(...STAGES.map((stage) => {
       const marker = this.completedStages.has(stage) ? "✓" : this.currentStage === stage ? "›" : "·";
       return `${marker} ${STAGE_LABELS[stage]}`;
@@ -116,7 +137,8 @@ export class ReviewProgressPresenter {
       lines.push(...rows.map((row) => {
         const tool = row.activeTool ? ` · ${safeTool(row.activeTool)}` : "";
         const failure = row.failure ? ` · ${row.failure}` : "";
-        return `  ${safeRole(row.role)}${workerIdentity(row)} · ${row.status} · attempt ${row.attempt}${tool} · ${formatUsage(row.usage)}${failure}`;
+        const runtime = row.model ? ` · ${row.model} · ${row.thinking ?? "unknown"}` : "";
+        return `  ${safeRole(row.role)}${workerIdentity(row)} · ${row.status} · attempt ${row.attempt}${runtime}${tool} · ${formatUsage(row.usage)}${failure}`;
       }));
       if (this.reviewers.size > MAX_REVIEWER_ROWS) lines.push(`  +${this.reviewers.size - MAX_REVIEWER_ROWS} more reviewers`);
     }
@@ -131,6 +153,9 @@ export class ReviewProgressPresenter {
     this.reviewers.clear();
     this.completedStages.clear();
     this.currentStage = undefined;
+    this.effort = undefined;
+    this.route = undefined;
+    this.configuredReviewers = [];
     this.options.release?.();
   }
 
@@ -151,7 +176,7 @@ export class ReviewProgressPresenter {
     if (previous.shardId === undefined && event.shardId !== undefined) previous = { ...previous, shardId: event.shardId };
     switch (event.type) {
       case "reviewer-start":
-        this.setReviewer({ ...previous, resultTool: event.resultTool, attempt: event.attempt, status: "starting", failure: undefined });
+        this.setReviewer({ ...previous, resultTool: event.resultTool, attempt: event.attempt, model: event.model, thinking: event.thinking, status: "starting", failure: undefined });
         break;
       case "reviewer-turn":
         this.setReviewer({ ...previous, attempt: event.attempt, status: "working", usage: event.usage, failure: undefined });
@@ -165,7 +190,7 @@ export class ReviewProgressPresenter {
         });
         break;
       case "reviewer-retry":
-        this.setReviewer({ ...previous, attempt: event.attempt, status: "retrying", usage: event.usage, activeTool: undefined, failure: "protocol retry" });
+        this.setReviewer({ ...previous, attempt: event.attempt, status: "retrying", usage: event.usage, activeTool: undefined, failure: "bounded retry" });
         break;
       case "reviewer-complete":
         this.setReviewer({ ...previous, attempt: event.attempt, status: "complete", usage: event.usage, activeTool: undefined, failure: undefined });

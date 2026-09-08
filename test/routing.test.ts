@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_REVIEW_ROUTING_CONFIG, loadReviewConfig } from "../src/config.js";
-import { analyzeDiff, classifyDiff, routeReview } from "../src/routing.js";
+import { analyzeDiff, classifyDiff, getReviewPlan, routeReview } from "../src/routing.js";
 
 const tempDirectories: string[] = [];
 
@@ -160,6 +160,11 @@ describe("deterministic diff routing", () => {
   });
 
   it("keeps every routed role bounded and uses the required thinking floors", () => {
+    for (const route of ["tiny", "small"] as const) {
+      const roles = getReviewPlan(route).roles;
+      expect(Object.entries(roles).filter(([role]) => role !== "validator").every(([, plan]) => plan.modelRoute.thinking === "xhigh"), route).toBe(true);
+      expect(roles.validator.modelRoute.thinking, route).toBe("high");
+    }
     const plan = routeReview(patch("src/a.ts", "new"), "deep").plan;
     expect(plan.roles.summary).toMatchObject({ inputBudgetBytes: 64 * 1024, reservedTokens: 32_000, contextBudget: 200_000 });
     expect(plan.roles.summary.modelRoute.thinking).toBe("high");

@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_INPUT_BUDGET_BYTES } from "../src/input-budget.js";
 import { REVIEWER_RESULT_TOOLS } from "../src/reviewer-protocol.js";
-import { reviewerControlReserveBytes } from "../src/reviewer-control.js";
 import { buildReviewAgentArgs, PiReviewAgentRunner, ReviewerRunError, reviewAgentConfiguration, reviewerOutputLimits } from "../src/runner.js";
 import { validateFinder } from "../src/prompts.js";
 import type { AgentInvocation, ReviewerProgressEvent } from "../src/types.js";
@@ -351,6 +350,7 @@ process.stdin.on("end", () => {
         const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
         expect(error).toBeInstanceOf(ReviewerRunError);
         expect((error as ReviewerRunError).kind).toBe(expectedKind);
+        if (name === "tool-error") expect((error as Error).message).toContain("schema rejected sensitive details");
         expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe(name === "missing-details" ? "2" : "1");
       } finally {
         await rm(directory, { recursive: true, force: true });
@@ -358,7 +358,7 @@ process.stdin.on("end", () => {
     }
   });
 
-  it("classifies a provider context error without leaking its message", async () => {
+  it("classifies a provider context error and preserves its message", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-provider-context-"));
     const base = messageEnd(10, 2, 12) as { type: string; message: Record<string, unknown> };
     const executable = await emitScript(directory, [
@@ -369,15 +369,49 @@ process.stdin.on("end", () => {
       const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
       expect(error).toBeInstanceOf(ReviewerRunError);
       expect((error as ReviewerRunError).kind).toBe("context-limit");
-      expect((error as Error).message).not.toContain("secret context_length_exceeded transcript");
+      expect((error as Error).message).toContain("secret context_length_exceeded transcript");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });
 
-  it("does not retry provider, length, or aborted assistant stops", async () => {
+  it("retries one short provider failure in a fresh process", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-stop-provider-"));
+    const providerFailure = {
+      ...messageEnd(10, 2, 12),
+      message: { ...(messageEnd(10, 2, 12) as { message: object }).message, stopReason: "error" },
+    };
+    const executable = await countScript(directory, [turnStart(), providerFailure], [
+      turnStart(),
+      toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [candidate] }),
+    ]);
+    try {
+      const result = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder);
+      expect(result.data.candidates).toEqual([candidate]);
+      expect(result.usage).toEqual({ role: "finder:diff-correctness", turns: 2, inputTokens: 10, outputTokens: 2, contextTokens: 12 });
+      expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("2");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry long provider failures", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-stop-provider-long-"));
+    const providerFailure = messageEnd(10, 2, 12, "x".repeat(reviewerOutputLimits.protocolRetryBytes + 1)) as { type: string; message: Record<string, unknown> };
+    providerFailure.message.stopReason = "error";
+    const executable = await countScript(directory, [turnStart(), providerFailure], [toolEnd(REVIEWER_RESULT_TOOLS.finder, { candidates: [] })]);
+    try {
+      const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
+      expect(error).toBeInstanceOf(ReviewerRunError);
+      expect((error as ReviewerRunError).kind).toBe("provider");
+      expect(await readFile(join(directory, "attempt-count"), "utf8")).toBe("1");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry length or aborted assistant stops", async () => {
     for (const [name, stopReason, expectedKind] of [
-      ["provider", "error", "provider"],
       ["length", "length", "length"],
       ["aborted", "aborted", "canceled"],
     ] as const) {
@@ -433,14 +467,14 @@ process.stdin.on("end", () => {
     }
   });
 
-  it("keeps reviewer stderr out of failures and does not retry process errors", async () => {
+  it("preserves reviewer stderr in failures and does not retry process errors", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-review-runner-stderr-"));
     const executable = await nodeScript(directory, "process.stderr.write(\"sensitive reviewer transcript\"); process.exit(7);");
     try {
       const error = await new PiReviewAgentRunner(executable).run(invocation(directory), validateFinder).catch((value: unknown) => value);
       expect(error).toBeInstanceOf(ReviewerRunError);
       expect((error as ReviewerRunError).kind).toBe("process");
-      expect((error as Error).message).not.toContain("sensitive reviewer transcript");
+      expect((error as Error).message).toContain("sensitive reviewer transcript");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

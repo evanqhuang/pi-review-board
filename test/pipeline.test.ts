@@ -507,7 +507,7 @@ describe("runCodeReview deterministic topology", () => {
     expect(result.summary).toBe("");
     expect(result.report).not.toContain("A bounded change summary");
     expect(agents.calls.map((call) => call.role)).toEqual(["diff-only-bug", "validator"]);
-    expect(agents.calls[0]).toMatchObject({ tools: [], model: "openai-codex/gpt-5.6-luna", thinking: "high", maxTurns: 4, contextBudget: 64_000, inputBudgetBytes: 64_000, reservedTokens: DEFAULT_RESERVED_TOKENS });
+    expect(agents.calls[0]).toMatchObject({ tools: [], model: "openai-codex/gpt-5.6-luna", thinking: "xhigh", maxTurns: 4, contextBudget: 64_000, inputBudgetBytes: 64_000, reservedTokens: DEFAULT_RESERVED_TOKENS });
     expect(agents.calls[1]).toMatchObject({ role: "validator", tools: [], model: "openai-codex/gpt-5.6-sol", thinking: "high", maxTurns: 6, contextBudget: 64_000, inputBudgetBytes: 64_000, reservedTokens: DEFAULT_RESERVED_TOKENS });
   });
 
@@ -825,7 +825,7 @@ describe("runCodeReview deterministic topology", () => {
     expect(lowConfidence.findings).toEqual([]);
   });
 
-  it("reports bounded reviewer counters without exposing diagnostic content", async () => {
+  it("reports reviewer counters and exact diagnostic content", async () => {
     const recording = new RecordingAgents();
     const agents: ReviewAgentRunner = { run: async (invocation, validate) => {
       if (invocation.role === "diff-only-bug") throw new ReviewerRunError(invocation.role, "missing-result",
@@ -837,9 +837,9 @@ describe("runCodeReview deterministic topology", () => {
     const result = await runCodeReview({ cwd: "/repo", target, snapshot: snapshot(normalDiff, ["src/auth.ts"]), comment: false, effort: "normal" },
       { ...dependencies(recording), agents });
     expect(result.status).toBe("incomplete");
-    expect(result.report).toContain("turns=4/4; results=0; finalization=true; retry=denied");
+    expect(result.report).toContain("turns=4/4; results=0; finalization=true; retry=PRIVATE_TOOL_CONTENT");
     expect(result.report).toContain("semanticBytes=21; stdoutBytes=300; stderrBytes=0");
-    expect(result.report).not.toContain("PRIVATE_TOOL_CONTENT");
+    expect(result.report).toContain("PRIVATE_TOOL_CONTENT");
   });
 
   it("keeps pull-request reviews report-only unless publication is explicit", async () => {

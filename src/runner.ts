@@ -233,8 +233,10 @@ export class ReviewerRunError extends Error {
   public readonly usage: AgentUsage;
   /** Only short, typed-result protocol misses may be recovered once. */
   public readonly retryableProtocol: boolean;
-  /** Bounded machine-readable facts; never includes prompts or provider content. */
+  /** Bounded machine-readable execution facts. */
   public readonly diagnostics: ReviewerRunDiagnostics;
+  /** Exact provider/process diagnostic text, when the failed boundary supplied it. */
+  public readonly detail?: string;
 
   public constructor(
     role: string,
@@ -242,14 +244,17 @@ export class ReviewerRunError extends Error {
     usage: AgentUsage,
     retryableProtocol = false,
     diagnostics: ReviewerRunDiagnostics = EMPTY_DIAGNOSTICS,
+    detail?: string,
   ) {
-    super(messageForFailure(kind, role));
+    const message = messageForFailure(kind, role);
+    super(detail ? `${message}: ${detail}` : message);
     this.name = "ReviewerRunError";
     this.role = role;
     this.kind = kind;
     this.usage = usage;
     this.retryableProtocol = retryableProtocol;
     this.diagnostics = Object.freeze({ ...diagnostics });
+    if (detail !== undefined) this.detail = detail;
   }
 }
 
@@ -280,6 +285,16 @@ function serializedBytes(value: unknown): number {
     // JSONL input cannot normally contain cycles. Treat an unexpected value as
     // maximally large so it cannot make a protocol retry look inexpensive.
     return MAX_PROTOCOL_RETRY_BYTES + 1;
+  }
+}
+
+function diagnosticText(value: unknown): string {
+  if (value instanceof Error) return value.message;
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
   }
 }
 
@@ -371,7 +386,14 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         onProgress?.({ type: "reviewer-failed", role: invocation.role, attempt, kind: limit.kind, usage: aggregateUsage });
         throw limit;
       }
-      onProgress?.({ type: "reviewer-start", role: invocation.role, resultTool: invocation.resultTool, attempt });
+      onProgress?.({
+        type: "reviewer-start",
+        role: invocation.role,
+        resultTool: invocation.resultTool,
+        attempt,
+        ...(invocation.model === undefined ? {} : { model: invocation.model }),
+        thinking: invocation.thinking,
+      });
       try {
         const result = await this.runAttempt(invocation, prompt, validate, signal, attempt, onProgress);
         aggregateUsage = addUsage(aggregateUsage, result.usage);
@@ -390,7 +412,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         aggregateUsage = addUsage(aggregateUsage, attemptError.usage);
         const canRetry = attempt < MAX_REVIEW_ATTEMPTS
           && attemptError.retryableProtocol
-          && (attemptError.kind === "missing-result" || attemptError.kind === "malformed-result")
+          && (attemptError.kind === "missing-result" || attemptError.kind === "malformed-result" || attemptError.kind === "provider")
           && !signal?.aborted;
         if (canRetry) {
           let retryAdmitted = true;
@@ -413,6 +435,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
               aggregateUsage,
               false,
               deniedDiagnostics,
+              attemptError.detail,
             );
             onProgress?.({ type: "reviewer-failed", role: invocation.role, attempt, kind: denied.kind, usage: aggregateUsage });
             throw denied;
@@ -426,6 +449,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           aggregateUsage,
           false,
           attemptError.diagnostics,
+          attemptError.detail,
         );
         onProgress?.({ type: "reviewer-failed", role: invocation.role, attempt, kind: terminal.kind, usage: aggregateUsage });
         throw terminal;
@@ -475,7 +499,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
             }),
           },
         });
-      } catch {
+      } catch (error) {
         const usage = emptyUsage(invocation.role);
         reject(new ReviewerRunError(
           invocation.role,
@@ -483,6 +507,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           usage,
           false,
           invocationDiagnostics(invocation, attempt, usage),
+          error instanceof Error ? error.message : String(error),
         ));
         return;
       }
@@ -499,6 +524,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
       let outputLimitExceeded = false;
       let terminationRequested = false;
       let terminalFailureKind: ReviewerFailureKind | undefined;
+      let terminalFailureDetail: string | undefined;
       let usage = emptyUsage(invocation.role);
       let authoritativeInput = 0;
       let authoritativeOutput = 0;
@@ -583,9 +609,9 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         stderrBytes,
       });
       const failureError = (kind: ReviewerFailureKind): ReviewerRunError => {
-        const retryableProtocol = (kind === "missing-result" || kind === "malformed-result")
+        const retryableProtocol = (kind === "missing-result" || kind === "malformed-result" || kind === "provider")
           && retryWithinSemanticBudget();
-        return new ReviewerRunError(invocation.role, kind, usage, retryableProtocol, diagnostics());
+        return new ReviewerRunError(invocation.role, kind, usage, retryableProtocol, diagnostics(), terminalFailureDetail);
       };
       const forceTerminate = (): void => {
         try {
@@ -615,12 +641,13 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           forceTerminate();
         }
       };
-      const requestFailure = (kind: ReviewerFailureKind): void => {
+      const requestFailure = (kind: ReviewerFailureKind, detail?: string): void => {
         // The first terminal cause is authoritative. In particular, a bound or
         // provider failure must not be replaced by cancellation, close, or a
         // result that was already in flight when termination began.
         if (terminalFailureKind || settled) return;
         terminalFailureKind = kind;
+        terminalFailureDetail = detail;
         terminateProcess();
       };
       const emitTool = (tool: unknown, status: "started" | "updated" | "completed"): void => {
@@ -694,7 +721,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
             if (expectedResultCount > 1) {
               requestFailure("duplicate-result");
             } else if (record.isError === true) {
-              requestFailure("result-tool-error");
+              requestFailure("result-tool-error", diagnosticText(record.result));
             } else {
               const details = resultDetails(record.result);
               if (!details.hasDetails) {
@@ -758,7 +785,10 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         } else if (stopReason === "length") {
           requestFailure("length");
         } else if (stopReason === "error" || typeof message.errorMessage === "string") {
-          requestFailure(contextError(message) ? "context-limit" : "provider");
+          requestFailure(
+            contextError(message) ? "context-limit" : "provider",
+            typeof message.errorMessage === "string" ? message.errorMessage : undefined,
+          );
         } else if (currentContextUsage > invocation.contextBudget) {
           requestFailure("context-limit");
         }
@@ -793,14 +823,19 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
         }
         consumeStdout(stdoutDecoder.write(bytes));
       };
+      let stderr = "";
+      const stderrDecoder = new StringDecoder("utf8");
       const consumeStderrChunk = (chunk: Buffer | string): void => {
-        stderrBytes += typeof chunk === "string" ? Buffer.byteLength(chunk, "utf8") : chunk.byteLength;
+        const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        stderrBytes += bytes.byteLength;
         if (stderrBytes > MAX_REVIEWER_STDERR_BYTES) {
           outputLimitExceeded = true;
           requestFailure("output-limit");
+          return;
         }
+        stderr += stderrDecoder.write(bytes);
       };
-      const onStdinError = (): void => requestFailure("transport");
+      const onStdinError = (error: Error): void => requestFailure("transport", error.message);
       const onStdoutData = (chunk: Buffer | string): void => {
         try {
           consumeStdoutChunk(chunk);
@@ -815,11 +850,12 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           requestFailure("transport");
         }
       };
-      const onStdoutError = (): void => requestFailure("transport");
-      const onStderrError = (): void => requestFailure("transport");
-      const onChildError = (): void => requestFailure("spawn");
+      const onStdoutError = (error: Error): void => requestFailure("transport", error.message);
+      const onStderrError = (error: Error): void => requestFailure("transport", error.message);
+      const onChildError = (error: Error): void => requestFailure("spawn", error.message);
       const onClose = (code: number | null): void => {
         if (settled) return;
+        stderr += stderrDecoder.end();
         try {
           const stdoutTail = stdoutDecoder.end();
           if (!outputLimitExceeded && !terminalFailureKind) consumeStdout(stdoutTail);
@@ -837,7 +873,7 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           return;
         }
         if (code !== 0) {
-          finish(() => reject(new ReviewerRunError(invocation.role, "process", usage, false, diagnostics())));
+          finish(() => reject(new ReviewerRunError(invocation.role, "process", usage, false, diagnostics(), stderr)));
           return;
         }
         const retryableProtocol = retryWithinSemanticBudget();
@@ -857,8 +893,8 @@ export class PiReviewAgentRunner implements ReviewAgentRunner {
           } else {
             finish(() => resolve({ data, usage }));
           }
-        } catch {
-          finish(() => reject(new ReviewerRunError(invocation.role, "validation", usage, false, diagnostics())));
+        } catch (error) {
+          finish(() => reject(new ReviewerRunError(invocation.role, "validation", usage, false, diagnostics(), diagnosticText(error))));
         }
       };
 

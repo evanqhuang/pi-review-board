@@ -7,6 +7,7 @@ import registerCodeReviewExtension, {
   injectReviewResult,
   reviewExecutionSelection,
   validateFindingDispositionInputs,
+  withReviewTelemetry,
 } from "../extensions/code-review.js";
 import type { ReviewResult } from "../src/types.js";
 
@@ -40,6 +41,28 @@ const result: ReviewResult = {
 };
 
 describe("review extension helpers", () => {
+  it("adds route, model, thinking, and token telemetry to final reports", () => {
+    const decorated = withReviewTelemetry({
+      ...result,
+      usage: [
+        { role: "diff-only-bug", turns: 2, inputTokens: 12_000, outputTokens: 3_000, contextTokens: 20_000 },
+        { role: "validator", turns: 1, inputTokens: 4_000, outputTokens: 500, contextTokens: 8_000 },
+      ],
+    }, {
+      type: "review-config",
+      effort: "normal",
+      route: "tiny",
+      reviewers: [
+        { role: "diff-only-bug", model: "openai-codex/gpt-5.6-luna", thinking: "xhigh" },
+        { role: "validator", model: "openai-codex/gpt-5.6-sol", thinking: "high" },
+      ],
+    });
+    expect(decorated.report).toContain("Mode: normal effort · tiny route");
+    expect(decorated.report).toContain("gpt-5.6-luna (xhigh)");
+    expect(decorated.report).toContain("gpt-5.6-sol (high)");
+    expect(decorated.report).toContain("3 turns · 16.0k input · 3.5k output · 20.0k peak context");
+  });
+
   it("offers the managed loop prominently while preserving advanced phase completions", () => {
     const rootCompletions = getReviewArgumentCompletions("")?.map((item) => item.value);
     expect(rootCompletions?.[0]).toBe("loop");

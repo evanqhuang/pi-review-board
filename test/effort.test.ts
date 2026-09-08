@@ -86,7 +86,8 @@ describe("review effort contract", () => {
         expect(rolePlan.maxTurns, `${route}/${role}`).toBe(caps[role]);
         expect(rolePlan.contextBudget, `${route}/${role}`).toBe(contextBudgets[role]);
         expect(rolePlan.candidateCap, `${route}/${role}`).toBe(candidateCaps[role]);
-        expect(rolePlan.modelRoute.thinking, `${route}/${role}`).toBe(thinkingByRole[role]);
+        const smallRouteLuna = (route === "tiny" || route === "small") && role !== "validator";
+        expect(rolePlan.modelRoute.thinking, `${route}/${role}`).toBe(smallRouteLuna ? "xhigh" : thinkingByRole[role]);
         expect(rolePlan.modelRoute.thinking, `${route}/${role}`).not.toBe("max");
         if ((noRepositoryTools as readonly string[]).includes(role)) {
           expect(rolePlan.tools, `${route}/${role}`).toEqual([]);

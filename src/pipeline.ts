@@ -99,13 +99,12 @@ function usageFromError(error: unknown): AgentResult<unknown>["usage"] | undefin
 }
 
 function errorMessage(error: unknown): string {
-  const message = (error instanceof Error ? error.message : String(error)).trim().slice(0, 500);
+  const message = (error instanceof Error ? error.message : String(error)).trim();
   if (!(error instanceof ReviewerRunError)) return message;
   const diagnostics = error.diagnostics;
   const count = (value: number): string => Number.isSafeInteger(value) && value >= 0 ? String(value) : "unknown";
-  const retry = diagnostics.retryDenial === "scheduler-admission-denied" || diagnostics.retryDenial === "canceled"
-    ? diagnostics.retryDenial : diagnostics.retryDenial === undefined ? "none" : "denied";
-  return `${message} [attempt=${count(diagnostics.attempt)}; turns=${count(diagnostics.turns)}/${count(diagnostics.maxTurns)}; results=${count(diagnostics.resultCount)}; finalization=${diagnostics.finalizationEntered === true}; retry=${retry}; semanticBytes=${count(diagnostics.semanticBytes)}; stdoutBytes=${count(diagnostics.stdoutBytes)}; stderrBytes=${count(diagnostics.stderrBytes)}]`.slice(0, 500);
+  const retry = diagnostics.retryDenial ?? "none";
+  return `${message} [attempt=${count(diagnostics.attempt)}; turns=${count(diagnostics.turns)}/${count(diagnostics.maxTurns)}; results=${count(diagnostics.resultCount)}; finalization=${diagnostics.finalizationEntered === true}; retry=${retry}; semanticBytes=${count(diagnostics.semanticBytes)}; stdoutBytes=${count(diagnostics.stdoutBytes)}; stderrBytes=${count(diagnostics.stderrBytes)}]`;
 }
 
 function isPromptBudgetFailure(error: unknown): error is InputLimitError {
@@ -1264,6 +1263,22 @@ async function runPreparedReview(
   }
 
   const { route, plan } = routing;
+  const configuredRoles = [
+    ...(route === "normal" || route === "deep" ? ["summary" as const] : []),
+    ...plan.activeRoles,
+    ...(route === "small" ? ["contextual-bug" as const] : []),
+    "validator" as const,
+  ];
+  dependencies.onProgress?.({
+    type: "review-config",
+    effort: options.effort,
+    route,
+    reviewers: [...new Set(configuredRoles)].map((role) => ({
+      role,
+      model: dependencies.reviewerModel ?? plan.roles[role].modelRoute.model,
+      thinking: plan.roles[role].modelRoute.thinking,
+    })),
+  });
 
   // Guidance is discovered once from the immutable snapshot.  It is loaded
   // before sharding so both the routing decision and every shard preflight

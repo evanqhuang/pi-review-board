@@ -1,9 +1,8 @@
 import { DEFAULT_REVIEW_ROUTING_CONFIG, type ReviewConfig } from "./config.js";
 import { DEFAULT_INPUT_BUDGET_BYTES, DEFAULT_RESERVED_TOKENS } from "./input-budget.js";
 import { DEFAULT_REVIEW_EFFORT, defaultReviewEffort, type ReviewEffort, type ReviewThinking } from "./effort.js";
-import type { ReviewRole } from "./types.js";
-
-export type ReviewRoute = "tiny" | "small" | "normal" | "deep";
+import type { ReviewRole, ReviewRoute } from "./types.js";
+export type { ReviewRoute } from "./types.js";
 
 export interface ReviewModelRoute {
   readonly model: string;
@@ -122,9 +121,19 @@ const ROLE_PLANS: Readonly<Record<ReviewRole, ReviewRoleConfig>> = Object.freeze
   validator: roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 1, SOL_MODEL, "high"),
 });
 
+function lunaRolePlansAtThinking(thinking: ReviewThinking): Readonly<Record<ReviewRole, ReviewRoleConfig>> {
+  return Object.freeze(Object.fromEntries(REVIEW_ROLES.map((role) => {
+    const plan = ROLE_PLANS[role];
+    const routedThinking = plan.modelRoute.model === LUNA_MODEL ? thinking : plan.modelRoute.thinking;
+    return [role, Object.freeze({ ...plan, modelRoute: modelRoute(plan.modelRoute.model, routedThinking) })];
+  })) as Record<ReviewRole, ReviewRoleConfig>);
+}
+
+const XHIGH_LUNA_ROLE_PLANS = lunaRolePlansAtThinking("xhigh");
+
 const ROUTE_PLANS: Readonly<Record<ReviewRoute, Readonly<Record<ReviewRole, ReviewRoleConfig>>>> = Object.freeze({
-  tiny: ROLE_PLANS,
-  small: ROLE_PLANS,
+  tiny: XHIGH_LUNA_ROLE_PLANS,
+  small: XHIGH_LUNA_ROLE_PLANS,
   normal: ROLE_PLANS,
   deep: ROLE_PLANS,
 });

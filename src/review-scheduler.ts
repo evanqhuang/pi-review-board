@@ -17,7 +17,7 @@ export interface ReviewScheduleTaskContext {
   readonly markAttemptStarted: (attempt?: number) => void;
   /** Mark the current attempt as rejected before a subprocess was started. */
   readonly markPreSpawnFailure: () => void;
-  /** Admit an equal-weight protocol retry, before its subprocess is started. */
+  /** Admit an equal-weight protocol/provider recovery attempt before its subprocess is started. */
   readonly retryAdmission: () => Promise<boolean>;
 }
 

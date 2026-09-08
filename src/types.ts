@@ -2,6 +2,7 @@ import type { ReviewEffort, ReviewThinking } from "./effort.js";
 import type { ReviewerResultToolName, ReviewerSafeToolName } from "./reviewer-protocol.js";
 
 export type ReviewTargetKind = "pull-request" | "current-diff" | "branch" | "path" | "worktree";
+export type ReviewRoute = "tiny" | "small" | "normal" | "deep";
 
 /** Bounded reviewer roles used by deterministic routing. */
 export type ReviewRole =
@@ -344,6 +345,8 @@ export type ReviewerProgressEvent =
       readonly shardId?: string;
       readonly resultTool: ReviewerResultToolName;
       readonly attempt: number;
+      readonly model?: string;
+      readonly thinking: ReviewThinking;
     }
   | {
       readonly type: "reviewer-turn";
@@ -390,6 +393,16 @@ export type ReviewerProgressEvent =
 
 export type ReviewProgressEvent =
   | { readonly type: "stage"; readonly stage: ReviewStage; readonly message: string }
+  | {
+      readonly type: "review-config";
+      readonly effort: ReviewEffort;
+      readonly route: ReviewRoute;
+      readonly reviewers: readonly {
+        readonly role: ReviewRole;
+        readonly model: string;
+        readonly thinking: ReviewThinking;
+      }[];
+    }
   | ReviewerProgressEvent;
 
 export interface AgentInvocation {
@@ -408,7 +421,7 @@ export interface AgentInvocation {
   readonly reservedTokens?: number;
   /** Called only after the reviewer subprocess has been created for an attempt. */
   readonly onAttemptStart?: (attempt: number) => void;
-  /** Optional bounded admission for the one protocol retry allowed by the runner. */
+  /** Optional bounded admission for the runner's one protocol/provider recovery attempt. */
   readonly retryAdmission?: () => boolean | Promise<boolean>;
   readonly model?: string;
   readonly thinking: ReviewThinking;

@@ -333,6 +333,8 @@ describe("runCodeReview deterministic topology", () => {
     expect(Buffer.byteLength(finder.prompt, "utf8")).toBeLessThanOrEqual(finder.inputBudgetBytes!);
   });
 
+  // This scale fixture scans hundreds of KiB thousands of times; hosted runners
+  // need more than the default 5s. Keep all coverage and budget assertions.
   it("reviews a 71-file diff with guidance under the default work budget", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "pi-review-scale-"));
     try {
@@ -366,7 +368,7 @@ describe("runCodeReview deterministic topology", () => {
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("keeps a 45 KiB indivisible line supported when its resolved prompt fits", async () => {
     const agents = new RecordingAgents();

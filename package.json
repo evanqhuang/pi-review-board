@@ -1,16 +1,28 @@
 {
-  "name": "pi-code-review",
+  "name": "pi-review-board",
   "version": "0.1.0",
-  "private": true,
-  "description": "Deterministic multi-pass code review orchestration for Pi",
+  "description": "Claude Code-style, deterministic multi-pass code review for Pi",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/evanqhuang/pi-review-board.git"
+  },
+  "homepage": "https://github.com/evanqhuang/pi-review-board#readme",
+  "bugs": {
+    "url": "https://github.com/evanqhuang/pi-review-board/issues"
+  },
+  "license": "MIT",
   "keywords": [
     "pi-package",
     "pi-extension",
-    "code-review"
+    "pi-coding-agent",
+    "code-review",
+    "claude-code-style",
+    "ai-agent",
+    "developer-tools"
   ],
   "scripts": {
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=1",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test"
   },

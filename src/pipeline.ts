@@ -1210,7 +1210,6 @@ export async function runCodeReview(options: ReviewOptions, dependencies: Review
   if (snapshot.pullRequest) {
     const pullRequest = snapshot.pullRequest;
     if (pullRequest.state.toUpperCase() !== "OPEN") return completedResult(snapshot, options, "ineligible", "The pull request is not open.", [], [], [], false);
-    if (pullRequest.isDraft) return completedResult(snapshot, options, "ineligible", "The pull request is a draft.", [], [], [], false);
     if (isLikelyAutomatedPullRequest(pullRequest)) return completedResult(snapshot, options, "ineligible", "The pull request appears to be automated.", [], [], [], false);
     if (hasExistingReview(pullRequest)) return completedResult(snapshot, options, "ineligible", "The pull request already has a code review from the current reviewer.", [], [], [], false);
     if (options.comment && !pullRequest.reviewerIdentityAvailable) {

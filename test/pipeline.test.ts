@@ -864,9 +864,8 @@ describe("runCodeReview deterministic topology", () => {
     expect(commands.calls.some((call) => call[0] === "gh" && call[1] === "pr" && call[2] === "comment" && call.includes("--repo") && call.includes("acme/repo"))).toBe(true);
   });
 
-  it("rejects draft, automated, and already-reviewed pull requests before reviewer work", async () => {
+  it("rejects automated and already-reviewed pull requests before reviewer work", async () => {
     const cases: readonly [string, Partial<PullRequestMetadata>][] = [
-      ["draft", { isDraft: true }],
       ["automated", { authorLogin: "dependabot[bot]" }],
       ["already reviewed", { comments: [{ body: "### Code review\\n\\nAlready reviewed.", authorLogin: "reviewer" }] }],
     ];
@@ -876,6 +875,19 @@ describe("runCodeReview deterministic topology", () => {
       expect(result.status, label).toBe("ineligible");
       expect(agents.calls, label).toEqual([]);
     }
+  });
+
+  it("reviews draft pull requests without an opt-in", async () => {
+    const agents = new RecordingAgents();
+    const result = await runCodeReview({
+      cwd: "/repo",
+      target: pullRequestTarget,
+      comment: false,
+      effort: "normal",
+      snapshot: pullRequestSnapshot({ isDraft: true }),
+    }, dependencies(agents));
+    expect(result.status).toBe("complete");
+    expect(agents.calls.length).toBeGreaterThan(0);
   });
 
   it("only treats a code review by the current reviewer as an existing review", async () => {

@@ -72,3 +72,70 @@ Tests use offline reviewer fixtures and an in-memory Pi provider. They do not
 start live reviews.
 
 After changing an installed copy, use `/reload` or start a new Pi session.
+
+## Publishing
+
+CI checks pull requests and pushes to `main`. Pushing a stable `vX.Y.Z` tag
+publishes that tagged commit to npm after typechecking and tests pass.
+The tag must exactly match `package.json`. Prerelease tags are rejected.
+
+### One-time maintainer setup
+
+1. Create a GitHub environment named `npm` in this repository's Settings →
+   Environments. Configure required reviewers and restrict deployments to release
+   tags as appropriate. The publishing job uses this environment.
+2. Claim/bootstrap `pi-review-board` from a clean, reviewed checkout using an npm
+   account authorized to publish the name (availability is not guaranteed until
+   publication). Use Node 24 and current npm 11:
+
+   ```sh
+   npm login
+   npm ci
+   npm run check
+   npm pack --dry-run
+   npm publish --access public
+   ```
+
+   This publishes the initial `0.1.0` version. Do not push `v0.1.0` afterward:
+   npm versions are immutable and the workflow would try to publish it again.
+3. On npmjs.com, open the package's Settings → Trusted Publisher and configure:
+
+   | Field | Value |
+   | --- | --- |
+   | Provider | GitHub Actions |
+   | Organization or user | `evanqhuang` |
+   | Repository | `pi-review-board` |
+   | Workflow filename | `publish.yml` |
+   | Environment | `npm` |
+   | Allowed action | `npm publish` |
+
+   No `NPM_TOKEN` repository secret is needed. GitHub-hosted runners use OIDC
+   with provenance. Keep npm account 2FA enabled; restrict token publishing after
+   confirming trusted publishing works.
+
+### Subsequent releases
+
+From a clean `main` checkout after CI passes:
+
+```sh
+git pull --ff-only
+npm version patch  # updates both manifests, commits, and creates vX.Y.Z
+git push origin main
+git push origin "v$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')"
+```
+
+Watch the **Publish to npm** action and approve the `npm` environment deployment if
+required. Authentication failures require checking the exact npm trusted
+publisher fields above; rerun the failed job once corrected. Never move a tag
+or reuse a version that has already been published.
+
+### Pi package gallery
+
+The [Pi package gallery](https://pi.dev/packages) displays npm packages with the
+`pi-package` keyword. This package already includes that keyword and the `pi`
+extension/skill manifest; no separate marketplace upload workflow is required.
+After npm publication, verify discovery in the gallery (indexing may lag) and
+test installation with `pi install npm:pi-review-board`.
+
+References: [npm trusted publishing](https://docs.npmjs.com/trusted-publishers)
+and [Pi packages](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/packages.md).

@@ -12,6 +12,11 @@
     "url": "https://github.com/evanqhuang/pi-review-board/issues"
   },
   "license": "MIT",
+  "files": [
+    "extensions/",
+    "src/",
+    "skills/"
+  ],
   "keywords": [
     "pi-package",
     "pi-extension",

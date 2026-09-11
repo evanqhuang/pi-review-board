@@ -804,7 +804,7 @@ function coverageReportLines(ledger: Ledger): string[] {
   const gaps = coverage.uncoveredUnitIds.length || coverage.uncoveredCandidates.length || 0;
   const budget = coverage.budget;
   const lines = [
-    `**Coverage:** ${coverage.state} (snapshot ${coverage.snapshotHash ? `\`${coverage.snapshotHash.slice(0, 12)}\`` : "unknown"})`,
+    `**Coverage:** ${coverage.state} (snapshot ${coverage.snapshotHash ? `\`${coverage.snapshotHash}\`` : "unknown"})`,
     `**Coverage policy:** ${coverage.policy ?? "unknown"}${coverage.policyVersion === undefined ? "" : ` v${coverage.policyVersion}`}`,
     `**Coverage budget:** ${budget ? `${budget.spentWeight}/${budget.maxWeight} weighted units spent` : "unknown"}`,
   ];
@@ -1252,7 +1252,7 @@ export function formatStatusReport(status: ReviewStatus | undefined): string {
     `**Decision:** ${status.decision.toUpperCase().replaceAll("-", " ")}`,
     `**Phase:** ${status.phase}`, `**Passes:** ${status.completedPasses}/${MAX_PASSES}`,
     `**Remediation batches:** ${status.remediationBatches}/${MAX_REMEDIATIONS}`,
-    `**Coverage:** ${coverage.state}`, `**Coverage snapshot:** ${coverage.snapshotHash ? `\`${coverage.snapshotHash.slice(0, 12)}\`` : "unknown"}`,
+    `**Coverage:** ${coverage.state}`, `**Coverage snapshot:** ${coverage.snapshotHash ? `\`${coverage.snapshotHash}\`` : "unknown"}`,
     `**Coverage policy:** ${coverage.policy ?? "unknown"}${coverage.policyVersion === undefined ? "" : ` v${coverage.policyVersion}`}`,
     `**Coverage gaps:** ${coverage.uncoveredUnitIds.length + coverage.uncoveredCandidates.length}`,
     `**Coverage budget:** ${budget ? `${budget.spentWeight}/${budget.maxWeight} weighted units spent` : "unknown"}`,

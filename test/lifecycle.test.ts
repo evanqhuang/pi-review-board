@@ -85,6 +85,9 @@ describe("managed review lifecycle", () => {
     expect(initial.phase).toBe("initial");
     expect(initial.findings[0]?.id).toBe("REV-001");
     expect(initial.reviewedSnapshotHash).toBeTruthy();
+    expect(initial.report).toContain(`snapshot \`${initial.reviewedSnapshotHash}\``);
+    const initialStatus = await getReviewStatus(repo, { commands }, { sessionId: initial.sessionId! });
+    expect(formatStatusReport(initialStatus)).toContain(`**Coverage snapshot:** \`${initial.reviewedSnapshotHash}\``);
     expect(agents.invocations.every((invocation) => invocation.maxTurns > 0 && invocation.contextBudget > 0)).toBe(true);
 
     const blocked = await recordReviewDispositions({ cwd: repo, sessionId: initial.sessionId!, reviewedSnapshotHash: initial.reviewedSnapshotHash!, dispositions: [{ id: "REV-001", disposition: "confirmed-blocker", parentEvidence: "A focused reproduction returns the wrong value." }] }, dependencies);

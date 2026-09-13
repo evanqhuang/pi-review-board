@@ -496,6 +496,12 @@ function noOpSourceView(cwd: string): ReviewSourceView {
   return { root: cwd, dispose: async (): Promise<void> => undefined };
 }
 
+function pullRequestSource(snapshot: ReviewSnapshot): { readonly number: number; readonly repository: string } | undefined {
+  const metadata = snapshot.pullRequest ?? (snapshot.target.kind === "pull-request" ? snapshot.target.metadata : undefined);
+  if (metadata === undefined) return undefined;
+  return { number: metadata.number, repository: metadata.repository };
+}
+
 /** Materialize the captured pull-request commit without touching the checkout. */
 export async function prepareReviewSourceView(
   snapshot: ReviewSnapshot,
@@ -509,15 +515,53 @@ export async function prepareReviewSourceView(
   const cwd = snapshot.cwd;
   let root: string | undefined;
   try {
+    const source = pullRequestSource(snapshot);
+    const verifyHead = async (): Promise<CommandResult> => checkedRun(
+      commands,
+      ["cat-file", "-e", `${headSha}^{commit}`],
+      cwd,
+      signal,
+      "verify the captured pull-request head commit",
+    );
+    const fetchHead = async (): Promise<CommandResult> => {
+      if (source === undefined) {
+        throw new Error(`Captured pull-request head commit ${headSha} is missing from ${cwd}; no network fetch was attempted`);
+      }
+      const fetchResult = await checkedRun(
+        commands,
+        ["fetch", "--no-tags", "--no-write-fetch-head", "--depth=1", `https://github.com/${source.repository}.git`, `refs/pull/${source.number}/head`],
+        cwd,
+        signal,
+        "fetch the captured pull-request head commit",
+      );
+      ensureSuccessful(fetchResult, "fetch the captured pull-request head commit");
+      return verifyHead();
+    };
     let objectResult: CommandResult;
     try {
-      objectResult = await checkedRun(commands, ["cat-file", "-e", `${headSha}^{commit}`], cwd, signal, "verify the captured pull-request head commit");
+      objectResult = await verifyHead();
     } catch (error) {
       if (signal?.aborted || errorMessage(error).includes("canceled")) throw error;
-      throw new Error(`Captured pull-request head commit ${headSha} is missing from ${cwd}; no network fetch was attempted (${errorMessage(error)})`);
+      try {
+        objectResult = await fetchHead();
+      } catch (fetchError) {
+        if (signal?.aborted || errorMessage(fetchError).includes("canceled")) throw fetchError;
+        throw new Error(`Captured pull-request head commit ${headSha} is missing from ${cwd}; network fetch failed (${errorMessage(fetchError)})`);
+      }
+      if (objectResult.truncated || objectResult.exitCode !== 0) {
+        throw new Error(`Captured pull-request head commit ${headSha} remains unavailable after network fetch`);
+      }
     }
     if (objectResult.truncated || objectResult.exitCode !== 0) {
-      throw new Error(`Captured pull-request head commit ${headSha} is missing from ${cwd}; no network fetch was attempted`);
+      try {
+        objectResult = await fetchHead();
+      } catch (fetchError) {
+        if (signal?.aborted || errorMessage(fetchError).includes("canceled")) throw fetchError;
+        throw new Error(`Captured pull-request head commit ${headSha} is missing from ${cwd}; network fetch failed (${errorMessage(fetchError)})`);
+      }
+      if (objectResult.truncated || objectResult.exitCode !== 0) {
+        throw new Error(`Captured pull-request head commit ${headSha} remains unavailable after network fetch`);
+      }
     }
     const listingResult = await checkedRun(commands, ["ls-tree", "-r", "-l", "-z", "--full-tree", headSha], cwd, signal, "list the captured pull-request tree");
     ensureSuccessful(listingResult, "list the captured pull-request tree");

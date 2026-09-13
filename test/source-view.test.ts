@@ -69,6 +69,23 @@ class ListedTreeCommands implements CommandRunner {
   }
 }
 
+class FetchingHeadCommands implements CommandRunner {
+  public readonly calls: string[][] = [];
+  private headAvailable = false;
+  public run(command: string, args: readonly string[]): Promise<CommandResult> {
+    this.calls.push([command, ...args]);
+    if (args[0] === "cat-file") {
+      return Promise.resolve(this.headAvailable ? ok() : { stdout: "", stderr: "missing", exitCode: 1 });
+    }
+    if (args[0] === "fetch") {
+      this.headAvailable = true;
+      return Promise.resolve(ok());
+    }
+    if (args[0] === "ls-tree") return Promise.resolve(ok());
+    return Promise.resolve({ stdout: "", stderr: "unexpected command", exitCode: 1 });
+  }
+}
+
 function abortOnThirdListener(): AbortSignal {
   let isAborted = false;
   let registrations = 0;
@@ -234,11 +251,24 @@ describe("review source view", () => {
     }
   });
 
-  it("rejects missing or mismatched captured heads before creating a source root", async () => {
+  it("fetches missing captured heads and rejects mismatched heads before creating a source root", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "pi-review-source-head-"));
     try {
+      const fetching = new FetchingHeadCommands();
+      const fetched = await prepareReviewSourceView(snapshot(cwd, fullObject), fetching);
+      expect(fetching.calls).toContainEqual([
+        "git",
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--depth=1",
+        "https://github.com/acme/project.git",
+        "refs/pull/7/head",
+      ]);
+      await fetched.dispose();
+
       const missing = new ListedTreeCommands("", { stdout: "", stderr: "not found", exitCode: 1 });
-      await expect(prepareReviewSourceView(snapshot(cwd, fullObject), missing)).rejects.toThrow(/head commit .*missing.*no network fetch/u);
+      await expect(prepareReviewSourceView(snapshot(cwd, fullObject), missing)).rejects.toThrow(/head commit .*network fetch failed/u);
       const mismatch = snapshot(cwd, fullObject);
       const other = { ...mismatch, headSha: "b".repeat(40) };
       await expect(prepareReviewSourceView(other, new ListedTreeCommands(""))).rejects.toThrow(/does not match/u);

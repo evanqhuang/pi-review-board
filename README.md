@@ -31,7 +31,9 @@ required when reviewing GitHub pull-request targets.
 Pull requests whose generated diff exceeds GitHub's 20,000-line limit are
 captured through the paginated per-file API instead; if GitHub omits an
 individual large-file patch, the immutable pull-request commits are used when
-available locally (or fetched without checking out a branch).
+available locally (or fetched without checking out a branch). The captured
+head commit is also fetched into the repository object database when needed to
+materialize snapshot-pinned source evidence; no branch is checked out.
 
 ## Use
 

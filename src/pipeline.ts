@@ -42,7 +42,12 @@ import {
 import { ReviewerRunError } from "./runner.js";
 import { prepareReviewSourceView } from "./source-view.js";
 import { assertInputBudget, InputLimitError, resolveInputBudget } from "./input-budget.js";
-import { MAX_REVIEW_WORK_UNITS } from "./types.js";
+import {
+  DEFAULT_MAX_REVIEW_WORK_UNITS,
+  DEFAULT_WORK_LIMIT_POLICY,
+  MAX_REVIEW_WORK_UNITS,
+  reviewRoleWeight,
+} from "./types.js";
 import type {
   AgentInvocation,
   AgentResult,
@@ -855,9 +860,41 @@ async function runShardedReview(
     return completedResult(snapshot, options, "incomplete", "Review could not start because prompt-aware sharding failed.", [], [stageFailure("eligibility", error), ...initialFailures, ...guidanceFailures], [], false);
   }
   const shardMap = new Map(shards.map((shard) => [shard.id, shard]));
+  const rolesByShard = new Map(shards.map((shard) => [shard.id, rolesForShard(shard)]));
+  const workLimit = options.maxReviewWorkUnits ?? DEFAULT_MAX_REVIEW_WORK_UNITS;
+  const roleWeight = (roles: ReadonlySet<ReviewRole>): number => [...rolesByShard.entries()].reduce((total, [shardId, rolesForShard]) => {
+    const shard = shardMap.get(shardId);
+    if (shard === undefined) return total;
+    return total + rolesForShard
+      .filter((role) => roles.has(role) && (role !== "diff-only-bug" || shard.supported))
+      .reduce((shardTotal, role) => shardTotal + reviewRoleWeight(role), 0);
+  }, 0);
+  const fullRoleSet = new Set<ReviewRole>(["diff-only-bug", "guidance-a", "guidance-b", "contextual-bug", "integration"]);
+  const fullWeight = roleWeight(fullRoleSet);
+  // A very large diff can produce more required role passes than the bounded
+  // default budget allows. Preserve the complete changed-line pass and add
+  // the highest-priority optional passes that fit, rather than rejecting the
+  // entire review before launching any work. Explicit limits and manifests
+  // retain their strict behavior so callers can still require fail-closed
+  // admission for a deliberately chosen scope.
+  const adaptToDefaultBudget = explicitManifest === undefined
+    && options.maxReviewWorkUnits === undefined
+    && (options.workLimitPolicy ?? DEFAULT_WORK_LIMIT_POLICY) === "reject"
+    && fullWeight > workLimit;
+  if (adaptToDefaultBudget) {
+    const boundedPrimaryBudget = Math.max(0, workLimit - MAX_FINDINGS * 2);
+    const selectedRoles = new Set<ReviewRole>(["diff-only-bug"]);
+    for (const role of ["guidance-a", "guidance-b", "contextual-bug", "integration"] as const) {
+      const candidate = new Set(selectedRoles).add(role);
+      if (roleWeight(candidate) <= boundedPrimaryBudget) selectedRoles.add(role);
+    }
+    for (const [shardId, roles] of rolesByShard) {
+      rolesByShard.set(shardId, roles.filter((role) => selectedRoles.has(role)));
+    }
+  }
   const obligations: Array<{ readonly role: ReviewRole; readonly shardIds: readonly string[]; readonly trigger?: "always" | "risk" | "candidate" }> = [];
   for (const shard of shards) {
-    for (const role of rolesForShard(shard)) {
+    for (const role of rolesByShard.get(shard.id) ?? []) {
       if (role === "diff-only-bug" && !shard.supported) continue;
       const trigger = role === "diff-only-bug" || role === "guidance-a" ? "always" : "risk";
       obligations.push({ role, shardIds: [shard.id], trigger });

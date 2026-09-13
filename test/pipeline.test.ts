@@ -373,6 +373,45 @@ describe("runCodeReview deterministic topology", () => {
     }
   });
 
+  it("adapts an oversized default sharded review instead of rejecting every shard", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-review-oversized-budget-"));
+    try {
+      await writeFile(join(cwd, "AGENTS.md"), "Preserve validation and public contracts.\n");
+      const paths = Array.from({ length: 24 }, (_, index) => `src/config/part-${index}.ts`);
+      const diff = paths.map((path, index) => largeDiff(path, index * 1000)).join("");
+      const agents = new ControlledAgents();
+      agents.candidateCount = 0;
+      const result = await runCodeReview({
+        cwd,
+        target,
+        comment: false,
+        effort: "normal",
+        snapshot: { ...snapshot(diff, paths), cwd },
+      }, { ...dependencies(agents), resolveModelContextWindow: () => 64_000 });
+
+      expect(result.status).toBe("complete");
+      expect(result.coverage).toMatchObject({ mode: "sharded", state: "complete", budgetMaxWeight: 128 });
+      expect(result.coverage?.budget?.spentWeight).toBeLessThanOrEqual(128);
+      expect([...new Set(agents.calls.map((call) => call.role))]).toEqual(["diff-only-bug", "guidance-a"]);
+      expect(agents.calls.filter((call) => call.role === "diff-only-bug").length).toBeGreaterThan(32);
+      expect(agents.calls.every((call) => Buffer.byteLength(call.prompt, "utf8") <= call.inputBudgetBytes!)).toBe(true);
+      const strictAgents = new RecordingAgents();
+      const strict = await runCodeReview({
+        cwd,
+        target,
+        comment: false,
+        effort: "normal",
+        maxReviewWorkUnits: 128,
+        snapshot: { ...snapshot(diff, paths), cwd },
+      }, { ...dependencies(strictAgents), resolveModelContextWindow: () => 64_000 });
+      expect(strict.status).toBe("incomplete");
+      expect(strictAgents.calls).toHaveLength(0);
+      expect(strict.report).toContain("weighted units required");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("keeps a 45 KiB indivisible line supported when its resolved prompt fits", async () => {
     const agents = new RecordingAgents();
     agents.candidateCount = 0;

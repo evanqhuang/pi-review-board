@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { runChecked } from "./commands.js";
 import { parseUnifiedDiff } from "./diff-shards.js";
 import { normalizeReviewPath } from "./output.js";
@@ -328,6 +328,16 @@ async function resolveWorktreeTarget(localPath: string, cwd: string, commands: C
   return { kind: "worktree", path: localPath };
 }
 
+async function resolveRepositoryRelativePath(value: string, cwd: string, commands: CommandRunner, signal?: AbortSignal): Promise<string | undefined> {
+  const commonDir = await commands.run("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, signal });
+  throwIfCanceled(commonDir, "Repository path lookup");
+  if (commonDir.exitCode !== 0 || commonDir.truncated) return undefined;
+  const path = commonDir.stdout.trim();
+  if (!path) return undefined;
+  const candidate = resolve(dirname(path), value);
+  return existsSync(candidate) ? candidate : undefined;
+}
+
 export async function resolveReviewTarget(rawTarget: string | undefined, cwd: string, commands: CommandRunner, signal?: AbortSignal): Promise<ReviewTarget> {
   const value = rawTarget?.trim();
   if (!value) return { kind: "current-diff" };
@@ -342,8 +352,15 @@ export async function resolveReviewTarget(rawTarget: string | undefined, cwd: st
     return { kind: "pull-request", value };
   }
 
-  const localPath = resolve(cwd, value);
-  const localExists = existsSync(localPath);
+  let localPath = resolve(cwd, value);
+  let localExists = existsSync(localPath);
+  if (!localExists) {
+    const repositoryRelativePath = await resolveRepositoryRelativePath(value, cwd, commands, signal);
+    if (repositoryRelativePath) {
+      localPath = repositoryRelativePath;
+      localExists = true;
+    }
+  }
   const ref = await commands.run("git", ["rev-parse", "--verify", `${value}^{commit}`], { cwd, signal });
   if (ref.canceled) throw new Error("Review target resolution canceled");
   if (localExists && ref.exitCode === 0) throw new Error(`Ambiguous review target: ${value} is both a path and a revision`);
@@ -426,11 +443,43 @@ async function captureCurrentDiff(cwd: string, commands: CommandRunner, signal?:
   return { diff: workingDiff, paths: workingPaths, ...(headSha ? { headSha } : {}) };
 }
 
+async function captureWorktreeDiff(cwd: string, commands: CommandRunner, signal?: AbortSignal): Promise<{ diff: string; paths: readonly string[]; headSha?: string; baseSha?: string }> {
+  const head = await runChecked(commands, "git", ["rev-parse", "HEAD"], cwd, signal);
+  const remoteHead = await commands.run("git", ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], { cwd, signal });
+  throwIfCanceled(remoteHead, "Default branch lookup");
+  const upstream = await commands.run("git", ["rev-parse", "--verify", "@{upstream}"], { cwd, signal });
+  throwIfCanceled(upstream, "Upstream lookup");
+  const bases = [
+    ...(remoteHead.exitCode === 0 ? [remoteHead.stdout.trim()] : []),
+    "main",
+    "origin/main",
+    ...(upstream.exitCode === 0 ? [upstream.stdout.trim()] : []),
+  ].filter(Boolean);
+  for (const base of [...new Set(bases)]) {
+    const candidate = await commands.run("git", ["rev-parse", "--verify", `${base}^{commit}`], { cwd, signal });
+    throwIfCanceled(candidate, `${base} lookup`);
+    if (candidate.exitCode !== 0 || candidate.stdout.trim() === head.trim()) continue;
+    const committedDiff = await readDiff(commands, cwd, [`${base}...HEAD`], signal);
+    const committedPaths = await readNames(commands, cwd, [`${base}...HEAD`], signal);
+    const workingDiff = await readDiff(commands, cwd, ["HEAD"], signal);
+    const workingPaths = await readNames(commands, cwd, ["HEAD"], signal);
+    return {
+      diff: [committedDiff, workingDiff].filter(Boolean).join("\n"),
+      paths: [...new Set([...committedPaths, ...workingPaths])].sort(),
+      headSha: head.trim(),
+      baseSha: candidate.stdout.trim(),
+    };
+  }
+  return captureCurrentDiff(cwd, commands, signal);
+}
+
 async function captureLocalTarget(target: ReviewTarget, cwd: string, commands: CommandRunner, signal?: AbortSignal): Promise<{ diff: string; paths: readonly string[]; headSha?: string; baseSha?: string }> {
-  if (target.kind === "current-diff" || target.kind === "worktree") return captureCurrentDiff(cwd, commands, signal);
+  if (target.kind === "current-diff") return captureCurrentDiff(cwd, commands, signal);
+  if (target.kind === "worktree") return captureWorktreeDiff(cwd, commands, signal);
   if (target.kind === "branch") {
     const head = await runChecked(commands, "git", ["rev-parse", "HEAD"], cwd, signal);
     const base = await runChecked(commands, "git", ["rev-parse", target.ref], cwd, signal);
+    if (head.trim() === base.trim()) return captureWorktreeDiff(cwd, commands, signal);
     const range = `HEAD...${target.ref}`;
     return {
       diff: await readDiff(commands, cwd, [range], signal),

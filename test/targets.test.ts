@@ -54,6 +54,21 @@ describe("review targets", () => {
     await expect(resolveReviewTarget("src", cwd, commands)).resolves.toEqual({ kind: "path", path: "src" });
   });
 
+  it("resolves repository-relative worktree paths from another linked worktree", async () => {
+    const repository = await mkdtemp(join(tmpdir(), "pi-review-target-"));
+    const cwd = join(repository, ".worktrees", "current");
+    const sibling = join(repository, ".worktrees", "topic");
+    await mkdir(cwd, { recursive: true });
+    await mkdir(sibling, { recursive: true });
+    const commands = new FakeCommands((command, args) => {
+      if (command === "git" && args[0] === "rev-parse" && args[1] === "--path-format=absolute") return ok(`${join(repository, ".git")}\n`);
+      if (command === "git" && args[0] === "-C" && args[1] === sibling) return ok(`${sibling}\n`);
+      return fail();
+    });
+
+    await expect(resolveReviewTarget(".worktrees/topic", cwd, commands)).resolves.toEqual({ kind: "worktree", path: sibling });
+  });
+
   it("captures and detects branch snapshot drift", async () => {
     let version = 1;
     const commands = new FakeCommands((command, args) => {
@@ -72,16 +87,38 @@ describe("review targets", () => {
     expect(await hasSnapshotDrift(snapshot, commands)).toBe(true);
   });
 
+  it("captures a checked-out branch against the default branch instead of itself", async () => {
+    const commands = new FakeCommands((command, args) => {
+      if (command !== "git") return fail();
+      if (args[0] === "rev-parse" && (args[1] === "HEAD" || args[1] === "topic")) return ok("topic-sha\n");
+      if (args[0] === "symbolic-ref") return ok("refs/remotes/origin/main\n");
+      if (args[0] === "rev-parse" && args[1] === "--verify" && args[2] === "@{upstream}") return ok("origin/topic\n");
+      if (args[0] === "rev-parse" && args[1] === "--verify" && args[2] === "refs/remotes/origin/main^{commit}") return ok("main-sha\n");
+      if (args[0] === "diff" && args[1] === "--name-only" && args[2] === "refs/remotes/origin/main...HEAD") return ok("src/a.ts\n");
+      if (args[0] === "diff" && args[1] === "refs/remotes/origin/main...HEAD") return ok("branch diff");
+      if (args[0] === "diff" && args[1] === "--name-only" && args[2] === "HEAD") return ok();
+      if (args[0] === "diff" && args[1] === "HEAD") return ok();
+      return fail();
+    });
+
+    const snapshot = await captureReviewSnapshot({ kind: "branch", ref: "topic" }, "/repo", commands);
+    expect(snapshot.changedPaths).toEqual(["src/a.ts"]);
+    expect(snapshot.diff).toBe("branch diff");
+    expect(snapshot.baseSha).toBe("main-sha");
+  });
+
   it("captures committed and working changes from a worktree root", async () => {
     const cwd = "/repo";
     const worktreePath = "/repo/.worktrees/topic";
     const commands = new FakeCommands((command, args) => {
       if (command !== "git") return fail();
       if (args[0] === "rev-parse" && args[1] === "HEAD") return ok("head-sha\n");
+      if (args[0] === "symbolic-ref") return ok("refs/remotes/origin/main\n");
       if (args[0] === "rev-parse" && args[1] === "--verify" && args[2] === "@{upstream}") return ok("origin/topic\n");
+      if (args[0] === "rev-parse" && args[1] === "--verify" && args[2] === "refs/remotes/origin/main^{commit}") return ok("base-sha\n");
       if (args[0] === "rev-parse" && args[1] === "--verify" && args[2] === "origin/topic^{commit}") return ok("base-sha\n");
-      if (args[0] === "diff" && args[1] === "--name-only" && args[2] === "origin/topic...HEAD") return ok("src/committed.ts\n");
-      if (args[0] === "diff" && args[1] === "origin/topic...HEAD") return ok("committed diff");
+      if (args[0] === "diff" && args[1] === "--name-only" && args[2] === "refs/remotes/origin/main...HEAD") return ok("src/committed.ts\n");
+      if (args[0] === "diff" && args[1] === "refs/remotes/origin/main...HEAD") return ok("committed diff");
       if (args[0] === "diff" && args[1] === "--name-only" && args[2] === "HEAD") return ok("src/working.ts\n");
       if (args[0] === "diff" && args[1] === "HEAD") return ok("working diff");
       return fail();

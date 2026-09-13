@@ -219,6 +219,29 @@ describe("review targets", () => {
     ]);
   });
 
+  it("uses all paginated file paths when gh pr view truncates metadata at 100 files", async () => {
+    const apiFiles = Array.from({ length: 101 }, (_, index) => ({ filename: `src/file-${index}.ts` }));
+    const payload = JSON.stringify({
+      number: 7,
+      url: "https://github.com/acme/repo/pull/7",
+      baseRefOid: "base-a",
+      headRefOid: "head-a",
+      files: apiFiles.slice(0, 100).map((file) => ({ path: file.filename })),
+    });
+    const commands = new FakeCommands((command, args) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(payload);
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return ok(apiFiles.map((file) => fileDiff(file.filename)).join("\n"));
+      if (command === "gh" && args[0] === "api" && args[1] === "user") return ok("reviewer");
+      if (command === "gh" && args[0] === "api" && args[1] === "--paginate") return ok(JSON.stringify([apiFiles]));
+      return fail();
+    });
+
+    const snapshot = await captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands);
+    expect(snapshot.changedPaths).toHaveLength(101);
+    expect(snapshot.changedPaths).toContain("src/file-100.ts");
+    expect(commands.calls.filter((call) => call[0] === "gh" && call[1] === "api" && call[2] === "--paginate")).toHaveLength(2);
+  });
+
   it("uses local immutable PR commits when a per-file patch is omitted", async () => {
     const payload = JSON.stringify({
       number: 7,

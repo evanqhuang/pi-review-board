@@ -244,6 +244,16 @@ async function readPullRequestFilesDiff(
   commands: CommandRunner,
   signal?: AbortSignal,
 ): Promise<string> {
+  const files = await readPullRequestFiles(pullRequest, cwd, commands, signal);
+  return files.map(formatPullRequestFile).join("\n");
+}
+
+async function readPullRequestFiles(
+  pullRequest: PullRequestMetadata,
+  cwd: string,
+  commands: CommandRunner,
+  signal?: AbortSignal,
+): Promise<readonly PullRequestFile[]> {
   const json = await runChecked(
     commands,
     "gh",
@@ -258,8 +268,7 @@ async function readPullRequestFilesDiff(
     cwd,
     signal,
   );
-  const files = parsePullRequestFiles(parseJson(json, "GitHub returned invalid pull request file JSON"));
-  return files.map(formatPullRequestFile).join("\n");
+  return parsePullRequestFiles(parseJson(json, "GitHub returned invalid pull request file JSON"));
 }
 
 async function readPullRequestGitDiff(
@@ -362,8 +371,17 @@ async function readPullRequest(target: Extract<ReviewTarget, { kind: "pull-reque
   throwIfCanceled(identity, "Reviewer identity lookup");
   if (identity.truncated) throw new Error("Reviewer identity lookup output was truncated");
   const reviewerLogin = identity.exitCode === 0 ? identity.stdout.trim() : "";
+  let changedPaths = pullRequest.changedPaths;
+  // GitHub's GraphQL-backed `gh pr view --json files` response is capped at
+  // 100 files. Replace that truncated scope with the paginated REST file list
+  // before validating either the normal or oversized diff.
+  if (changedPaths.length >= 100) {
+    const files = await readPullRequestFiles(pullRequest, cwd, commands, signal);
+    changedPaths = [...new Set(files.map((file) => file.filename))].sort();
+  }
   return {
     ...pullRequest,
+    changedPaths,
     reviewerIdentityAvailable: identity.exitCode === 0 && reviewerLogin.length > 0,
     ...(reviewerLogin ? { reviewerLogin } : {}),
   };

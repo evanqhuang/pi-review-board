@@ -73,7 +73,6 @@ const CONTEXT_TOOLS = Object.freeze(["read", "grep"]);
 export const REVIEW_ROLES: readonly ReviewRole[] = Object.freeze([
   "summary",
   "guidance-a",
-  "guidance-b",
   "diff-only-bug",
   "contextual-bug",
   "integration",
@@ -114,7 +113,6 @@ function roleConfig(
 const ROLE_PLANS: Readonly<Record<ReviewRole, ReviewRoleConfig>> = Object.freeze({
   summary: roleConfig(NO_REPOSITORY_TOOLS, 3, 200_000, 0, LUNA_MODEL, "high"),
   "guidance-a": roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 4, LUNA_MODEL, "high"),
-  "guidance-b": roleConfig(NO_REPOSITORY_TOOLS, 6, 220_000, 4, LUNA_MODEL, "high"),
   "diff-only-bug": roleConfig(NO_REPOSITORY_TOOLS, 4, 220_000, 4, LUNA_MODEL, "high"),
   "contextual-bug": roleConfig(CONTEXT_TOOLS, 16, 240_000, 4, LUNA_MODEL, "xhigh"),
   integration: roleConfig(CONTEXT_TOOLS, 16, 240_000, 4, LUNA_MODEL, "xhigh"),
@@ -143,8 +141,8 @@ export const REVIEW_ROLE_PLANS = ROUTE_PLANS;
 const ACTIVE_ROLES: Readonly<Record<ReviewRoute, readonly ReviewRole[]>> = Object.freeze({
   tiny: Object.freeze(["diff-only-bug"] as ReviewRole[]),
   small: Object.freeze(["diff-only-bug", "guidance-a"] as ReviewRole[]),
-  normal: Object.freeze(["guidance-a", "guidance-b", "diff-only-bug", "contextual-bug"] as ReviewRole[]),
-  deep: Object.freeze(["guidance-a", "guidance-b", "diff-only-bug", "contextual-bug", "integration"] as ReviewRole[]),
+  normal: Object.freeze(["guidance-a", "diff-only-bug", "contextual-bug"] as ReviewRole[]),
+  deep: Object.freeze(["guidance-a", "diff-only-bug", "contextual-bug", "integration"] as ReviewRole[]),
 });
 
 export function getReviewPlan(route: ReviewRoute, effort?: ReviewEffort): ReviewPlan {

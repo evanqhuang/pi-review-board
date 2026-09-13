@@ -45,7 +45,6 @@ import { assertInputBudget, InputLimitError, resolveInputBudget } from "./input-
 import {
   DEFAULT_MAX_REVIEW_WORK_UNITS,
   DEFAULT_WORK_LIMIT_POLICY,
-  MAX_REVIEW_WORK_UNITS,
   reviewRoleWeight,
 } from "./types.js";
 import type {
@@ -90,7 +89,7 @@ function rejectedWorkMessage(plan: ReviewWorkPlan): string {
   const reasons = [...new Set(plan.units.filter((unit) => unit.status === "uncovered").map((unit) => unit.reason).filter(Boolean))];
   const budgetRejected = reasons.some((reason) => reason?.startsWith("review work limit rejected plan:"));
   if (budgetRejected) {
-    return `Review did not start: ${required} weighted units required for ${plan.units.length} discovery tasks; limit ${plan.maxReviewWorkUnits}. Validation and retries need additional headroom. ${required < MAX_REVIEW_WORK_UNITS ? `Increase --max-work-units (up to ${MAX_REVIEW_WORK_UNITS}).` : "Reduce the review scope or required discovery work."}`;
+    return `Review did not start: ${required} weighted units required for ${plan.units.length} discovery tasks; limit ${plan.maxReviewWorkUnits}. Validation and retries need additional headroom. Increase --max-work-units or reduce the review scope.`;
   }
   return `Review did not start: required work is unsupported. ${reasons.join("; ")}`.slice(0, 500);
 }
@@ -399,7 +398,6 @@ export function roleInvocation(
 function finderValidator(role: Exclude<ReviewRole, "summary" | "validator">): (value: unknown) => FinderOutput {
   switch (role) {
     case "guidance-a":
-    case "guidance-b":
       return validateGuidance;
     case "diff-only-bug":
       return validateDiffOnlyBug;
@@ -454,7 +452,6 @@ function rolePrompt(
     case "summary":
       return buildSummaryPrompt(snapshot, [], inputBudgetBytes);
     case "guidance-a":
-    case "guidance-b":
       return buildGuidancePrompt(snapshot, guidanceByPath, context, inputBudgetBytes);
     case "diff-only-bug":
       return buildDiffOnlyBugPrompt(snapshot, guidance, context, inputBudgetBytes);
@@ -818,7 +815,6 @@ async function runShardedReview(
     return [
       "diff-only-bug",
       ...(hasGuidance ? ["guidance-a" as const] : []),
-      ...(hasGuidance && risky ? ["guidance-b" as const] : []),
       ...(risky ? ["contextual-bug" as const] : []),
       ...(route.route === "deep" && risky ? ["integration" as const] : []),
     ];
@@ -869,7 +865,7 @@ async function runShardedReview(
       .filter((role) => roles.has(role) && (role !== "diff-only-bug" || shard.supported))
       .reduce((shardTotal, role) => shardTotal + reviewRoleWeight(role), 0);
   }, 0);
-  const fullRoleSet = new Set<ReviewRole>(["diff-only-bug", "guidance-a", "guidance-b", "contextual-bug", "integration"]);
+  const fullRoleSet = new Set<ReviewRole>(["diff-only-bug", "guidance-a", "contextual-bug", "integration"]);
   const fullWeight = roleWeight(fullRoleSet);
   // A very large diff can produce more required role passes than the bounded
   // default budget allows. Preserve the complete changed-line pass and add
@@ -884,7 +880,7 @@ async function runShardedReview(
   if (adaptToDefaultBudget) {
     const boundedPrimaryBudget = Math.max(0, workLimit - MAX_FINDINGS * 2);
     const selectedRoles = new Set<ReviewRole>(["diff-only-bug"]);
-    for (const role of ["guidance-a", "guidance-b", "contextual-bug", "integration"] as const) {
+    for (const role of ["guidance-a", "contextual-bug", "integration"] as const) {
       const candidate = new Set(selectedRoles).add(role);
       if (roleWeight(candidate) <= boundedPrimaryBudget) selectedRoles.add(role);
     }
@@ -1053,7 +1049,7 @@ async function runShardedReview(
     const candidatePlan = planReviewWork(snapshot, {
       shards: candidateShards,
       manifest: [...byShard.keys()].map((shardId) => ({ role, shardIds: [shardId], trigger: "candidate" as const })),
-      maxReviewWorkUnits: Math.max(1, Math.min(MAX_REVIEW_WORK_UNITS, remaining + candidateShards.length)),
+      maxReviewWorkUnits: Math.max(1, remaining + candidateShards.length),
       workLimitPolicy: "partial",
     });
     const syntheticDiffIds = candidatePlan.units.filter((unit) => unit.role === "diff").map((unit) => unit.id);
@@ -1322,7 +1318,7 @@ async function runPreparedReview(
   // use the same applicability result.
   let guidance: readonly GuidanceFile[] = [];
   const guidanceFailures: StageFailure[] = [];
-  const guidanceSelected = plan.activeRoles.includes("guidance-a") || plan.activeRoles.includes("guidance-b");
+  const guidanceSelected = plan.activeRoles.includes("guidance-a");
   if (guidanceSelected) {
     progress(dependencies, "guidance", "Loading applicable repository guidance");
     const guidanceDiscovery = discoverApplicableGuidance(reviewCwd, snapshot.changedPaths);
@@ -1594,7 +1590,7 @@ async function runPreparedReview(
           { role: "diff-only-bug" },
           { role: "contextual-bug", trigger: "candidate" },
         ],
-        maxReviewWorkUnits: Math.max(1, Math.min(MAX_REVIEW_WORK_UNITS, remaining + 1)),
+        maxReviewWorkUnits: Math.max(1, remaining + 1),
         workLimitPolicy: workPlan.workLimitPolicy,
       });
       const syntheticDiffIds = candidatePlan.units.filter((unit) => unit.role === "diff").map((unit) => unit.id);

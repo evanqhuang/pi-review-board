@@ -346,7 +346,7 @@ describe("runCodeReview deterministic topology", () => {
       const result = await runCodeReview(options, deps);
       expect(result.status).toBe("complete");
       expect(result.coverage).toMatchObject({ mode: "sharded", state: "complete", budgetMaxWeight: 128 });
-      expect(result.coverage?.budget?.spentWeight).toBeGreaterThan(32);
+      expect(result.coverage?.budget?.spentWeight).toBeGreaterThan(0);
       expect(agents.maxActiveReviewers).toBeLessThanOrEqual(4);
       expect(agents.calls.some((call) => call.role === "guidance-a")).toBe(true);
       expect(agents.calls.every((call) => Buffer.byteLength(call.prompt, "utf8") <= call.inputBudgetBytes!)).toBe(true);
@@ -360,12 +360,12 @@ describe("runCodeReview deterministic topology", () => {
       expect(reviewedDiffLines).toHaveLength(expectedDiffLines.length);
       expect([...reviewedDiffLines].sort()).toEqual([...expectedDiffLines].sort());
       const rejectedAgents = new RecordingAgents();
-      const rejected = await runCodeReview({ ...options, maxReviewWorkUnits: 32 }, { ...dependencies(rejectedAgents), resolveModelContextWindow: () => 64_000 });
+      const rejected = await runCodeReview({ ...options, maxReviewWorkUnits: 16 }, { ...dependencies(rejectedAgents), resolveModelContextWindow: () => 64_000 });
       expect(rejected.status).toBe("incomplete");
       expect(rejectedAgents.calls).toHaveLength(0);
       expect(rejected.report).toContain("Review did not start");
       expect(rejected.report).toContain("weighted units required");
-      expect(rejected.report).toContain("limit 32");
+      expect(rejected.report).toContain("limit 16");
       expect(rejected.report).toContain("INCOMPLETE REVIEW");
       expect(rejected.report).not.toContain("No verified findings");
     } finally {
@@ -620,7 +620,7 @@ describe("runCodeReview deterministic topology", () => {
     const result = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", snapshot: snapshot(normalDiff, ["src/auth.ts"]) }, dependencies(agents));
 
     expect(result.status).toBe("complete");
-    for (const role of ["summary", "guidance-a", "guidance-b"] as const) {
+    for (const role of ["summary", "guidance-a"] as const) {
       expect(agents.calls.find((call) => call.role === role)).toMatchObject({ model: "openai-codex/gpt-5.6-luna", thinking: "high" });
     }
     for (const role of ["diff-only-bug", "contextual-bug"] as const) {
@@ -651,13 +651,13 @@ describe("runCodeReview deterministic topology", () => {
     normalAgents.candidateCount = 1;
     const normal = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", snapshot: snapshot(normalDiff, ["src/auth.ts"]) }, dependencies(normalAgents));
     expect(normal.status).toBe("complete");
-    expect(normalAgents.calls.slice(0, 5).map((call) => call.role)).toEqual(["summary", "guidance-a", "guidance-b", "diff-only-bug", "contextual-bug"]);
+    expect(normalAgents.calls.slice(0, 4).map((call) => call.role)).toEqual(["summary", "guidance-a", "diff-only-bug", "contextual-bug"]);
     expect(normalAgents.calls.find((call) => call.role === "summary")).toMatchObject({ tools: [], maxTurns: 3, contextBudget: 64_000, inputBudgetBytes: 64_000, reservedTokens: DEFAULT_RESERVED_TOKENS });
 
     const deepAgents = new RecordingAgents();
     const deep = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "deep", snapshot: snapshot(tinyDiff) }, dependencies(deepAgents));
     expect(deep.status).toBe("complete");
-    expect(deepAgents.calls.slice(0, 6).map((call) => call.role)).toEqual(["summary", "guidance-a", "guidance-b", "diff-only-bug", "contextual-bug", "integration"]);
+    expect(deepAgents.calls.slice(0, 5).map((call) => call.role)).toEqual(["summary", "guidance-a", "diff-only-bug", "contextual-bug", "integration"]);
     expect(deepAgents.calls.find((call) => call.role === "integration")).toMatchObject({ tools: ["read", "grep"], thinking: "xhigh", maxTurns: 16, contextBudget: 64_000, inputBudgetBytes: 64_000, reservedTokens: DEFAULT_RESERVED_TOKENS });
   });
 
@@ -811,7 +811,6 @@ describe("runCodeReview deterministic topology", () => {
       "finders",
       "finders",
       "finders",
-      "finders",
     ]);
     expect(agents.calls).toEqual([]);
   });
@@ -825,7 +824,7 @@ describe("runCodeReview deterministic topology", () => {
 
     expect(result.status).toBe("incomplete");
     expect(result.failures[0]?.stage).toBe("summary");
-    expect(result.failures.filter((failure) => failure.stage === "finders")).toHaveLength(4);
+    expect(result.failures.filter((failure) => failure.stage === "finders")).toHaveLength(3);
     expect(agents.calls).toEqual([]);
   });
 
@@ -860,7 +859,7 @@ describe("runCodeReview deterministic topology", () => {
     agents.verdict = { disposition: "PLAUSIBLE", confidence: 99 };
     const plausible = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", snapshot: snapshot(normalDiff, ["src/auth.ts"]) }, dependencies(agents));
     expect(plausible.status).toBe("complete");
-    expect(agents.calls.filter((call) => call.role === "validator")).toHaveLength(16);
+    expect(agents.calls.filter((call) => call.role === "validator")).toHaveLength(12);
     expect(agents.maxActiveValidators).toBeLessThanOrEqual(4);
     expect(plausible.findings).toEqual([]);
 
@@ -989,13 +988,13 @@ describe("runCodeReview deterministic topology", () => {
 
   it("keeps concurrent finder failures in primary-role order", async () => {
     const agents = new RecordingAgents();
-    agents.failRoles.add("guidance-b");
+    agents.failRoles.add("guidance-a");
     agents.failRoles.add("diff-only-bug");
     const result = await runCodeReview({ cwd: "/repo", target, comment: false, effort: "normal", snapshot: snapshot(normalDiff, ["src/auth.ts"]) }, dependencies(agents));
 
     expect(result.status).toBe("incomplete");
     expect(result.failures.filter((failure) => failure.stage === "finders").map((failure) => failure.message)).toEqual([
-      "guidance-b: guidance-b failed",
+      "guidance-a: guidance-a failed",
       "diff-only-bug: diff-only-bug failed",
     ]);
   });

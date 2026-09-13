@@ -169,7 +169,6 @@ describe("deterministic diff routing", () => {
     expect(plan.roles.summary).toMatchObject({ inputBudgetBytes: 64 * 1024, reservedTokens: 32_000, contextBudget: 200_000 });
     expect(plan.roles.summary.modelRoute.thinking).toBe("high");
     expect(plan.roles["guidance-a"].modelRoute.thinking).toBe("high");
-    expect(plan.roles["guidance-b"].modelRoute.thinking).toBe("high");
     expect(plan.roles["diff-only-bug"].modelRoute.thinking).toBe("high");
     expect(plan.roles["contextual-bug"].modelRoute.thinking).toBe("xhigh");
     expect(plan.roles.integration.modelRoute.thinking).toBe("xhigh");

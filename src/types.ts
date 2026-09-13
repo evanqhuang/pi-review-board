@@ -8,7 +8,6 @@ export type ReviewRoute = "tiny" | "small" | "normal" | "deep";
 export type ReviewRole =
   | "summary"
   | "guidance-a"
-  | "guidance-b"
   | "diff-only-bug"
   | "contextual-bug"
   | "integration"
@@ -117,7 +116,8 @@ export type ReviewWorkManifest =
 export const REVIEW_WORK_POLICY_VERSION = 1;
 export const REVIEW_WORK_POLICY = "bounded-sharded-review";
 export const DEFAULT_MAX_REVIEW_WORK_UNITS = 128;
-export const MAX_REVIEW_WORK_UNITS = 128;
+/** JavaScript's numeric safety ceiling; there is no product-level cap. */
+export const MAX_REVIEW_WORK_UNITS = Number.MAX_SAFE_INTEGER;
 export const DEFAULT_WORK_LIMIT_POLICY: WorkLimitPolicy = "reject";
 
 export const REVIEW_WORK_UNIT_WEIGHTS: Readonly<Record<ReviewWorkRole, number>> = Object.freeze({
@@ -133,7 +133,6 @@ export const REVIEW_WORK_UNIT_WEIGHTS: Readonly<Record<ReviewWorkRole, number>> 
 export const REVIEW_ROLE_WEIGHTS: Readonly<Record<ReviewRole, number>> = Object.freeze({
   summary: 1,
   "guidance-a": 1,
-  "guidance-b": 1,
   "diff-only-bug": 1,
   "contextual-bug": 2,
   integration: 2,

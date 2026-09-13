@@ -15,9 +15,9 @@ const snapshot = {
 } as const;
 
 describe("deterministic review work and coverage", () => {
-  it("exposes bounded role weights and plans against an immutable snapshot", () => {
+  it("exposes role weights and plans against an immutable snapshot", () => {
     expect(DEFAULT_MAX_REVIEW_WORK_UNITS).toBe(128);
-    expect(MAX_REVIEW_WORK_UNITS).toBe(128);
+    expect(MAX_REVIEW_WORK_UNITS).toBe(Number.MAX_SAFE_INTEGER);
     expect(REVIEW_WORK_UNIT_WEIGHTS).toEqual({ summary: 1, diff: 1, guidance: 1, contextual: 2, integration: 2, validator: 1 });
     const first = planReviewWork(snapshot, { roles: ["summary", "diff", "validator"], maxReviewWorkUnits: 8 });
     const second = planReviewWork(snapshot, { roles: ["summary", "diff", "validator"], maxReviewWorkUnits: 8 });
@@ -28,6 +28,7 @@ describe("deterministic review work and coverage", () => {
     expect(first.coverage.plannedUnits).toEqual(first.units.map((unit) => unit.id));
     expect(first.coverage.coveredUnits).toEqual([]);
     expect(Object.isFrozen(first)).toBe(true);
+    expect(planReviewWork(snapshot, { roles: ["diff"], maxReviewWorkUnits: 256 }).maxReviewWorkUnits).toBe(256);
   });
 
   it("rejects or partially records deterministic work-limit coverage", () => {
@@ -51,14 +52,14 @@ describe("deterministic review work and coverage", () => {
     const selective = planReviewWork(snapshot, {
       manifest: [
         { role: "integration", applicable: false },
-        { role: "guidance-b", trigger: "risk" },
+        { role: "guidance-a", trigger: "risk" },
         { role: "guidance-a", applicable: false },
         { role: "contextual-bug", trigger: "candidate", applicable: false },
       ],
     });
     expect(selective.units.map((unit) => [unit.role, unit.agentRole, unit.trigger])).toEqual([
       ["diff", undefined, undefined],
-      ["guidance", "guidance-b", "risk"],
+      ["guidance", "guidance-a", "risk"],
     ]);
   });
 

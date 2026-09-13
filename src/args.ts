@@ -1,6 +1,5 @@
 import { isReviewEffort, parseReviewEffort, type ReviewEffort } from "./effort.js";
 import {
-  MAX_REVIEW_WORK_UNITS,
   type ReviewPhase,
   type WorkLimitPolicy,
 } from "./types.js";
@@ -78,11 +77,9 @@ function isPhase(value: string): value is ReviewPhase | "auto" {
 /** Validate the external work-unit limit before it reaches the planner. */
 export function validateMaxReviewWorkUnits(value: unknown, label = "maxReviewWorkUnits"): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-    throw new Error(`${label} must be a safe integer between 1 and ${MAX_REVIEW_WORK_UNITS}`);
+    throw new Error(`${label} must be a positive safe integer`);
   }
-  if (value < 1 || value > MAX_REVIEW_WORK_UNITS) {
-    throw new Error(`${label} must be between 1 and ${MAX_REVIEW_WORK_UNITS}`);
-  }
+  if (value < 1) throw new Error(`${label} must be a positive safe integer`);
   return value;
 }
 

@@ -48,7 +48,7 @@ describe("parseReviewArgs", () => {
     expect(() => parseReviewArgs("--model one --model two")).toThrow("Model may be provided only once");
   });
 
-  it("parses bounded sharding policies in both separated and equals forms", () => {
+  it("parses work-limit policies in both separated and equals forms", () => {
     expect(parseReviewArgs("--max-work-units 7 --work-limit-policy partial")).toMatchObject({
       maxReviewWorkUnits: 7,
       workLimitPolicy: "partial",
@@ -57,12 +57,13 @@ describe("parseReviewArgs", () => {
       maxReviewWorkUnits: 8,
       workLimitPolicy: "reject",
     });
+    expect(parseReviewArgs("--max-work-units=256").maxReviewWorkUnits).toBe(256);
     expect(() => parseReviewArgs("--max-work-units 4 --max-work-units=5")).toThrow("--max-work-units may be provided only once");
     expect(() => parseReviewArgs("--work-limit-policy reject --work-limit-policy=partial")).toThrow("--work-limit-policy may be provided only once");
   });
 
   it("rejects invalid sharding policy values and work-unit limits clearly", () => {
-    for (const value of ["0", "129", "1.5", "not-a-number", "1e309"]) {
+    for (const value of ["0", "-1", "1.5", "not-a-number", "1e309"]) {
       expect(() => parseReviewArgs(`--max-work-units=${value}`)).toThrow("--max-work-units");
     }
     expect(() => parseReviewArgs("--work-limit-policy maybe")).toThrow("--work-limit-policy must be reject or partial");

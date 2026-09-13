@@ -183,8 +183,8 @@ describe("review extension helpers", () => {
     const toolSchema = JSON.stringify(tool!.parameters);
     expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 1, workLimitPolicy: "reject" })).toBe(true);
     expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 128, workLimitPolicy: "partial" })).toBe(true);
+    expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 256 })).toBe(true);
     expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 0 })).toBe(false);
-    expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 129 })).toBe(false);
     expect(Value.Check(tool!.parameters as never, { maxReviewWorkUnits: 1.5 })).toBe(false);
     expect(Value.Check(tool!.parameters as never, { workLimitPolicy: "maybe" })).toBe(false);
     expect(toolSchema).toContain('"const":"normal"');

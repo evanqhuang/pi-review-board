@@ -20,7 +20,6 @@ import {
   type FindingDispositionInput,
 } from "../src/lifecycle.js";
 import { captureReviewSnapshot, resolveReviewTarget } from "../src/targets.js";
-import { MAX_REVIEW_WORK_UNITS } from "../src/types.js";
 import type { ReviewDecision, ReviewPhase, ReviewProgressEvent, ReviewResult, ReviewTarget, WorkLimitPolicy } from "../src/types.js";
 
 interface ReviewToolParams {
@@ -75,7 +74,7 @@ const REVIEW_ARGUMENT_COMPLETIONS: readonly AutocompleteItem[] = [
   { value: "reset", label: "reset — reset a managed review session" },
   { value: "--effort normal", label: "--effort normal — automatic tiny/small routing (default)" },
   { value: "--effort deep", label: "--effort deep — normal review plus one integration pass" },
-  { value: "--max-work-units ", label: "--max-work-units <1..128> — cap weighted review work" },
+  { value: "--max-work-units ", label: "--max-work-units <positive integer> — cap weighted review work" },
   { value: "--work-limit-policy reject", label: "--work-limit-policy reject — reject over-budget work" },
   { value: "--work-limit-policy partial", label: "--work-limit-policy partial — cover work up to the budget" },
   { value: "--phase initial", label: "--phase initial — advanced managed override" },
@@ -526,7 +525,7 @@ export default function (pi: ExtensionAPI): void {
         Type.Literal("normal"),
         Type.Literal("deep"),
       ], { description: "Review depth: normal automatically routes tiny/small changes; deep adds one integration pass" })),
-      maxReviewWorkUnits: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_REVIEW_WORK_UNITS, description: "Maximum weighted review work units (1-128)" })),
+      maxReviewWorkUnits: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum weighted review work units (positive integer)" })),
       workLimitPolicy: Type.Optional(Type.Union([
         Type.Literal("reject"),
         Type.Literal("partial"),

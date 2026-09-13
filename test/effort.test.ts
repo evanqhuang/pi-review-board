@@ -6,19 +6,17 @@ import type { ReviewRole } from "../src/types.js";
 const roles: readonly ReviewRole[] = [
   "summary",
   "guidance-a",
-  "guidance-b",
   "diff-only-bug",
   "contextual-bug",
   "integration",
   "validator",
 ];
 
-const noRepositoryTools = ["summary", "guidance-a", "guidance-b", "diff-only-bug", "validator"] as const;
+const noRepositoryTools = ["summary", "guidance-a", "diff-only-bug", "validator"] as const;
 const repositoryTools = ["contextual-bug", "integration"] as const;
 const caps: Readonly<Record<ReviewRole, number>> = {
   summary: 3,
   "guidance-a": 6,
-  "guidance-b": 6,
   "diff-only-bug": 4,
   "contextual-bug": 16,
   integration: 16,
@@ -28,7 +26,6 @@ const caps: Readonly<Record<ReviewRole, number>> = {
 const candidateCaps: Readonly<Record<ReviewRole, number>> = {
   summary: 0,
   "guidance-a": 4,
-  "guidance-b": 4,
   "diff-only-bug": 4,
   "contextual-bug": 4,
   integration: 4,
@@ -38,7 +35,6 @@ const candidateCaps: Readonly<Record<ReviewRole, number>> = {
 const contextBudgets: Readonly<Record<ReviewRole, number>> = {
   summary: 200_000,
   "guidance-a": 220_000,
-  "guidance-b": 220_000,
   "diff-only-bug": 220_000,
   "contextual-bug": 240_000,
   integration: 240_000,
@@ -48,7 +44,6 @@ const contextBudgets: Readonly<Record<ReviewRole, number>> = {
 const thinkingByRole: Readonly<Record<ReviewRole, "high" | "xhigh">> = {
   summary: "high",
   "guidance-a": "high",
-  "guidance-b": "high",
   "diff-only-bug": "high",
   "contextual-bug": "xhigh",
   integration: "xhigh",
@@ -58,8 +53,8 @@ const thinkingByRole: Readonly<Record<ReviewRole, "high" | "xhigh">> = {
 const activeRoles = {
   tiny: ["diff-only-bug"],
   small: ["diff-only-bug", "guidance-a"],
-  normal: ["guidance-a", "guidance-b", "diff-only-bug", "contextual-bug"],
-  deep: ["guidance-a", "guidance-b", "diff-only-bug", "contextual-bug", "integration"],
+  normal: ["guidance-a", "diff-only-bug", "contextual-bug"],
+  deep: ["guidance-a", "diff-only-bug", "contextual-bug", "integration"],
 } as const;
 
 describe("review effort contract", () => {
@@ -98,10 +93,10 @@ describe("review effort contract", () => {
     }
   });
 
-  it("keeps validator out of primary invocations and makes guidance multiplicity explicit", () => {
+  it("keeps validator out of primary invocations and uses one guidance pass", () => {
     expect(getReviewPlan("tiny").activeRoles).not.toContain("validator");
     expect(getReviewPlan("small").activeRoles).not.toContain("contextual-bug");
-    expect(getReviewPlan("normal").activeRoles.filter((role) => role.startsWith("guidance"))).toEqual(["guidance-a", "guidance-b"]);
+    expect(getReviewPlan("normal").activeRoles.filter((role) => role.startsWith("guidance"))).toEqual(["guidance-a"]);
     expect(getReviewPlan("deep").activeRoles).toContain("integration");
     expect(getReviewPlan("deep").activeRoles).not.toContain("validator");
   });

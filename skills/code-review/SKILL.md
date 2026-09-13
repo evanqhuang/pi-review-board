@@ -40,14 +40,14 @@ The route controls a fixed role set; it is not a general exploration framework:
 
 - `tiny`: one diff-only bug pass.
 - `small`: one diff-only bug pass and one guidance pass, with at most one candidate-triggered contextual escalation.
-- `normal`: one summary, two guidance passes, one diff-only bug pass, and one contextual bug pass.
+- `normal`: one summary, one guidance pass, one diff-only bug pass, and one contextual bug pass.
 - `deep`: the normal set plus one integration pass.
 
 For oversized sharded changes, the implicit bounded budget keeps the complete
 diff-only pass and admits the highest-priority optional passes that fit while
-leaving retry/validation headroom. An explicit `--max-work-units` value or
-manifest remains strict and rejects an over-budget plan rather than silently
-changing its requested scope.
+leaving retry/validation headroom. An explicit `--max-work-units` value may be
+any positive safe integer; it remains strict and rejects an over-budget plan
+rather than silently changing its requested scope.
 
 Primary role passes run in parallel. They inspect only the supplied change and the nearest permitted context. Each candidate is tied to a changed line, then gets one fresh, single-candidate validator; validator concurrency is bounded (at most four). Only `CONFIRMED` verdicts with confidence `>=85` are reportable. `PLAUSIBLE`, `REFUTED`, and lower-confidence results are not findings.
 

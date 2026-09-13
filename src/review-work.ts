@@ -123,17 +123,16 @@ function workId(snapshotHash: string, role: ReviewWorkRole, key: string, agentRo
 
 function validateLimit(value: number): number {
   if (!Number.isSafeInteger(value) || value <= 0) throw new RangeError("maxReviewWorkUnits must be a positive safe integer");
-  if (value > MAX_REVIEW_WORK_UNITS) throw new RangeError(`maxReviewWorkUnits cannot exceed ${MAX_REVIEW_WORK_UNITS}`);
   return value;
 }
 
 function canonicalRole(role: ReviewWorkManifestRole): { readonly role: ReviewWorkRole; readonly agentRole?: ReviewRole } {
   const valid = new Set<ReviewWorkManifestRole>([
     "summary", "diff", "guidance", "contextual", "integration", "validator",
-    "guidance-a", "guidance-b", "diff-only-bug", "contextual-bug",
+    "guidance-a", "diff-only-bug", "contextual-bug",
   ]);
   if (!valid.has(role)) throw new RangeError(`unknown review work role: ${String(role)}`);
-  if (role === "guidance-a" || role === "guidance-b" || role === "diff-only-bug" || role === "contextual-bug") {
+  if (role === "guidance-a" || role === "diff-only-bug" || role === "contextual-bug") {
     const mapped: ReviewWorkRole = role === "diff-only-bug" ? "diff" : role === "contextual-bug" ? "contextual" : "guidance";
     return { role: mapped, agentRole: role };
   }
@@ -144,7 +143,7 @@ function normalizeRoles(roles: readonly ReviewWorkManifestRole[] | undefined): r
   const selected = roles ?? [];
   const valid = new Set<ReviewWorkManifestRole>([
     "summary", "diff", "guidance", "contextual", "integration", "validator",
-    "guidance-a", "guidance-b", "diff-only-bug", "contextual-bug",
+    "guidance-a", "diff-only-bug", "contextual-bug",
   ]);
   for (const role of selected) {
     if (!valid.has(role)) throw new RangeError(`unknown review work role: ${String(role)}`);

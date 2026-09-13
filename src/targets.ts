@@ -27,12 +27,39 @@ interface RawPullRequest {
   readonly comments?: readonly { readonly body?: unknown; readonly author?: { readonly login?: unknown } }[];
 }
 
+interface PullRequestFile {
+  readonly filename: string;
+  readonly status: string;
+  readonly previousFilename?: string;
+  readonly additions?: number;
+  readonly deletions?: number;
+  readonly patch?: string;
+}
+
+type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+function asNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 function throwIfCanceled(result: CommandResult, operation: string): void {
   if (result.canceled) throw new Error(`${operation} canceled`);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function parseJson(value: string, operation: string): JsonValue {
+  try {
+    return JSON.parse(value) as JsonValue;
+  } catch (error) {
+    throw new Error(`${operation}: ${errorMessage(error)}`);
+  }
 }
 
 function asPaths(files: RawPullRequest["files"]): readonly string[] {
@@ -115,6 +142,168 @@ function parsePullRequest(value: unknown): PullRequestMetadata {
   };
 }
 
+function isOversizedPullRequestDiffError(error: unknown): boolean {
+  return /(?:HTTP 406|PullRequest\.diff\s+too_large|diff exceeded the maximum number of lines)/iu.test(errorMessage(error));
+}
+
+function parsePullRequestFiles(value: unknown): readonly PullRequestFile[] {
+  if (!Array.isArray(value)) throw new Error("gh returned an invalid pull request file list");
+  // `gh api --paginate --slurp` returns one array per page. Accepting a
+  // single page as well keeps this parser useful with command fakes.
+  const pages = value.length === 0 || Array.isArray(value[0]) ? value : [value];
+  const files: PullRequestFile[] = [];
+  for (const page of pages) {
+    if (!Array.isArray(page)) throw new Error("gh returned an invalid pull request file page");
+    for (const raw of page) {
+      if (!raw || typeof raw !== "object") throw new Error("gh returned an invalid pull request file");
+      const record = raw as Record<string, unknown>;
+      const filename = asString(record.filename);
+      if (!filename) throw new Error("gh returned a pull request file without a filename");
+      const previousFilename = asString(record.previous_filename);
+      const patch = typeof record.patch === "string" ? record.patch : undefined;
+      const additions = asNonNegativeInteger(record.additions);
+      const deletions = asNonNegativeInteger(record.deletions);
+      files.push({
+        filename,
+        status: asString(record.status, "modified"),
+        ...(previousFilename ? { previousFilename } : {}),
+        ...(additions === undefined ? {} : { additions }),
+        ...(deletions === undefined ? {} : { deletions }),
+        ...(patch === undefined ? {} : { patch }),
+      });
+    }
+  }
+  return files;
+}
+
+function quoteGitPath(path: string): string {
+  if (!/[\s"\\\x00-\x1f\x7f]|[^\x20-\x7e]/u.test(path)) return path;
+  let quoted = '"';
+  for (const byte of Buffer.from(path, "utf8")) {
+    if (byte === 0x22) quoted += '\\\"';
+    else if (byte === 0x5c) quoted += "\\\\";
+    else if (byte === 0x09) quoted += "\\t";
+    else if (byte === 0x0a) quoted += "\\n";
+    else if (byte === 0x0d) quoted += "\\r";
+    else if (byte >= 0x20 && byte <= 0x7e) quoted += String.fromCharCode(byte);
+    else quoted += `\\${byte.toString(8).padStart(3, "0")}`;
+  }
+  return `${quoted}"`;
+}
+
+function pullRequestFilePaths(file: PullRequestFile): { readonly oldPath: string | null; readonly newPath: string | null } {
+  const status = file.status.toLowerCase();
+  return {
+    oldPath: status === "added" ? null : file.previousFilename ?? file.filename,
+    newPath: status === "removed" ? null : file.filename,
+  };
+}
+
+function patchLineCounts(patch: string): { readonly additions: number; readonly deletions: number } {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of patch.replace(/\r\n?/gu, "\n").split("\n")) {
+    if (line.startsWith("+")) additions += 1;
+    else if (line.startsWith("-")) deletions += 1;
+  }
+  return { additions, deletions };
+}
+
+function formatPullRequestFile(file: PullRequestFile): string {
+  const paths = pullRequestFilePaths(file);
+  const oldHeaderPath = paths.oldPath === null ? "/dev/null" : `a/${paths.oldPath}`;
+  const newHeaderPath = paths.newPath === null ? "/dev/null" : `b/${paths.newPath}`;
+  const lines = [`diff --git ${quoteGitPath(oldHeaderPath)} ${quoteGitPath(newHeaderPath)}`];
+  const status = file.status.toLowerCase();
+  if (status === "added") lines.push("new file mode 100644");
+  if (status === "removed") lines.push("deleted file mode 100644");
+  if (status === "renamed" && paths.oldPath !== null && paths.newPath !== null && file.patch === undefined) {
+    lines.push("similarity index 100%", `rename from ${quoteGitPath(paths.oldPath)}`, `rename to ${quoteGitPath(paths.newPath)}`);
+    return lines.join("\n");
+  }
+  if (paths.oldPath !== null || paths.newPath !== null) {
+    lines.push(`--- ${quoteGitPath(oldHeaderPath)}`, `+++ ${quoteGitPath(newHeaderPath)}`);
+  }
+  if (file.patch !== undefined && file.patch.length > 0) {
+    const patch = file.patch.replace(/\r\n?/gu, "\n");
+    const counts = patchLineCounts(patch);
+    if (file.additions !== undefined && file.deletions !== undefined
+      && (counts.additions !== file.additions || counts.deletions !== file.deletions)) {
+      throw new Error(`GitHub returned an incomplete patch for ${file.filename}; retry the review from a local checkout.`);
+    }
+    lines.push(patch.replace(/\n$/u, ""));
+  } else if ((file.additions ?? 0) + (file.deletions ?? 0) > 0) {
+    throw new Error(`GitHub did not return a patch for changed file ${file.filename}; retry the review from a local checkout.`);
+  }
+  return lines.join("\n");
+}
+
+async function readPullRequestFilesDiff(
+  pullRequest: PullRequestMetadata,
+  cwd: string,
+  commands: CommandRunner,
+  signal?: AbortSignal,
+): Promise<string> {
+  const json = await runChecked(
+    commands,
+    "gh",
+    [
+      "api",
+      "--paginate",
+      "--slurp",
+      "--header",
+      "Accept: application/vnd.github+json",
+      `repos/${pullRequest.repository}/pulls/${pullRequest.number}/files?per_page=100`,
+    ],
+    cwd,
+    signal,
+  );
+  const files = parsePullRequestFiles(parseJson(json, "GitHub returned invalid pull request file JSON"));
+  return files.map(formatPullRequestFile).join("\n");
+}
+
+async function readPullRequestGitDiff(
+  pullRequest: PullRequestMetadata,
+  cwd: string,
+  commands: CommandRunner,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (!pullRequest.baseSha || !pullRequest.headSha) {
+    throw new Error("Pull request metadata did not include immutable base and head SHAs");
+  }
+  const remote = `https://github.com/${pullRequest.repository}.git`;
+  const hasObject = async (sha: string): Promise<boolean> => {
+    const result = await commands.run("git", ["cat-file", "-e", `${sha}^{commit}`], { cwd, signal });
+    throwIfCanceled(result, "Pull request commit lookup");
+    return result.exitCode === 0 && !result.truncated;
+  };
+  if (!(await hasObject(pullRequest.headSha))) {
+    await runChecked(commands, "git", ["fetch", "--no-tags", "--no-write-fetch-head", "--depth=1", remote, `refs/pull/${pullRequest.number}/head`], cwd, signal);
+  }
+  if (!(await hasObject(pullRequest.baseSha))) {
+    await runChecked(commands, "git", ["fetch", "--no-tags", "--no-write-fetch-head", "--depth=1", remote, pullRequest.baseSha], cwd, signal);
+  }
+  const diffArgs = ["diff", "--no-ext-diff", "--binary", "--find-renames", "--find-copies", `${pullRequest.baseSha}...${pullRequest.headSha}`];
+  try {
+    return await runChecked(commands, "git", diffArgs, cwd, signal);
+  } catch (diffError) {
+    // A shallow checkout can contain both immutable commits while lacking
+    // their merge base. Deepen it without checking out or moving a branch,
+    // then retry the same immutable revision diff once.
+    const shallow = await commands.run("git", ["rev-parse", "--is-shallow-repository"], { cwd, signal });
+    throwIfCanceled(shallow, "Pull request repository depth lookup");
+    if (shallow.exitCode !== 0 || shallow.truncated || shallow.stdout.trim() !== "true") throw diffError;
+    await runChecked(
+      commands,
+      "git",
+      ["fetch", "--no-tags", "--no-write-fetch-head", "--unshallow", remote, `refs/pull/${pullRequest.number}/head`, pullRequest.baseSha],
+      cwd,
+      signal,
+    );
+    return runChecked(commands, "git", diffArgs, cwd, signal);
+  }
+}
+
 async function resolveWorktreeTarget(localPath: string, cwd: string, commands: CommandRunner, signal?: AbortSignal): Promise<ReviewTarget | undefined> {
   try {
     if (!statSync(localPath).isDirectory()) return undefined;
@@ -168,7 +357,7 @@ async function readPullRequest(target: Extract<ReviewTarget, { kind: "pull-reque
     cwd,
     signal,
   );
-  const pullRequest = parsePullRequest(JSON.parse(json) as unknown);
+  const pullRequest = parsePullRequest(parseJson(json, "gh returned invalid pull request JSON"));
   const identity = await commands.run("gh", ["api", "user", "--jq", ".login"], { cwd, signal });
   throwIfCanceled(identity, "Reviewer identity lookup");
   if (identity.truncated) throw new Error("Reviewer identity lookup output was truncated");
@@ -262,7 +451,27 @@ function hashSnapshot(target: ReviewTarget, diff: string, paths: readonly string
 export async function captureReviewSnapshot(target: ReviewTarget, cwd: string, commands: CommandRunner, signal?: AbortSignal): Promise<ReviewSnapshot> {
   if (target.kind === "pull-request") {
     const pullRequest = await readPullRequest(target, cwd, commands, signal);
-    const diff = await runChecked(commands, "gh", ["pr", "diff", String(pullRequest.number), "--repo", pullRequest.repository], cwd, signal);
+    let diff: string;
+    try {
+      diff = await runChecked(commands, "gh", ["pr", "diff", String(pullRequest.number), "--repo", pullRequest.repository], cwd, signal);
+    } catch (error) {
+      if (!isOversizedPullRequestDiffError(error)) throw error;
+      let filesError: unknown;
+      try {
+        // The per-file endpoint does not apply the aggregate 20,000-line
+        // limit used by the PR diff endpoint. Prefer it because it avoids
+        // changing the caller's checkout; fall back to immutable Git refs if
+        // GitHub omits a patch for an individual large file.
+        diff = await readPullRequestFilesDiff(pullRequest, cwd, commands, signal);
+      } catch (fallbackError) {
+        filesError = fallbackError;
+        try {
+          diff = await readPullRequestGitDiff(pullRequest, cwd, commands, signal);
+        } catch (gitError) {
+          throw new Error(`${errorMessage(error)}; per-file fallback failed: ${errorMessage(filesError)}; local Git fallback failed: ${errorMessage(gitError)}`);
+        }
+      }
+    }
     const diffPaths = effectiveDiffPaths(diff);
     if (JSON.stringify(diffPaths) !== JSON.stringify(normalizedPathSet(pullRequest.changedPaths))) {
       throw new Error("Pull request diff changed-path scope does not match captured metadata; retry the review.");

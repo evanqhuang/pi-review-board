@@ -28,6 +28,11 @@ pi install npm:pi-review-board
 The package requires Pi and a configured model/provider. The `gh` CLI is also
 required when reviewing GitHub pull-request targets.
 
+Pull requests whose generated diff exceeds GitHub's 20,000-line limit are
+captured through the paginated per-file API instead; if GitHub omits an
+individual large-file patch, the immutable pull-request commits are used when
+available locally (or fetched without checking out a branch).
+
 ## Use
 
 ```text

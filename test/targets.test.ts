@@ -178,6 +178,116 @@ describe("review targets", () => {
     await expect(captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands)).rejects.toThrow(/malformed or unsupported/u);
   });
 
+  it("recovers an oversized pull-request diff from paginated file patches", async () => {
+    const payload = JSON.stringify({
+      number: 7,
+      url: "https://github.com/acme/repo/pull/7",
+      baseRefOid: "base-a",
+      headRefOid: "head-a",
+      files: [{ path: "src/a.ts" }],
+    });
+    const commands = new FakeCommands((command, args) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(payload);
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") {
+        return fail("could not find pull request diff: HTTP 406: PullRequest.diff too_large");
+      }
+      if (command === "gh" && args[0] === "api" && args[1] === "user") return ok("reviewer");
+      if (command === "gh" && args[0] === "api" && args[1] === "--paginate") {
+        return ok(JSON.stringify([[{
+          filename: "src/a.ts",
+          status: "modified",
+          additions: 1,
+          deletions: 1,
+          patch: "@@ -1 +1 @@\n-old\n+new",
+        }]]));
+      }
+      return fail();
+    });
+
+    const snapshot = await captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands);
+    expect(snapshot.diff).toContain("diff --git a/src/a.ts b/src/a.ts");
+    expect(snapshot.diff).toContain("@@ -1 +1 @@\n-old\n+new");
+    expect(snapshot.changedPaths).toEqual(["src/a.ts"]);
+    expect(commands.calls).toContainEqual([
+      "gh",
+      "api",
+      "--paginate",
+      "--slurp",
+      "--header",
+      "Accept: application/vnd.github+json",
+      "repos/acme/repo/pulls/7/files?per_page=100",
+    ]);
+  });
+
+  it("uses local immutable PR commits when a per-file patch is omitted", async () => {
+    const payload = JSON.stringify({
+      number: 7,
+      url: "https://github.com/acme/repo/pull/7",
+      baseRefOid: "base-a",
+      headRefOid: "head-a",
+      files: [{ path: "src/a.ts" }],
+    });
+    const completeDiff = fileDiff("src/a.ts");
+    const commands = new FakeCommands((command, args) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(payload);
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return fail("HTTP 406: PullRequest.diff too_large");
+      if (command === "gh" && args[0] === "api" && args[1] === "user") return ok("reviewer");
+      if (command === "gh" && args[0] === "api" && args[1] === "--paginate") {
+        return ok(JSON.stringify([[{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 1 }]]));
+      }
+      if (command === "git" && args[0] === "cat-file" && args[2] === "base-a^{commit}") return ok();
+      if (command === "git" && args[0] === "cat-file" && args[2] === "head-a^{commit}") return ok();
+      if (command === "git" && args[0] === "diff" && args[1] === "--no-ext-diff") return ok(completeDiff);
+      return fail();
+    });
+
+    const snapshot = await captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands);
+    expect(snapshot.diff).toBe(completeDiff);
+    expect(commands.calls.some((call) => call[0] === "git" && call[1] === "fetch")).toBe(false);
+    expect(commands.calls).toContainEqual(["git", "diff", "--no-ext-diff", "--binary", "--find-renames", "--find-copies", "base-a...head-a"]);
+  });
+
+  it("deepens a shallow checkout before retrying the immutable PR diff", async () => {
+    const payload = JSON.stringify({
+      number: 7,
+      url: "https://github.com/acme/repo/pull/7",
+      baseRefOid: "base-a",
+      headRefOid: "head-a",
+      files: [{ path: "src/a.ts" }],
+    });
+    const completeDiff = fileDiff("src/a.ts");
+    let diffAttempts = 0;
+    const commands = new FakeCommands((command, args) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") return ok(payload);
+      if (command === "gh" && args[0] === "pr" && args[1] === "diff") return fail("HTTP 406: PullRequest.diff too_large");
+      if (command === "gh" && args[0] === "api" && args[1] === "user") return ok("reviewer");
+      if (command === "gh" && args[0] === "api" && args[1] === "--paginate") {
+        return ok(JSON.stringify([[{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 1 }]]));
+      }
+      if (command === "git" && args[0] === "cat-file") return ok();
+      if (command === "git" && args[0] === "diff") {
+        diffAttempts += 1;
+        return diffAttempts === 1 ? fail("fatal: no merge base") : ok(completeDiff);
+      }
+      if (command === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") return ok("true\n");
+      if (command === "git" && args[0] === "fetch") return ok();
+      return fail();
+    });
+
+    const snapshot = await captureReviewSnapshot({ kind: "pull-request", value: "7" }, "/repo", commands);
+    expect(snapshot.diff).toBe(completeDiff);
+    expect(commands.calls).toContainEqual([
+      "git",
+      "fetch",
+      "--no-tags",
+      "--no-write-fetch-head",
+      "--unshallow",
+      "https://github.com/acme/repo.git",
+      "refs/pull/7/head",
+      "base-a",
+    ]);
+  });
+
   it("accepts the parser's effective paths for empty, rename, deletion, binary, and quoted diffs", async () => {
     const fixtures = [
       { files: [], diff: "" },

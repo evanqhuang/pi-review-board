@@ -41,6 +41,22 @@ function largeDiff(path: string, start: number): string {
   return fileDiff(path, Array.from({ length: 100 }, (_, index) => `changed-${start + index}-${"x".repeat(300)}`));
 }
 
+function renamedLargeDiff(): string {
+  const changedLines = Array.from({ length: 400 }, (_, index) => [`-old-${index}-${"x".repeat(300)}`, `+new-${index}-${"x".repeat(300)}`]).flat();
+  return [
+    "diff --git a/src/old.ts b/src/new.ts",
+    "similarity index 80%",
+    "rename from src/old.ts",
+    "rename to src/new.ts",
+    "--- a/src/old.ts",
+    "+++ b/src/new.ts",
+    `@@ -1,${changedLines.length / 2 + 1} +1,${changedLines.length / 2 + 1} @@`,
+    " context",
+    ...changedLines,
+    "",
+  ].join("\n");
+}
+
 function snapshot(diff: string, changedPaths: readonly string[] = ["src/a.ts"]): ReviewSnapshot {
   return { target, cwd: "/repo", changedPaths, diff, snapshotHash: `hash:${diff}` };
 }
@@ -488,6 +504,24 @@ describe("runCodeReview deterministic topology", () => {
     expect(agents.calls.find((call) => call.role === "contextual-bug")?.prompt).toContain("Candidate-focused excerpts");
     expect(agents.calls.some((call) => call.role === "validator")).toBe(true);
     expect(agents.calls.every((call) => Buffer.byteLength(call.prompt, "utf8") <= call.inputBudgetBytes!)).toBe(true);
+  });
+
+  it("validates deleted-side candidates from renamed shards", async () => {
+    const agents = new RecordingAgents();
+    agents.candidateFile = "src/old.ts";
+    const diff = renamedLargeDiff();
+    const result = await runCodeReview({
+      cwd: "/repo",
+      target,
+      comment: false,
+      effort: "normal",
+      snapshot: { ...snapshot(diff, ["src/new.ts"]), snapshotHash: createHash("sha256").update(diff).digest("hex") },
+    }, dependencies(agents));
+
+    expect(result.status, JSON.stringify(result.failures)).toBe("complete");
+    expect(result.coverage).toMatchObject({ mode: "sharded", state: "complete" });
+    expect(result.coverage?.unvalidatedCandidates ?? []).toEqual([]);
+    expect(agents.calls.filter((call) => call.role === "validator").length).toBeGreaterThan(0);
   });
 
   it("validates known candidates before spending the last units on a follow-up", async () => {

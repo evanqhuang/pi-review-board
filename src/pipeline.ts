@@ -1133,15 +1133,30 @@ async function runShardedReview(
   const verdicts: VerifierOutput[] = [];
   const validatorTasks: ReviewScheduleTask<VerifierOutput>[] = [];
   const validatorByTask = new Map<string, ReviewCandidate>();
+  const oldPathToIdentity = new Map<string, string>();
+  for (const file of parseUnifiedDiff(snapshot.diff).files) {
+    if (file.oldPath !== null && file.newPath !== null && file.oldPath !== file.newPath) {
+      oldPathToIdentity.set(file.oldPath, file.fileIdentity);
+    }
+  }
   const ownerForCandidate = (candidate: ReviewCandidate): { readonly shard: (typeof shards)[number]; readonly source: ShardedCandidateSource } | undefined => {
     const source = sourceByCandidate.get(candidate.id);
     if (!source) return undefined;
     const shard = shardMap.get(source.shardId);
     if (!shard) return undefined;
-    const ownsPath = shard.fileIdentities.includes(candidate.file) || shard.oldPath === candidate.file || shard.newPath === candidate.file;
-    const ownsLine = shard.ranges.some((range) => range.fileIdentity === undefined || range.fileIdentity === candidate.file
-      ? range.newLineNumbers.includes(candidate.line) || range.oldLineNumbers.includes(candidate.line)
-      : false);
+    const canonicalFile = oldPathToIdentity.get(candidate.file) ?? candidate.file;
+    const ownsPath = shard.fileIdentities.includes(canonicalFile) || shard.fileIdentities.includes(candidate.file)
+      || shard.oldPath === candidate.file || shard.newPath === candidate.file;
+    const ownsLine = shard.ranges.some((range) => {
+      if (canonicalFile !== candidate.file) {
+        // A renamed candidate can refer to a deleted line on the old path,
+        // while shard ranges are tagged with the canonical new identity.
+        return (range.fileIdentity === undefined || range.fileIdentity === canonicalFile)
+          && range.oldLineNumbers.includes(candidate.line);
+      }
+      return (range.fileIdentity === undefined || range.fileIdentity === candidate.file)
+        && (range.newLineNumbers.includes(candidate.line) || range.oldLineNumbers.includes(candidate.line));
+    });
     return ownsPath && ownsLine ? { shard, source } : undefined;
   };
   for (const candidate of candidates) {
